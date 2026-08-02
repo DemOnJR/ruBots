@@ -328,6 +328,13 @@ impl Decoder {
             .as_ref()
             .map(|si| (si.max_players, si.player_index))
             .unwrap_or((32, 0));
+        // `TeamInfo` and friends are keyed by ENTITY index, which for a
+        // player is slot + 1 (`SV_IsPlayerIndex` counts from 1). Without this
+        // the game state has no idea which of the 32 slots is us, and
+        // `my_team()` answers Unassigned forever.
+        let mut game = crate::usermsg::GameState::default();
+        game.self_index = Some(my_slot.saturating_add(1));
+
         Self {
             registry: signon.registry.clone(),
             maxclients,
@@ -336,7 +343,7 @@ impl Decoder {
             time: 0.0,
             clientdata: None,
             entities: Vec::new(),
-            game: crate::usermsg::GameState::default(),
+            game,
             user_table,
             stats: DecodeStats::default(),
         }
@@ -629,51 +636,6 @@ pub struct PlayerView {
     pub angles: [f32; 3],
     pub team: crate::usermsg::Team,
     pub ducking: bool,
-}
-
-/// Offset of whatever follows `svc_clientdata` in a running datagram.
-///
-/// Split out from [`parse_datagram`] so both agree on the framing by
-/// construction rather than by two people reading the same source twice.
-fn datagram_entity_offset(msg: &[u8], registry: &proto::delta::DeltaRegistry) -> Option<usize> {
-    if msg.first() != Some(&svc::SVC_TIME) || msg.len() < 5 {
-        return None;
-    }
-    let mut at = 5usize;
-    loop {
-        match msg.get(at) {
-            Some(&svc::SVC_CHOKE) => at += 1,
-            Some(&svc::SVC_SETANGLE) => at += 7,
-            Some(&svc::SVC_ADDANGLE) => at += 3,
-            _ => break,
-        }
-    }
-    if msg.get(at) != Some(&svc::SVC_CLIENTDATA) {
-        return None;
-    }
-    at += 1;
-
-    let cd = registry.get("clientdata_t")?;
-    let mut r = proto::bitbuf::BitReader::new(&msg[at..]);
-    if r.read_bits(1) != 0 {
-        return None;
-    }
-    proto::delta::parse_delta(&mut r, cd);
-    if let Some(wd) = registry.get("weapon_data_t") {
-        let mut guard = 0;
-        while r.read_bits(1) != 0 {
-            r.read_bits(6);
-            proto::delta::parse_delta(&mut r, wd);
-            guard += 1;
-            if guard > 64 || r.overflowed() {
-                break;
-            }
-        }
-    }
-    if r.overflowed() {
-        return None;
-    }
-    Some(at + block_bytes(&r))
 }
 
 #[cfg(test)]

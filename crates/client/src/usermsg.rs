@@ -988,6 +988,14 @@ pub struct GameState {
     /// Our own slot, if the caller has told us (it comes from
     /// `svc_serverinfo`'s `player_index`, not from any user message).
     pub self_index: Option<u8>,
+    /// Set once the server has offered the team-selection menu.
+    ///
+    /// `ShowVGUIMenu(VGUI_Menu_Team)` goes out in the same breath as the
+    /// SHOWTEAMSELECT -> PICKINGTEAM transition
+    /// (`multiplay_gamerules.cpp:3778-3785`), so it is the client-visible
+    /// proof that the server is ready to accept `jointeam`. Answering earlier
+    /// is accepted and then silently undone.
+    pub saw_team_menu: bool,
 
     // --- our own state, all from MSG_ONE messages ---
     pub money: i32,
@@ -1040,6 +1048,7 @@ impl Default for GameState {
         Self {
             players: std::array::from_fn(|_| PlayerInfo::default()),
             self_index: None,
+            saw_team_menu: false,
             money: 0,
             health: 0,
             armor: 0,
@@ -1206,7 +1215,18 @@ impl GameState {
             UserMessage::Scenario(s) => {
                 self.scenario_sprite = s.icon.as_ref().map(|i| i.sprite.clone());
             }
-            UserMessage::ShowMenu(_) | UserMessage::VguiMenu(_) => {}
+            // The team menu is the server saying "I am ready for jointeam".
+            // VGUI_Menu_Team is type 2 (`cdll_dll.h:94-108`). The text
+            // fallback is used when the client has `_vgui_menus 0`; ours does
+            // not, but accept either rather than depend on it.
+            UserMessage::VguiMenu(m) => {
+                if m.menu_type == 2 {
+                    self.saw_team_menu = true;
+                }
+            }
+            UserMessage::ShowMenu(_) => {
+                self.saw_team_menu = true;
+            }
         }
     }
 

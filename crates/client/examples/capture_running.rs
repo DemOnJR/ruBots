@@ -179,8 +179,8 @@ fn main() {
         }
         eprintln!("  joining team, retrying until the server actually spawns us");
         match session.join_and_spawn(&mut t, Session::TEAM_TERRORIST, Duration::from_secs(15)) {
-            Ok(true) => eprintln!("  *** SPAWNED AS A LIVE PLAYER ***"),
-            Ok(false) => eprintln!("  !!! never spawned -- still in the joining state"),
+            Ok(true) => eprintln!("  *** TEAM ACCEPTED -- joined ***"),
+            Ok(false) => eprintln!("  !!! team was never accepted"),
             Err(e) => eprintln!("  join error: {e}"),
         }
     }
@@ -247,6 +247,12 @@ fn main() {
                     cd.weapons.len(),
                 );
                 if let Some(d) = session.decoder.as_ref() {
+                    eprintln!(
+                        "      game: team {:?} money ${} hp {} weapon {} buyzone {} round {}s resets {}",
+                        d.game.my_team(), d.game.money, d.game.health,
+                        d.game.weapon_id, d.game.in_buy_zone, d.game.round_time,
+                        d.game.hud_resets,
+                    );
                     let players = d.players();
                     eprintln!(
                         "      world: {} entities, {} players | ok={} ents={} nocd={} tail={} errs={} stop={:?}",

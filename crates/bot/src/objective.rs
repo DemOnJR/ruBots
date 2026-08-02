@@ -13,6 +13,25 @@
 //! precise roles were not established, so they are recorded in
 //! [`RECOVERED_OBJECTIVE_CONSTANTS`] and the radii below are named after what
 //! they plainly must gate — reaching the spot, and staying on it.
+//!
+//! ## What this layer is, after the rework
+//!
+//! This module now does **navigation and mode selection only**: which of the
+//! bomb objectives applies, and where to stand for it. The button patterns and
+//! the completion conditions live in [`bomb`] and [`hostage`], which are driven
+//! by observation rather than by a private stopwatch.
+//!
+//! The one behavioural change here is the same principle applied to the
+//! completion event: a plant used to be declared finished when a local timer
+//! reached 3 seconds. It is now declared finished when **the server says the
+//! bomb is planted**. Holding the button for three seconds is not evidence the
+//! plant succeeded — it is exactly what a cancelled plant also looks like from
+//! the inside. [`ObjectiveState::elapsed`] still counts, because "how long have
+//! I been holding my own button" is genuinely local knowledge; it just no
+//! longer decides anything.
+
+pub mod bomb;
+pub mod hostage;
 
 use crate::math::{distance2d, Vec3};
 use crate::world::{Team, WorldView};
@@ -29,12 +48,13 @@ pub const ACTION_RADIUS: f32 = 72.0;
 /// Drifting further than this abandons the action.
 pub const ABANDON_RADIUS: f32 = 160.0;
 
-/// Seconds the plant animation takes in CS 1.6.
-pub const PLANT_DURATION: f32 = 3.0;
-/// Defuse time without a kit.
-pub const DEFUSE_DURATION: f32 = 10.0;
-/// Defuse time with a kit.
-pub const DEFUSE_DURATION_KIT: f32 = 5.0;
+/// Seconds the plant animation takes — `C4_ARMING_ON_TIME`,
+/// `dlls/weapons.h:860`. Verified, unlike the radii above.
+pub const PLANT_DURATION: f32 = bomb::C4_ARMING_ON_TIME;
+/// Defuse time without a kit (`dlls/ggrenade.cpp:1067`).
+pub const DEFUSE_DURATION: f32 = bomb::DEFUSE_TIME_NO_KIT;
+/// Defuse time with a kit (`dlls/ggrenade.cpp:1052`).
+pub const DEFUSE_DURATION_KIT: f32 = bomb::DEFUSE_TIME_KIT;
 
 /// What the bot is doing about the bomb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +132,15 @@ impl ObjectiveState {
             return None;
         }
 
+        // The only confirmation a plant ever gets: the server said so. This has
+        // to be checked before the defuse branch below, or the transition out
+        // of `Planting` would be swallowed by "a bomb is planted, go defuse it".
+        if self.objective == Objective::Planting && world.bomb.planted {
+            self.objective = Objective::Idle;
+            self.elapsed = 0.0;
+            return Some(ObjectiveEvent::BombPlantedSuccessfully);
+        }
+
         // Defusing takes precedence: a planted bomb is the whole game.
         if world.bomb.planted {
             if world.me.team != Team::CounterTerrorist {
@@ -173,12 +202,9 @@ impl ObjectiveState {
                     self.elapsed = 0.0;
                     return Some(ObjectiveEvent::PlantSpotNotValid);
                 }
+                // Keep holding. Completion is observed at the top of `tick`,
+                // never inferred from this counter.
                 self.elapsed += dt;
-                if self.elapsed >= PLANT_DURATION {
-                    self.objective = Objective::Idle;
-                    self.elapsed = 0.0;
-                    return Some(ObjectiveEvent::BombPlantedSuccessfully);
-                }
                 None
             }
             _ => {
@@ -223,7 +249,7 @@ mod tests {
                 has_defuse_kit: kit,
                 ..Default::default()
             },
-            bomb: BombState { planted: true, origin: Some(SITE), carried_by_me: false },
+            bomb: BombState { planted: true, origin: Some(SITE), ..Default::default() },
             ..Default::default()
         }
     }
@@ -245,20 +271,33 @@ mod tests {
     }
 
     #[test]
-    fn planting_completes_after_the_plant_duration() {
+    fn planting_completes_only_when_the_server_confirms_it() {
         let mut s = ObjectiveState::default();
         let there = terrorist_with_bomb([1000.0, 1000.0, 0.0]);
         s.tick(&there, Some(SITE), 0.1); // begins planting
 
-        let mut done = None;
+        // Ten seconds of holding — more than three times the arming time —
+        // proves nothing on its own. A cancelled plant looks exactly like this
+        // from the inside, which is why the old local timer was wrong.
         for _ in 0..100 {
-            if let Some(e) = s.tick(&there, Some(SITE), 0.1) {
-                done = Some(e);
-                break;
-            }
+            assert_eq!(
+                s.tick(&there, Some(SITE), 0.1),
+                None,
+                "a private stopwatch must never declare the bomb planted"
+            );
         }
-        assert_eq!(done, Some(ObjectiveEvent::BombPlantedSuccessfully));
+        assert!(s.elapsed >= PLANT_DURATION, "it did keep holding, though");
+        assert_eq!(s.objective, Objective::Planting);
+
+        // The server saying so is the only thing that finishes it.
+        let mut planted = there;
+        planted.bomb.planted = true;
+        assert_eq!(
+            s.tick(&planted, Some(SITE), 0.1),
+            Some(ObjectiveEvent::BombPlantedSuccessfully)
+        );
         assert_eq!(s.objective, Objective::Idle);
+        assert_eq!(s.elapsed, 0.0);
     }
 
     #[test]

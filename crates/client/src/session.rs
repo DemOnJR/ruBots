@@ -50,8 +50,6 @@ pub struct Session {
     /// Receive-path diagnostics: how many of each datagram kind arrived and
     /// how many actually completed into a message.
     pub stats: RecvStats,
-    /// When a datagram last arrived, for deadlock detection.
-    last_recv: Option<Instant>,
     resyncs: u32,
     /// When set, every assembled message is kept in `recorded` — including the
     /// signon phase, which `connect_and_signon` otherwise consumes silently.
@@ -74,6 +72,11 @@ pub struct Session {
     /// velocity, health, weapons. This is the objective test of whether our
     /// movement commands are being applied.
     pub clientdata: Option<crate::world::ClientData>,
+    /// Paced console commands (buy aliases, weapon switches, chat).
+    pub console: crate::console::ConsoleQueue,
+    /// Which round we last bought in, so a buy happens once per spawn rather
+    /// than every frame we happen to be standing in the zone.
+    bought_at_reset: Option<u32>,
     /// The world model: baselines, entities, and accumulated game state.
     /// Built once the signon has taught us the delta tables and the user
     /// message table.
@@ -112,7 +115,6 @@ impl Session {
             signon: None,
             sender: None,
             stats: RecvStats::default(),
-            last_recv: None,
             resyncs: 0,
             record_all: false,
             recorded: Vec::new(),
@@ -120,6 +122,8 @@ impl Session {
             content: crate::content::GameContent::discover(),
             clock: crate::clock::MoveClock::new(Instant::now()),
             clientdata: None,
+            console: crate::console::ConsoleQueue::new(),
+            bought_at_reset: None,
             decoder: None,
             cmd_history: std::collections::VecDeque::new(),
             last_valid_frame: None,
@@ -824,7 +828,10 @@ impl Session {
     /// How long to wait for a spawn before re-sending the join pair. The
     /// server only advances the join state inside its own `PlayerThink`, so
     /// this has to cover several server frames, not just a round trip.
-    pub const JOIN_RETRY: Duration = Duration::from_millis(1200);
+    /// Gap between `sendents` and `jointeam`, from a real client: 0.7 s.
+    pub const JOIN_SETTLE: Duration = Duration::from_millis(700);
+
+    pub const JOIN_RETRY: Duration = Duration::from_millis(600);
 
     /// Walk the join sequence with a real client's spacing, pumping between
     /// each step so the server can drain what the previous one produced.
@@ -850,6 +857,36 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Queue a loadout when we are alive, in a buy zone, and have not already
+    /// bought for this spawn.
+    ///
+    /// Gated on the `StatusIcon "buyzone"` message rather than on position,
+    /// because `SIGNAL_BUY` is a two-phase latch that `HandleSignals`
+    /// republishes only every 0.5 s (`player.cpp:7875-7879`), and
+    /// `CanPlayerBuy` reads the *previous* window. Buying off our own idea of
+    /// where the zone is therefore fails for up to half a second after
+    /// entering it; the icon is the server telling us the latch is actually
+    /// set.
+    ///
+    /// `hud_resets` counts `ResetHUD`, which the server sends on every spawn
+    /// (`player.cpp:7577`), so it doubles as a round counter -- one buy per
+    /// spawn, not one per frame spent standing in the zone.
+    fn maybe_buy(&mut self) {
+        let Some(d) = self.decoder.as_ref() else {
+            return;
+        };
+        if !d.game.in_buy_zone || self.bought_at_reset == Some(d.game.hud_resets) {
+            return;
+        }
+        if !self.clientdata.as_ref().is_some_and(|c| c.in_game()) {
+            return;
+        }
+        let is_ct = d.game.my_team() == crate::usermsg::Team::CounterTerrorist;
+        let plan = crate::console::buy_plan(d.game.money, is_ct);
+        self.bought_at_reset = Some(d.game.hud_resets);
+        self.console.extend(plan);
     }
 
     /// Start decoding the world.
@@ -914,35 +951,81 @@ impl Session {
         timeout: Duration,
     ) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
-        let mut attempt = 0u32;
 
+        // Replicate a real client's join exactly, because we have measured it:
+        // relaying a genuine CS 1.6 client showed `jointeam 5` at +1.767 s and
+        // `joinclass 6` at +1.946 s relative to `new` -- roughly 0.7 s after
+        // `sendents`, then 0.18 s apart, and each sent EXACTLY ONCE.
+        //
+        // Sending them once is not a stylistic choice, it is the only thing
+        // that works. A second `jointeam` is refused with
+        // `#Only_1_Team_Change` (`client.cpp:2088`), and that refusal resets
+        // `m_iMenu` to Menu_ChooseTeam, after which `joinclass` is refused with
+        // `#Command_Not_Available`. Retrying therefore destroys a join that had
+        // already succeeded. Observed, in this order:
+        //
+        //     TeamInfo TERRORIST / #Game_join_terrorist   <- worked
+        //     #Only_1_Team_Change                          <- the retry
+        //     #Command_Not_Available                       <- joinclass now dead
+        self.settle(t, Self::JOIN_SETTLE)?;
+        self.send_command(&format!("jointeam {team}"));
+        self.settle(t, Self::JOIN_STEP)?;
+        self.send_command(&format!("joinclass {}", Self::CLASS_ANY));
+
+        // Then simply wait. `ResetHUD` is the server confirming the join
+        // (`GetIntoGame` -> `Spawn` -> `m_fInitHUD` -> `player.cpp:7577`).
         while Instant::now() < deadline {
-            if self.in_game() {
+            self.pump(t, &[netchan::clc::NOP])?;
+            if self.joined() {
                 return Ok(true);
             }
-            attempt += 1;
-            self.send_command(&format!("jointeam {team}"));
-
-            // Let `jointeam` be processed before `joinclass`, which is refused
-            // unless the first one has already moved `m_iMenu`.
-            let step = Instant::now() + Self::JOIN_STEP;
-            while Instant::now() < step {
-                self.pump(t, &[netchan::clc::NOP])?;
-            }
-            self.send_command(&format!("joinclass {}", Self::CLASS_ANY));
-
-            // Give the server a couple of think ticks to actually spawn us
-            // before deciding this attempt failed.
-            let settle = Instant::now() + Self::JOIN_RETRY;
-            while Instant::now() < settle && Instant::now() < deadline {
-                self.pump(t, &[netchan::clc::NOP])?;
-                if self.in_game() {
-                    return Ok(true);
-                }
-            }
-            let _ = attempt;
         }
-        Ok(self.in_game())
+        Ok(self.joined())
+    }
+
+    /// Pump for `d`, doing nothing else.
+    fn settle<T: Transport>(&mut self, t: &mut T, d: Duration) -> io::Result<()> {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            self.pump(t, &[netchan::clc::NOP])?;
+        }
+        Ok(())
+    }
+
+    /// Has the server shown us the team-selection menu?
+    ///
+    /// `ShowVGUIMenu(VGUI_Menu_Team)` is emitted in the same breath as the
+    /// SHOWTEAMSELECT -> PICKINGTEAM transition, so receiving it is proof the
+    /// server is ready to be answered.
+    pub fn saw_team_menu(&self) -> bool {
+        self.decoder
+            .as_ref()
+            .is_some_and(|d| d.game.saw_team_menu || d.game.hud_resets > 0)
+    }
+
+    /// Has the server accepted our team choice?
+    ///
+    /// `TeamInfo` naming our own entity with a real team is the confirmation,
+    /// and it arrives within a few hundred milliseconds of `jointeam`
+    /// (`player.cpp:6072-6075`), alongside `#Game_join_terrorist`.
+    ///
+    /// **Deliberately not `ResetHUD`.** That was the obvious choice and it is
+    /// wrong: `GetIntoGame` sets `m_iJoiningState = JOINED` unconditionally but
+    /// only calls `Spawn()` -- which is what produces `ResetHUD` -- when
+    /// `FPlayerCanRespawn` allows it (`player.cpp:10730-10732`), and that is
+    /// false mid-round. So a bot that joins between rounds is fully joined and
+    /// receives no `ResetHUD` until the next round begins. Waiting for one made
+    /// a working join look like a 15-second failure, and the "15 seconds" was
+    /// just however long was left on the round clock.
+    ///
+    /// Spawning is a separate question -- see [`in_game`](Self::in_game).
+    pub fn joined(&self) -> bool {
+        self.decoder.as_ref().is_some_and(|d| {
+            matches!(
+                d.game.my_team(),
+                crate::usermsg::Team::Terrorist | crate::usermsg::Team::CounterTerrorist
+            )
+        })
     }
 
     /// Has the server spawned us as a live player, rather than parked us in the
@@ -984,7 +1067,6 @@ impl Session {
         unreliable: &[u8],
     ) -> io::Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        let mut got_any = false;
         // Drain the ENTIRE backlog before acknowledging, so the sequence we
         // echo is the newest one we have seen.
         //
@@ -998,7 +1080,6 @@ impl Session {
         for _ in 0..Self::MAX_DRAIN {
             match t.recv()? {
                 Some(d) => {
-                    got_any = true;
                     for msg in self.ingest(&d) {
                         // Answer the server's echo prompts as they arrive.
                         self.echo_stufftexts(&msg);
@@ -1096,6 +1177,13 @@ impl Session {
         }
         for msg in &out {
             self.echo_stufftexts(msg);
+        }
+
+        // One console command per frame at most, and only when the reliable
+        // channel is idle -- see `crate::console` for why a burst is fatal.
+        self.maybe_buy();
+        if let Some(cmd) = self.console.next(Instant::now(), self.reliables_settled()) {
+            self.send_command(&cmd);
         }
 
         let msecs = self.clock.due(Instant::now());
