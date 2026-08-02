@@ -1337,6 +1337,13 @@ impl GameState {
             }
             UserMessage::BombPickup => {
                 // Off the ground; nobody has told us where it is any more.
+                //
+                // This is also the round boundary. `RestartRound` broadcasts it
+                // to reset the radar (`multiplay_gamerules.cpp:1707-1710`), so
+                // it is the one signal that means "forget last round's bomb" --
+                // which `ResetHUD` deliberately no longer does, because that
+                // fires on every spawn and a planted bomb outlives a respawn.
+                self.bomb_planted = false;
                 self.bomb_position = None;
             }
 
@@ -1395,8 +1402,19 @@ impl GameState {
         self.weapon_clip = 0;
         self.ammo = [0u8; 32];
         self.round_time = 0;
-        self.bomb_planted = false;
-        self.bomb_position = None;
+        // NOT the bomb. `ResetHUD` fires on every spawn, including a mid-round
+        // one, and a planted bomb outlives a player's respawn. Clearing it here
+        // threw away the server's own resync: `CHalfLifeMultiplay::InitHUD`
+        // sends a joining client `BombDrop(BOMB_FLAG_PLANTED, origin)` for a
+        // live bomb (`multiplay_gamerules.cpp:3541-3575`) -- and then the
+        // player spawns, ResetHUD arrives, and the state was wiped a moment
+        // after being handed to us. Live, a CT that joined after a plant walked
+        // to a bomb site and stood there for the rest of the round, never once
+        // entering the defuse rung.
+        //
+        // The round boundary is signalled separately and unambiguously:
+        // `RestartRound` broadcasts `BombPickup` to reset everyone's radar
+        // (`multiplay_gamerules.cpp:1707-1710`), which is where this belongs.
         self.hostages.clear();
         self.in_buy_zone = false;
         self.in_rescue_zone = false;
@@ -2667,15 +2685,25 @@ mod tests {
 
         gs.apply("ResetHUD", &[]);
 
+        // The bomb SURVIVES: ResetHUD fires on every spawn, including a
+        // mid-round one, and a planted bomb outlives a player's respawn. It is
+        // cleared by BombPickup, which RestartRound broadcasts to reset the
+        // radar (`multiplay_gamerules.cpp:1707-1710`).
+        assert!(gs.bomb_planted, "a live bomb must survive a respawn");
+        assert!(gs.bomb_position.is_some());
+
         // Gone.
-        assert!(!gs.bomb_planted);
-        assert_eq!(gs.bomb_position, None);
         assert!(!gs.in_rescue_zone);
         assert_eq!(gs.bar_time, None);
         assert!(!gs.has_defuser());
         assert!(gs.hostages.is_empty());
         assert_eq!(gs.round_time, 0);
         assert_eq!(gs.player(4).map(|p| p.dead), Some(false));
+
+        // ...and the round boundary does clear it.
+        gs.apply("BombPickup", &[]);
+        assert!(!gs.bomb_planted, "BombPickup is the round reset");
+        assert_eq!(gs.bomb_position, None);
         assert_eq!(gs.player(4).map(|p| p.has_bomb), Some(false));
 
         // Kept.
