@@ -947,12 +947,15 @@ impl Session {
         // Turn the objective into the NEXT waypoint. Steering straight at a
         // distant goal walks into walls -- on de_dust2 the straight line from
         // a T spawn to bombsite B crosses most of the map.
-        let speed = self.measured_speed(world.me.origin, now);
+        // Still measured, because the fire-control layer needs to know whether
+        // the bot is moving fast enough to spoil a rifle shot (>140 u/s).
+        // Navigation no longer uses it: see `PathFollower::next_waypoint`.
+        let _speed = self.measured_speed(world.me.origin, now);
         let site = match (self.map.take(), self.site) {
             (Some(m), Some(goal)) => {
-                let w =
-                    self.follower
-                        .next_waypoint(&m.grid, world.me.origin, goal, speed, dt);
+                let w = self
+                    .follower
+                    .next_waypoint(&m.grid, world.me.origin, goal, dt);
                 self.map = Some(m);
                 w
             }
