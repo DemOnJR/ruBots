@@ -824,3 +824,19 @@ mod tests {
         assert!(!cd.in_game());
     }
 }
+
+// ---------------------------------------------------------------------------
+// A note on detecting "has spawned", because two obvious answers are both wrong
+// and both cost time.
+//
+//  * `maxspeed > 1.5` is NOT it. `GetIntoGame` calls `ResetMaxSpeed()` at
+//    player.cpp:10718, BEFORE the `if (FPlayerCanRespawn(this)) Spawn()` gate
+//    at :10730 -- so maxspeed reaches 240 on merely ENTERING the game.
+//  * `ResetHUD` is NOT it either. It fires from `m_fInitHUD`, which `Spawn()`
+//    sets (player.cpp:5997) but so do `Precache()` (:6146) and
+//    `ForceClientDllUpdate()` (:6694).
+//
+// The reliable evidence that a player is really in the world is holding a
+// weapon: every spawn gives a knife, and `CurWeapon` is emitted when one is
+// deployed (weapons.cpp:1380). Absence of any weapon means absence of a spawn,
+// whatever maxspeed and ResetHUD claim.
