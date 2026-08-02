@@ -39,6 +39,7 @@ pub struct Decision {
     pub yaw: f32,
     pub waypoints_left: usize,
     pub reroutes: u32,
+    pub stuck: bool,
 }
 
 /// Where a session is in its lifecycle.
@@ -947,7 +948,20 @@ impl Session {
                 self.site
             }
         };
-        let intent = self.brain.as_mut()?.think(&world, site, dt);
+        let mut intent = self.brain.as_mut()?.think(&world, site, dt);
+
+        // Blocked by geometry the route does not model: strafe, jump, and
+        // swing the view off the wall. Without this a solid player walks
+        // straight into a door frame and stays there for the rest of the
+        // round -- the route stays perfectly valid the whole time, which is
+        // what makes it so confusing to watch.
+        if let Some(u) = self.follower.unstick() {
+            if intent.forwardmove != 0.0 || intent.sidemove != 0.0 {
+                intent.sidemove = u.sidemove;
+                intent.jump |= u.jump;
+                intent.view.yaw = bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
+            }
+        }
         self.last_decision = Some(Decision {
             alive: world.me.alive,
             in_game: world.me.freeze_period,
@@ -957,6 +971,7 @@ impl Session {
             yaw: intent.view.yaw,
             waypoints_left: self.follower.remaining(),
             reroutes: self.follower.reroutes,
+            stuck: self.follower.is_stuck(),
         });
 
         for cmd in &intent.commands {

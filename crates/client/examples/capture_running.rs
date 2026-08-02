@@ -240,6 +240,47 @@ fn main() {
             forwardmove: 250.0,
             ..Default::default()
         };
+        // Manual drive: ignore the brain entirely and send a fixed command, to
+        // separate "the movement layer is broken" from "the bot decided not to
+        // move". Jumping is the sharpest probe -- a blocked player can still
+        // rise, so a changing Z proves usercmds are being applied.
+        if let Ok(mode) = env::var("AIPLAYERS_DRIVE") {
+            let t0 = start.elapsed().as_secs_f32();
+            let mut manual = bot::Intent::default();
+            manual.view = bot::Angles { pitch: 0.0, yaw: (t0 * 20.0) % 360.0 };
+            match mode.as_str() {
+                "jump" => manual.jump = (t0 as u32) % 2 == 0,
+                "fwd" => manual.forwardmove = 250.0,
+                _ => {
+                    manual.forwardmove = 250.0;
+                    manual.jump = (t0 as u32) % 2 == 0;
+                }
+            }
+            session.brain = None;
+            let step = session.frame(&mut t, &manual);
+            if let Ok(msgs) = step {
+                for msg in msgs {
+                    f.write_all(&(msg.len() as u32).to_le_bytes()).unwrap();
+                    f.write_all(&msg).unwrap();
+                    records += 1;
+                    bytes += msg.len();
+                }
+            }
+            if let Some(cd) = session.clientdata.as_ref() {
+                let o = cd.origin();
+                let base = *first_origin.get_or_insert(o);
+                max_travel = max_travel
+                    .max(((o[0] - base[0]).powi(2) + (o[1] - base[1]).powi(2)).sqrt());
+                if last_state.elapsed() >= Duration::from_millis(700) {
+                    eprintln!(
+                        "  DRIVE t+{:>4.0}s origin [{:>6.0} {:>6.0} {:>6.1}] on_ground {} hp {:.0}",
+                        t0, o[0], o[1], o[2], cd.on_ground(), cd.health()
+                    );
+                    last_state = Instant::now();
+                }
+            }
+            continue;
+        }
         let step = if env::var("AIPLAYERS_NO_MOVES").is_ok() {
             session.pump(&mut t, &[netchan::clc::NOP])
         } else {
@@ -284,10 +325,10 @@ fn main() {
                 let queued = session.console.len();
                 if let Some(dec) = session.last_decision {
                     eprintln!(
-                        "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} reroutes {}",
+                        "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} reroutes {} stuck {}",
                         dec.alive, dec.in_game, dec.forwardmove, dec.sidemove, dec.yaw,
                         dec.site.map(|s| [s[0] as i32, s[1] as i32]),
-                        dec.waypoints_left, dec.reroutes,
+                        dec.waypoints_left, dec.reroutes, dec.stuck,
                     );
                 }
                 if let Some(d) = session.decoder.as_ref() {

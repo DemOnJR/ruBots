@@ -43,6 +43,29 @@ pub struct PathFollower {
     /// Waypoints skipped because we could not reach them. Diagnostic: a bot
     /// that constantly re-routes is a graph problem, not a steering one.
     pub reroutes: u32,
+    /// How long we have been trying to get unstuck, and which way we are
+    /// currently leaning. See [`Unstick`].
+    unstick_for: f32,
+    unstick_dir: f32,
+}
+
+/// What to add to the steering while blocked.
+///
+/// A route says which way to *want* to go; it says nothing about the door
+/// frame you are standing in. Walking straight at a waypoint pins a solid
+/// player against geometry and it stays there forever -- measured: the brain
+/// commanding `forwardmove 250` at the correct bearing, on the ground, alive,
+/// with the origin not changing at all for tens of seconds. Sweeping the view
+/// by hand freed it immediately, which is what proved the movement layer was
+/// never at fault.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Unstick {
+    /// Sideways push, in the same units as `forwardmove`.
+    pub sidemove: f32,
+    /// Whether to jump this tick — clears knee-high lips and crates.
+    pub jump: bool,
+    /// Extra yaw to add, so we stop staring at the wall we cannot pass.
+    pub yaw_bias: f32,
 }
 
 fn dist2d(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -52,7 +75,7 @@ fn dist2d(a: [f32; 3], b: [f32; 3]) -> f32 {
 
 impl PathFollower {
     pub fn new() -> Self {
-        Self::default()
+        Self { unstick_dir: 1.0, ..Self::default() }
     }
 
     pub fn path_len(&self) -> usize {
@@ -70,6 +93,32 @@ impl PathFollower {
         self.at = 0;
         self.goal = None;
         self.stuck_for = 0.0;
+        self.unstick_for = 0.0;
+    }
+
+    /// Are we currently blocked?
+    pub fn is_stuck(&self) -> bool {
+        self.unstick_for > 0.0
+    }
+
+    /// Steering to add while blocked, if anything.
+    ///
+    /// Escalates rather than repeating one trick: strafe first, then strafe
+    /// and jump, then swing the view away from the obstacle. Alternates
+    /// direction each time it gives up on a side, because a corner needs the
+    /// other one.
+    pub fn unstick(&self) -> Option<Unstick> {
+        if self.unstick_for <= 0.0 {
+            return None;
+        }
+        let dir = self.unstick_dir;
+        Some(if self.unstick_for < 0.6 {
+            Unstick { sidemove: 250.0 * dir, jump: false, yaw_bias: 0.0 }
+        } else if self.unstick_for < 1.4 {
+            Unstick { sidemove: 250.0 * dir, jump: true, yaw_bias: 25.0 * dir }
+        } else {
+            Unstick { sidemove: 180.0 * dir, jump: true, yaw_bias: 60.0 * dir }
+        })
     }
 
     /// The point the bot should steer at right now.
@@ -94,13 +143,22 @@ impl PathFollower {
         // are rather than insisting on a waypoint we cannot reach.
         if speed < STUCK_SPEED {
             self.stuck_for += dt;
+            // Start evading well before giving up on the waypoint: the route
+            // is usually right and only the last few feet are blocked.
+            self.unstick_for += dt;
             if self.stuck_for >= STUCK_SECONDS {
                 self.stuck_for = 0.0;
                 self.reroutes += 1;
+                // Try the other side next time; a corner needs the opposite
+                // one, and repeating a failed direction is how a bot spends a
+                // whole round grinding against the same wall.
+                self.unstick_dir = -self.unstick_dir;
+                self.unstick_for = 0.0;
                 self.advance_past_blocked(grid, from, goal);
             }
         } else {
             self.stuck_for = 0.0;
+            self.unstick_for = 0.0;
         }
 
         // Consume every waypoint we have already reached. More than one can
@@ -210,6 +268,88 @@ mod tests {
             f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
         }
         assert!(f.reroutes > 0, "never noticed it was stuck");
+    }
+
+    /// A blocked bot must try something different, and escalate rather than
+    /// repeat one trick. Measured before this existed: forwardmove 250 at the
+    /// correct bearing, on the ground, alive, origin unchanged for tens of
+    /// seconds -- a route stays perfectly valid while the player is wedged in
+    /// a door frame.
+    #[test]
+    fn being_blocked_escalates_strafe_then_jump_then_turn() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+        let mut f = PathFollower::new();
+
+        // Moving: nothing to correct.
+        f.next_waypoint(&map.grid, start, goal, 250.0, 0.02);
+        assert!(f.unstick().is_none(), "a moving bot must not be nudged");
+
+        // Blocked: strafe first, no jump yet.
+        for _ in 0..15 {
+            f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
+        }
+        let a = f.unstick().expect("blocked bot should be nudged");
+        assert!(a.sidemove.abs() > 0.0, "first response is a sidestep");
+        assert!(!a.jump);
+
+        // Still blocked: add the jump.
+        for _ in 0..40 {
+            f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
+        }
+        let b = f.unstick().expect("still blocked");
+        assert!(b.jump, "a persistent block should provoke a jump");
+        assert!(b.yaw_bias.abs() > 0.0, "and stop staring at the wall");
+    }
+
+    /// Moving again must clear it, or the bot strafes across the whole map.
+    #[test]
+    fn moving_again_clears_the_nudge() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+        let mut f = PathFollower::new();
+
+        for _ in 0..20 {
+            f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
+        }
+        assert!(f.unstick().is_some());
+        f.next_waypoint(&map.grid, start, goal, 250.0, 0.02);
+        assert!(f.unstick().is_none(), "nudge must stop once we are moving");
+    }
+
+    /// Repeating a failed direction is how a bot spends a round grinding
+    /// against one wall; a corner needs the other side.
+    #[test]
+    fn giving_up_on_a_waypoint_switches_the_evade_direction() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+        let mut f = PathFollower::new();
+
+        for _ in 0..15 {
+            f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
+        }
+        let first = f.unstick().expect("blocked").sidemove.signum();
+        // Drive it past the reroute threshold, which flips the side.
+        for _ in 0..80 {
+            f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
+        }
+        for _ in 0..15 {
+            f.next_waypoint(&map.grid, start, goal, 0.0, 0.02);
+        }
+        let second = f.unstick().expect("still blocked").sidemove.signum();
+        assert_ne!(first, second, "must try the other side after giving up");
     }
 
     #[test]
