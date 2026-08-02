@@ -68,24 +68,30 @@ COPY --chown=steam:steam rehlds/ /home/steam/hlds/
 RUN chmod +x /home/steam/hlds/hlds_linux \
  && find /home/steam/hlds -name '*.so' -exec chmod +x {} +
 
-# Baked-in copies so the image boots sanely even without the compose bind
-# mounts. docker-compose then mounts the same three files read-only, which is
-# what makes an edit take effect without a rebuild.
+# Our config, baked in so the image boots correctly on its own. Copied AFTER
+# the bundle so ours win over the ones it ships. docker-compose additionally
+# mounts cfg/ as a DIRECTORY and the entrypoint re-copies from it at start, so
+# an edit needs only a `docker compose restart`.
+#
+# Do NOT bind-mount these as individual files: HLDS's filesystem_stdio cannot
+# stat a single-file bind mount under Docker Desktop and silently runs with no
+# config at all ("_stat on file ... which appeared to exist failed" /
+# "exec: not enough space for server.cfg").
 #
 # NOTE the precedence, verified in source: the engine exec's server.cfg exactly
 # once at startup (rehlds/engine/sys_dll2.cpp:669), while ReGameDLL's
 # InstallGameRules exec's game.cfg on EVERY map load
 # (regamedll/dlls/gamerules.cpp:136). game.cfg therefore WINS from the first map
 # change onward. Anything that must survive a map change goes in game.cfg.
-#
-# Copied AFTER the bundle so ours win over the ones it ships.
-COPY --chown=steam:steam server.cfg /home/steam/hlds/cstrike/server.cfg
-COPY --chown=steam:steam game.cfg /home/steam/hlds/cstrike/game.cfg
-COPY --chown=steam:steam mapcycle.txt /home/steam/hlds/cstrike/mapcycle.txt
+COPY --chown=steam:steam cfg/ /home/steam/hlds/cstrike/
 
 # Log_Open writes L<MM><DD><NNN>.log here (rehlds/engine/sv_log.cpp:117-168).
 # Created up front so the compose bind mount lands on a steam-owned directory.
 RUN mkdir -p /home/steam/hlds/cstrike/logs
+
+COPY --chown=steam:steam entrypoint.sh /home/steam/entrypoint.sh
+RUN chmod +x /home/steam/entrypoint.sh
+ENTRYPOINT ["/home/steam/entrypoint.sh"]
 
 WORKDIR /home/steam/hlds
 ENV LD_LIBRARY_PATH=/home/steam/hlds:/home/steam/hlds/cstrike
