@@ -40,6 +40,19 @@ pub struct Decision {
     pub waypoints_left: usize,
     pub reroutes: u32,
     pub stuck: bool,
+    /// `IN_ATTACK` this tick — also how a plant in progress shows up.
+    pub attack: bool,
+    /// `IN_USE` this tick — defusing, and hostages.
+    pub use_action: bool,
+    /// The bot believes it is carrying the C4.
+    pub carrying_bomb: bool,
+    /// The plant machine has the button down and the timer running.
+    pub arming: bool,
+    /// Straight-line distance to the objective, which is the number that
+    /// actually says whether the navigation is working.
+    pub to_goal: f32,
+    /// Which rung of the brain's ladder decided this tick.
+    pub rung: &'static str,
 }
 
 /// Where a session is in its lifecycle.
@@ -962,6 +975,13 @@ impl Session {
                 intent.view.yaw = bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
             }
         }
+        let to_goal = self
+            .site
+            .map(|g| {
+                let (dx, dy) = (g[0] - world.me.origin[0], g[1] - world.me.origin[1]);
+                (dx * dx + dy * dy).sqrt()
+            })
+            .unwrap_or(f32::NAN);
         self.last_decision = Some(Decision {
             alive: world.me.alive,
             in_game: world.me.freeze_period,
@@ -972,6 +992,12 @@ impl Session {
             waypoints_left: self.follower.remaining(),
             reroutes: self.follower.reroutes,
             stuck: self.follower.is_stuck(),
+            attack: intent.attack,
+            use_action: intent.use_action,
+            carrying_bomb: world.bomb.carried_by_me,
+            arming: self.brain.as_ref().is_some_and(|b| b.plant.is_arming()),
+            to_goal,
+            rung: self.brain.as_ref().map_or("none", |b| b.rung),
         });
 
         for cmd in &intent.commands {

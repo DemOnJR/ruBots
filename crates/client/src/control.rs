@@ -28,6 +28,12 @@ pub fn intent_to_usercmd(intent: &Intent, msec: u8) -> UserCmd {
     if intent.attack {
         btn |= buttons::ATTACK;
     }
+    if intent.attack2 {
+        btn |= buttons::ATTACK2;
+    }
+    if intent.reload {
+        btn |= buttons::RELOAD;
+    }
     if intent.jump {
         btn |= buttons::JUMP;
     }
@@ -37,10 +43,22 @@ pub fn intent_to_usercmd(intent: &Intent, msec: u8) -> UserCmd {
     if intent.use_action {
         btn |= buttons::USE;
     }
+    if intent.score {
+        btn |= buttons::SCORE;
+    }
     if intent.forwardmove > 0.0 {
         btn |= buttons::FORWARD;
     } else if intent.forwardmove < 0.0 {
         btn |= buttons::BACK;
+    }
+    // The strafe buttons are redundant for movement -- `PM_PlayerMove`
+    // integrates `sidemove` and never reads them -- but a real client always
+    // sets them alongside the axis, and moving with no matching button held is
+    // a signature no human client produces.
+    if intent.sidemove > 0.0 {
+        btn |= buttons::MOVERIGHT;
+    } else if intent.sidemove < 0.0 {
+        btn |= buttons::MOVELEFT;
     }
 
     UserCmd {
@@ -124,6 +142,52 @@ mod tests {
         let b = u32::from(cmd.buttons);
         assert!(b & buttons::BACK != 0);
         assert!(b & buttons::FORWARD == 0);
+    }
+
+    /// Every button the bot can ask for must actually reach the wire.
+    ///
+    /// This is a coverage test rather than a behaviour one because the failure
+    /// it guards against is silent: `reload` and `attack2` were both plumbed
+    /// all the way through the brain, set correctly by the fire-control layer,
+    /// and then dropped on the floor here. Nothing downstream complains -- the
+    /// bot simply never reloads and never un-zooms, which reads as "the combat
+    /// logic is wrong" for as long as you are looking at the combat logic.
+    #[test]
+    fn every_intent_button_reaches_the_bitmask() {
+        let all = Intent {
+            attack: true,
+            attack2: true,
+            reload: true,
+            jump: true,
+            duck: true,
+            use_action: true,
+            score: true,
+            ..Intent::default()
+        };
+        let b = u32::from(intent_to_usercmd(&all, 20).buttons);
+        for (name, bit) in [
+            ("attack", buttons::ATTACK),
+            ("attack2", buttons::ATTACK2),
+            ("reload", buttons::RELOAD),
+            ("jump", buttons::JUMP),
+            ("duck", buttons::DUCK),
+            ("use", buttons::USE),
+            ("score", buttons::SCORE),
+        ] {
+            assert!(b & bit != 0, "`{name}` never reached the buttons mask");
+        }
+        // ...and an empty intent presses nothing at all.
+        assert_eq!(intent_to_usercmd(&Intent::default(), 20).buttons, 0);
+    }
+
+    #[test]
+    fn strafing_sets_the_matching_direction_bit() {
+        let right = intent_to_usercmd(&Intent { sidemove: 250.0, ..Intent::default() }, 20);
+        let left = intent_to_usercmd(&Intent { sidemove: -250.0, ..Intent::default() }, 20);
+        assert!(u32::from(right.buttons) & buttons::MOVERIGHT != 0);
+        assert!(u32::from(right.buttons) & buttons::MOVELEFT == 0);
+        assert!(u32::from(left.buttons) & buttons::MOVELEFT != 0);
+        assert!(u32::from(left.buttons) & buttons::MOVERIGHT == 0);
     }
 
     /// End to end against the REAL `usercmd_t` table: an Intent aiming at yaw

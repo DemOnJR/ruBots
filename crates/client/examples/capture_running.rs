@@ -330,6 +330,11 @@ fn main() {
                         dec.site.map(|s| [s[0] as i32, s[1] as i32]),
                         dec.waypoints_left, dec.reroutes, dec.stuck,
                     );
+                    eprintln!(
+                        "      obj: rung {:<10} bomb {} arming {} attack {} use {} to_goal {:.0}",
+                        dec.rung, dec.carrying_bomb, dec.arming, dec.attack, dec.use_action,
+                        dec.to_goal,
+                    );
                 }
                 if let Some(d) = session.decoder.as_ref() {
                     eprintln!(

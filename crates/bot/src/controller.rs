@@ -102,6 +102,14 @@ pub struct Controller {
     /// The weapon we last saw ourselves holding, so the fire latches can be
     /// cleared on a switch.
     last_weapon: WeaponId,
+    /// Which rung of the ladder produced the last [`Intent`].
+    ///
+    /// Purely diagnostic, and worth the field. The ladder is exclusive by
+    /// design, so "the bot stood still" has as many explanations as there are
+    /// rungs and no way to tell them apart from the outside -- every one of
+    /// them can legitimately emit `forwardmove: 0.0`. Reading this off a live
+    /// run replaces an afternoon of narrowing down which branch it was.
+    pub rung: &'static str,
 }
 
 impl Controller {
@@ -120,6 +128,7 @@ impl Controller {
             tracking: None,
             aim_offset: (Angles::default(), f32::INFINITY),
             last_weapon: WeaponId::None,
+            rung: "init",
         }
     }
 
@@ -212,6 +221,7 @@ impl Controller {
         // --- 1) Dead -------------------------------------------------------
         if !world.me.alive {
             self.reset_for_death();
+            self.rung = "dead";
             return Intent::hold(self.wire_view(world));
         }
 
@@ -226,6 +236,7 @@ impl Controller {
             let view = self.idle.apply(self.wire_view(world));
             let mut intent = Intent::hold(view);
             intent.commands = self.buy_plan(world);
+            self.rung = "freeze";
             return intent;
         }
 
@@ -264,6 +275,7 @@ impl Controller {
                 self.plant.note_released();
             }
 
+            self.rung = "combat";
             return Intent {
                 view: self.wire_view(world),
                 // Close only when we still need to; hold ground in a knife-fight
@@ -284,6 +296,7 @@ impl Controller {
             if let Some(look) = defuse.look_at {
                 self.view = turn_toward(self.view, aim_angles(world.me.origin, look), max_turn);
             }
+            self.rung = "defuse";
             return Intent {
                 view: self.wire_view(world),
                 forwardmove: if defuse.move_to.is_some() { FORWARD_SPEED } else { 0.0 },
@@ -315,6 +328,7 @@ impl Controller {
                 if let Some(w) = out.select {
                     intent.commands.push(BotCommand::Select(w));
                 }
+                self.rung = if arrived { "plant" } else { "plant-walk" };
                 return intent;
             }
         }
@@ -326,6 +340,7 @@ impl Controller {
                 self.view = turn_toward(self.view, aim_angles(world.me.origin, look), max_turn);
             }
             let speed = if escort.walk { WALK_SPEED } else { FORWARD_SPEED };
+            self.rung = "hostage";
             return Intent {
                 view: self.wire_view(world),
                 forwardmove: if escort.move_to.is_some() { speed } else { 0.0 },
@@ -353,6 +368,7 @@ impl Controller {
         if let Some(t) = self.objective.target.or(site) {
             self.view = turn_toward(self.view, aim_angles(world.me.origin, t), max_turn);
             let arrived = distance2d(world.me.origin, t) < ARRIVE_RADIUS;
+            self.rung = if arrived { "arrived" } else { "goto" };
             return Intent {
                 view: self.wire_view(world),
                 forwardmove: if arrived { 0.0 } else { FORWARD_SPEED },
@@ -366,6 +382,7 @@ impl Controller {
         // axes to have moved by 0.1 degrees between two samples five seconds
         // apart, and standing perfectly still gets the bot kicked.
         let action = self.fire.decide(&world.me.weapon_or_unknown(), false);
+        self.rung = "idle";
         Intent {
             view: self.idle.apply(self.wire_view(world)),
             reload: action.reload,

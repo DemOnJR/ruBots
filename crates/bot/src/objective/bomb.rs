@@ -213,6 +213,29 @@ impl PlantMachine {
             return PlantOutput { attack: false, select: Some(WeaponId::C4) };
         }
 
+        // Deploying the C4 sets `m_flNextAttack = 0.75` (`DefaultDeploy`,
+        // `dlls/weapons.cpp:1509`) and `CBasePlayer::ItemPostFrame` returns
+        // early for as long as that is in the future (`dlls/player.cpp:7422`).
+        // So the first three quarters of a second of held `IN_ATTACK` after the
+        // switch are simply not seen: `CC4::PrimaryAttack` is never reached and
+        // no arming starts.
+        //
+        // Hold the button through it -- releasing is what cancels an arm, and
+        // there is nothing to cancel yet -- but do not start a clock the server
+        // has not started. Counting from the press instead would put our timer
+        // 0.75 s ahead of the server's for the whole plant, which turns the
+        // give-up deadline into a race we can lose for reasons that have
+        // nothing to do with the plant.
+        //
+        // The weapon's own countdown answers this exactly rather than by
+        // modelling it: `m_flNextPrimaryAttack` rides in `weapon_data_t`, and
+        // `<= 0` means the server will act on the button now.
+        if !me.weapon_or_unknown().primary_ready() {
+            self.phase = PlantPhase::Selecting;
+            self.held = 0.0;
+            return PlantOutput { attack: true, select: None };
+        }
+
         if !self.is_arming() {
             self.phase = PlantPhase::Arming;
             self.held = 0.0;
@@ -481,6 +504,31 @@ mod tests {
         assert!(m.held >= C4_ARMING_ON_TIME, "held only {}", m.held);
         assert_eq!(m.phase, PlantPhase::Arming);
         assert_eq!(m.released_ticks, 0);
+    }
+
+    /// Switching to the C4 costs 0.75 s of `m_flNextAttack` before
+    /// `ItemPostFrame` will look at the button at all. The bot must hold the
+    /// button through that window -- letting go is what cancels an arm -- but
+    /// must not credit itself for time the server never counted.
+    #[test]
+    fn the_arming_clock_starts_when_the_server_will_accept_the_button() {
+        let mut m = PlantMachine::default();
+        let mut w = carrier_at(SITE, true, WeaponId::C4);
+        // Freshly deployed: the countdown is still running.
+        w.me.weapon.as_mut().unwrap().next_primary_attack = 0.75;
+
+        for _ in 0..15 {
+            let out = m.tick(&w, 0.05);
+            assert!(out.attack, "the button has to stay down across the deploy delay");
+        }
+        assert_eq!(m.held, 0.0, "counted {} s the server had not started", m.held);
+        assert_eq!(m.phase, PlantPhase::Selecting);
+
+        // The countdown expires; now the clock is real.
+        w.me.weapon.as_mut().unwrap().next_primary_attack = 0.0;
+        m.tick(&w, 0.05);
+        assert_eq!(m.phase, PlantPhase::Arming);
+        assert!((m.held - 0.05).abs() < 1e-6, "held {}", m.held);
     }
 
     #[test]
