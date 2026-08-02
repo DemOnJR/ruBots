@@ -135,6 +135,11 @@ pub struct Session {
     /// frame we never parsed makes the server delta against a world we do not
     /// have.
     pub last_valid_frame: Option<u32>,
+    /// Every user message the server has registered with `svc_newusermsg`,
+    /// learned by [`trace_message`](Session::trace_message) as the
+    /// registrations are walked over. Without it the walker cannot size a user
+    /// message and has to stop at the first one.
+    pub user_msgs: crate::stream::UserMsgTable,
 }
 
 /// Counters for the receive pipeline, so a stall can be attributed to the
@@ -182,6 +187,7 @@ impl Session {
             decoder: None,
             cmd_history: std::collections::VecDeque::new(),
             last_valid_frame: None,
+            user_msgs: crate::stream::UserMsgTable::new(),
         }
     }
 
@@ -622,6 +628,14 @@ impl Session {
             };
             let text = String::from_utf8_lossy(&rest[..end]).to_string();
             let head = text.split_whitespace().next().unwrap_or("");
+            // Every console command the server pushes at us, verbatim. An
+            // anticheat's whole interface to a client is stufftext, so this is
+            // the only place its demands are visible -- and a command we do not
+            // recognise is silently dropped, which is indistinguishable from a
+            // server that never asked for anything.
+            if std::env::var_os("AIPLAYERS_TRACE_STUFF").is_some() {
+                eprintln!("  <<stufftext>> {:?}", text.trim());
+            }
             if Self::ECHO_COMMANDS.contains(&head) {
                 let cmd = text.trim_end_matches(['\n', '\r']).to_string();
                 self.send_command(&cmd);
@@ -1455,6 +1469,48 @@ impl Session {
         !self.chan.reliable_in_flight() && self.chan.queued_count() == 0
     }
 
+    /// Re-assert our name now that the server has put us in the world.
+    ///
+    /// A bot that lands on a client slot recycled from an earlier bot has its
+    /// name replaced by that bot's — the name in the `connect` userinfo does
+    /// **not** win. [`Identity::setinfo_name_command`] documents the whole
+    /// chain, engine line by engine line. Call this once the spawn has gone
+    /// through: by then the edict is ours, so the `setinfo` is accepted (or,
+    /// if we happen to be dead, applied by ReGameDLL at the next respawn).
+    ///
+    /// Idempotent and cheap — a `setinfo` whose value already matches is
+    /// discarded by `PF_SetClientKeyValue_I` (`rehlds/engine/pr_cmds.cpp:1660`)
+    /// before it reaches the game DLL.
+    pub fn reassert_name(&mut self) {
+        let cmd = self.client.identity.setinfo_name_command();
+        self.send_command(&cmd);
+    }
+
+    /// The name this session asked the server for.
+    pub fn name(&self) -> &str {
+        self.client.identity.wire_name()
+    }
+
+    /// Leave the server cleanly instead of just going quiet.
+    ///
+    /// Queues [`Client::DISCONNECT_COMMAND`] and pumps until the server has
+    /// acknowledged it (or `timeout` elapses). Skipping this is what leaves a
+    /// ghost holding a client slot for the whole `sv_timeout`, and the ghost is
+    /// what the next bot inherits its name from.
+    pub fn disconnect<T: Transport>(&mut self, t: &mut T, timeout: Duration) -> io::Result<()> {
+        self.send_command(Client::DISCONNECT_COMMAND);
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            // Drive the channel until the reliable carrying `dropclient` has
+            // been acknowledged; an unsent queue entry is not a disconnect.
+            self.pump(t, &[netchan::clc::NOP])?;
+            if self.reliables_settled() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Flip the echoed reliable-acknowledgement bit.
     ///
     /// **Kept only as a documented negative result.** The in-game stall looked
@@ -1661,6 +1717,74 @@ mod tests {
         let s = Session::new(Identity::default());
         assert_eq!(s.cvar_value("definitely_not_a_cvar"), "");
         assert_eq!(s.cvar_value("cl_lw"), "1");
+    }
+
+    /// The name in the connect userinfo does not always survive: a bot given a
+    /// client slot recycled from an earlier bot has it replaced by that bot's
+    /// name (Identity::setinfo_name_command has the engine-level chain). This
+    /// is the repair -- and it has to be the real `clc_stringcmd`, because
+    /// nothing else can change a userinfo key after the handshake.
+    #[test]
+    fn reassert_name_queues_a_setinfo_stringcmd_for_our_own_name() {
+        let mut s = Session::new(Identity { name: "Bot03".into(), ..Default::default() });
+        assert_eq!(s.chan.queued_count(), 0);
+        s.reassert_name();
+        assert_eq!(s.chan.queued_count(), 1);
+
+        let payload = NetChannel::string_command("setinfo \"name\" \"Bot03\"");
+        assert_eq!(payload[0], netchan::clc::STRINGCMD);
+        assert_eq!(
+            &payload[1..payload.len() - 1],
+            b"setinfo \"name\" \"Bot03\"",
+            "must carry OUR name, not the default"
+        );
+        assert_eq!(*payload.last().unwrap(), 0, "stringcmd is NUL terminated");
+        assert_eq!(s.name(), "Bot03");
+    }
+
+    /// Leaving without a `dropclient` is what creates the ghost the next bot
+    /// inherits its name from: the slot stays `connected` for the whole
+    /// sv_timeout with `cl->name` intact, because only `SV_DropClient` clears
+    /// it (rehlds/engine/host.cpp:504).
+    #[test]
+    fn disconnect_puts_the_dropclient_command_on_the_wire() {
+        struct Sink {
+            sent: Vec<Vec<u8>>,
+        }
+        impl Transport for Sink {
+            fn send(&mut self, data: &[u8]) -> io::Result<()> {
+                self.sent.push(data.to_vec());
+                Ok(())
+            }
+            fn recv(&mut self) -> io::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+        }
+
+        let mut s = Session::new(Identity::default());
+        let mut t = Sink { sent: Vec::new() };
+        s.disconnect(&mut t, Duration::from_millis(150)).unwrap();
+
+        assert!(!t.sent.is_empty(), "disconnect must put a packet on the wire");
+
+        // Peel the netchannel off every packet and look for the actual bytes.
+        //
+        // The previous version of this assertion was
+        //     s.chan.reliable_in_flight() || s.chan.queued_count() == 0
+        // which passes when NOTHING was queued -- precisely the failure it
+        // claimed to catch. An assertion that cannot fail is worse than no
+        // assertion, because it reports coverage that does not exist.
+        let found = t.sent.iter().any(|pkt| {
+            if pkt.len() <= 8 {
+                return false;
+            }
+            let seq = u32::from_le_bytes(pkt[0..4].try_into().unwrap()) & 0x3FFF_FFFF;
+            let mut body = pkt[8..].to_vec();
+            let n = body.len() - body.len() % 4;
+            proto::munge::unmunge(&mut body[..n], &proto::munge::TABLE2, seq as i32);
+            body.windows(10).any(|w| w == b"dropclient")
+        });
+        assert!(found, "no packet on the wire carried `dropclient`");
     }
 
     use super::*;

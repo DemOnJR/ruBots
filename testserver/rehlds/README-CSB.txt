@@ -34,14 +34,14 @@ COMPONENTS
                          license: GPL-3.0
   ReAPI                  5.29.0.358         https://github.com/rehlds/ReAPI
                          license: GPL-3.0
+  ReAuthCheck            0.1.6              
+                         license: Freeware
   ReChecker              2.7                https://github.com/rehlds/rechecker
                          license: GPL-3.0
   ReSemiclip             2.4.3              https://github.com/rehlds/ReSemiclip
                          license: GPL-3.0
   SafeNameAndChat        1.2Beta3           https://github.com/WPMGPRoSToTeMa/SafeNameAndChat
                          license: Open source
-  Revoice                0.1.0.34           https://github.com/rehlds/Revoice
-                         license: GPL-3.0
 
 Each component is redistributed under its own license, unmodified, from its
 official release channel. Follow the links above for sources and terms.

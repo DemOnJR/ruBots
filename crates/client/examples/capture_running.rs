@@ -198,6 +198,12 @@ fn main() {
         match session.join_and_spawn(&mut t, team, Duration::from_secs(15)) {
             Ok(true) => {
                 eprintln!("  *** TEAM ACCEPTED -- joined ***");
+                // Say our name again now that the edict is ours. If this slot
+                // was recycled from an earlier bot, the name in the connect
+                // userinfo was quietly reverted to that bot's by ReGameDLL --
+                // see Identity::setinfo_name_command for the whole chain.
+                session.reassert_name();
+                eprintln!("  re-asserted name {:?}", session.name());
                 session.refresh_objective(0);
                 if let Some(site) = session.site {
                     eprintln!("  objective: [{:.0} {:.0} {:.0}]", site[0], site[1], site[2]);
@@ -508,4 +514,13 @@ fn main() {
          (reliables settled: {})",
         session.reliables_settled()
     );
+
+    // Say goodbye. Exiting without this leaves the slot `connected` for the
+    // whole sv_timeout (120 s), still holding our name and our edict -- and the
+    // next bot to connect from this address is treated as our reconnect and
+    // inherits that name. See Client::DISCONNECT_COMMAND.
+    match session.disconnect(&mut t, Duration::from_secs(2)) {
+        Ok(()) => eprintln!("disconnected cleanly (slot released)"),
+        Err(e) => eprintln!("disconnect failed: {e}"),
+    }
 }

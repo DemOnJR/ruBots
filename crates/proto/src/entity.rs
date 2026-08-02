@@ -813,7 +813,8 @@ pub struct Baselines {
 /// carries baselines is `svc_spawnbaseline`, whose block is bit-packed, so a
 /// caller that cannot walk the byte stream to it has to *guess* — and the one
 /// in this workspace guesses by scanning for a bare byte 22
-/// (`client/src/world.rs`, `Decoder::absorb_baselines`).
+/// (`client/src/world.rs`, formerly `Decoder::absorb_baselines`, now located by the
+/// stream walker).
 ///
 /// A guess that lands in the middle of a user-message burst used to be
 /// **accepted**: an 894-byte round-restart record from `captures/swarm/Bot02.bin`

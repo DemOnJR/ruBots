@@ -162,6 +162,18 @@ impl UdpTransport {
     }
 }
 
+/// The longest name the engine keeps.
+///
+/// `MAX_NAME` is 32 *including* the NUL (`rehlds/engine/server.h:35`) and every
+/// copy the server makes is `Q_strncpy(dst, val, MAX_NAME - 1)`
+/// (`sv_main.cpp:2076`, `sv_main.cpp:2235`, `sv_main.cpp:5328`), so 31 bytes is
+/// all that survives. Two longer names sharing a 31-byte prefix arrive as the
+/// *same* name and the second is then renamed `(1)…` by
+/// `SV_CheckForDuplicateNames` (`sv_main.cpp:2060-2109`) — which is why the
+/// clamp happens here, where the caller can still see it, rather than silently
+/// on the server.
+pub const MAX_NAME: usize = 31;
+
 /// How the bot identifies itself.
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -202,6 +214,58 @@ impl Identity {
         pairs.iter().map(|(k, v)| format!("\\{k}\\{v}")).collect()
     }
 
+    /// The name as the server will actually hold it: clamped to [`MAX_NAME`]
+    /// on a character boundary.
+    pub fn wire_name(&self) -> &str {
+        let mut end = self.name.len().min(MAX_NAME);
+        while end > 0 && !self.name.is_char_boundary(end) {
+            end -= 1;
+        }
+        &self.name[..end]
+    }
+
+    /// `setinfo "name" "<name>"` — the `clc_stringcmd` a real client sends when
+    /// a userinfo cvar changes (`rehlds/engine/cvar.cpp:267-268`, verbatim
+    /// `setinfo "%s" "%s"`), and the only way to correct a name once the
+    /// connect handshake is over.
+    ///
+    /// **This is not decoration — it is half the fix for ghost names.** The
+    /// name in the `connect` userinfo can be *silently replaced* by the name of
+    /// whoever last used the client slot, and re-asserting it after the spawn
+    /// is what puts it back. Full chain, all verified:
+    ///
+    /// 1. Our processes never say goodbye, so a finished bot's slot stays
+    ///    `connected` on the server for `sv_timeout` (120 s) with its `name`,
+    ///    its edict and its `pvPrivateData` intact.
+    /// 2. Every bot reaches the server from one address (the Docker gateway),
+    ///    and ReHLDS matches a connect onto an existing slot by **base address
+    ///    only** once that slot has been quiet for 10 s
+    ///    (`sv_main.cpp:2378-2384`) — it never checks `client->connected`. So a
+    ///    new bot is treated as the *reconnect* of the dead one.
+    /// 3. The reconnect branch (`sv_main.cpp:2397-2412`) calls
+    ///    `pfnClientDisconnect` but **not** `SV_DropClient`, so unlike a clean
+    ///    drop (`host.cpp:504`, `cl->name[0] = 0`) the ghost's name survives.
+    /// 4. `SV_ExtractFromUserinfo` hands the userinfo to the game DLL at
+    ///    `sv_main.cpp:5325` and only copies the new name into `cl->name`
+    ///    afterwards, at `sv_main.cpp:5328` — so during that call
+    ///    `pev->netname` still reads the ghost's name.
+    /// 5. ReGameDLL therefore sees a *name change*
+    ///    (`regamedll/dlls/client.cpp:3756`), asks
+    ///    `CBasePlayer::SetClientUserInfoName`, which refuses because the ghost
+    ///    is dead (`regamedll/dlls/player.cpp:225-231`), and puts the old name
+    ///    back into the buffer (`client.cpp:3773-3776`).
+    /// 6. That reverted name is what `sv_main.cpp:5328` stores, what `status`
+    ///    prints, and what `"<name>" entered the game`
+    ///    (`multiplay_gamerules.cpp:3407`) reports.
+    ///
+    /// After our own spawn the edict is ours again (`SV_WriteSpawn` resets it,
+    /// `sv_main.cpp:1404-1409`), so this `setinfo` is accepted — immediately if
+    /// we are alive, and otherwise deferred by ReGameDLL to our next respawn
+    /// (`player.cpp:227-228` stores it, `player.cpp:6087-6097` applies it).
+    pub fn setinfo_name_command(&self) -> String {
+        format!("setinfo \"name\" \"{}\"", self.wire_name())
+    }
+
     /// The certificate-bearing half of the connect packet.
     pub fn protinfo(&self) -> String {
         let cdkey = auth::cdkey_hash(&self.key);
@@ -236,7 +300,8 @@ impl Identity {
             ("cl_lw", "1"),
             ("cl_updaterate", &up),
             ("model", "gordon"),
-            ("name", &self.name),
+            // Clamped here rather than left to the server: see [`MAX_NAME`].
+            ("name", self.wire_name()),
             ("topcolor", "30"),
             ("_vgui_menus", "1"),
             ("_ah", "1"),
@@ -294,6 +359,22 @@ pub const RETRY_INTERVAL: Duration = Duration::from_millis(1500);
 pub const MAX_RETRIES: u32 = 6;
 
 impl Client {
+    /// The `clc_stringcmd` that ends the session cleanly.
+    ///
+    /// `dropclient` is on the engine's client-command whitelist
+    /// (`rehlds/engine/sv_user.cpp:45`, checked by `SV_ValidateClientCommand`)
+    /// and reaches `SV_Drop_f` (`sv_main.cpp:8144-8155`), which calls
+    /// `SV_DropClient`. That is what actually frees the slot: `cl->name[0] = 0`,
+    /// `cl->edict = NULL` and a zeroed `cl->userinfo`
+    /// (`rehlds/engine/host.cpp:504-519`).
+    ///
+    /// Without it the slot stays `connected` for the whole `sv_timeout`, and
+    /// the next bot to connect from the same address inherits its name — see
+    /// [`Identity::setinfo_name_command`] for the full chain. Sending it is the
+    /// half of the fix that prevents the problem; the `setinfo` is the half
+    /// that repairs it when a bot was killed and never got to send this.
+    pub const DISCONNECT_COMMAND: &'static str = "dropclient";
+
     pub fn new(identity: Identity) -> Self {
         Self {
             state: State::Disconnected,
@@ -576,5 +657,89 @@ mod tests {
         let u = id.userinfo();
         assert!(u.contains("\\name\\Bravo"), "{u}");
         assert!(u.contains("\\rate\\30000"), "{u}");
+    }
+
+    /// The headline guarantee: launch N bots with N names and the server is
+    /// asked for exactly those N names, once each.
+    ///
+    /// This is the regression guard for a swarm that connected as `Bot01..Bot04`
+    /// and appeared in the server log as `NoCert`, `NoCdKey`, `(1)AIPlayer` and
+    /// `Bot04` — three of four wearing the names of *earlier* clients whose
+    /// slots they were given. The half of that bug the connect packet can be
+    /// blamed for is this one: every bot must put its own name in its own
+    /// userinfo. (The other half is repaired after the spawn — see
+    /// [`Identity::setinfo_name_command`] — and prevented by
+    /// [`Client::DISCONNECT_COMMAND`].)
+    #[test]
+    fn n_bots_ask_for_n_distinct_names() {
+        let names: Vec<String> = (1..=8).map(|i| format!("Bot{i:02}")).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, name) in names.iter().enumerate() {
+            let id = Identity {
+                name: name.clone(),
+                key: format!("AIPLAYERBOT{:04}", i + 1).into_bytes(),
+                ..Default::default()
+            };
+            let u = id.userinfo();
+            assert!(
+                u.contains(&format!("\\name\\{name}")),
+                "bot {i} asked for the wrong name: {u}"
+            );
+            // No other bot's name may appear anywhere in this userinfo, so a
+            // stale default cannot hide in it.
+            for other in &names {
+                if other != name {
+                    assert!(!u.contains(&format!("\\name\\{other}")), "{u}");
+                }
+            }
+            assert!(seen.insert(id.wire_name().to_string()), "duplicate name {name}");
+        }
+        assert_eq!(seen.len(), names.len());
+        // And the default is only ever used when nobody asked for a name --
+        // "(1)AIPlayer" in a server log means a bot fell back to it.
+        assert_eq!(Identity::default().name, "AIPlayer");
+    }
+
+    /// `MAX_NAME` is 31 usable bytes (`rehlds/engine/server.h:35`), and the
+    /// clamp happens here so two long names cannot silently collapse into one
+    /// on the server and come back deduplicated as `(1)…`.
+    #[test]
+    fn names_are_clamped_to_the_engines_max_name() {
+        let id = Identity { name: "N".repeat(64), ..Default::default() };
+        assert_eq!(id.wire_name().len(), MAX_NAME);
+        assert!(id.userinfo().contains(&format!("\\name\\{}", "N".repeat(MAX_NAME))));
+        // A short name is untouched.
+        let short = Identity { name: "Bot01".into(), ..Default::default() };
+        assert_eq!(short.wire_name(), "Bot01");
+        // Multi-byte names are cut on a character boundary, never mid-codepoint.
+        let wide = Identity { name: "ä".repeat(20), ..Default::default() };
+        assert!(wide.wire_name().len() <= MAX_NAME);
+        assert!(std::str::from_utf8(wide.wire_name().as_bytes()).is_ok());
+    }
+
+    /// The exact wire form the engine writes for a userinfo change:
+    /// `setinfo "%s" "%s"` (`rehlds/engine/cvar.cpp:268`). The quotes matter —
+    /// `Host_SetInfo_f` requires `Cmd_Argc() == 3` (`host_cmd.cpp:2584`), so an
+    /// unquoted name containing a space would be silently ignored.
+    #[test]
+    fn setinfo_name_command_matches_the_engine_wire_form() {
+        let id = Identity { name: "Bot01".into(), ..Default::default() };
+        assert_eq!(id.setinfo_name_command(), "setinfo \"name\" \"Bot01\"");
+        let spaced = Identity { name: "Bot 01".into(), ..Default::default() };
+        assert_eq!(spaced.setinfo_name_command(), "setinfo \"name\" \"Bot 01\"");
+        // It re-asserts the clamped name, so it agrees with the connect
+        // userinfo rather than fighting it.
+        let long = Identity { name: "N".repeat(64), ..Default::default() };
+        assert!(long.setinfo_name_command().contains(&"N".repeat(MAX_NAME)));
+        assert!(!long.setinfo_name_command().contains(&"N".repeat(MAX_NAME + 1)));
+    }
+
+    /// `dropclient` is the one disconnect verb the engine accepts from a
+    /// client: it is on `clcommands` (`rehlds/engine/sv_user.cpp:45`, gated by
+    /// `SV_ValidateClientCommand`) and is the only name registered for
+    /// `SV_Drop_f` (`sv_main.cpp:8260`). "drop" and "disconnect" are not.
+    #[test]
+    fn the_disconnect_command_is_the_one_the_engine_whitelists() {
+        assert_eq!(Client::DISCONNECT_COMMAND, "dropclient");
     }
 }

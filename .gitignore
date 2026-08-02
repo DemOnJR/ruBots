@@ -13,3 +13,9 @@
 # Game content copied out of the container (maps for navigation, sprites for
 # consistency hashing). Reproducible via `harness setup`; not ours to ship.
 /testserver/cstrike
+
+# The CSB server bundle: a downloaded build artefact, and its predecessor kept
+# only long enough to compare. testserver/rehlds/ is the installed stack and IS
+# tracked, because which build the bots were tested against is part of the result.
+/testserver/bundle/
+/testserver/rehlds.old/

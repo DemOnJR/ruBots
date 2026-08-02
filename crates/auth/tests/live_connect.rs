@@ -24,6 +24,13 @@ const SERVER: &str = "127.0.0.1:27015";
 const PROTOCOL: i32 = 48;
 
 fn rpc(request: &[u8]) -> Option<Vec<u8>> {
+    rpc_keep(request).map(|(_sock, reply)| reply)
+}
+
+/// Like [`rpc`] but hands the socket back, so the caller can keep talking from
+/// the **same source port** — which is the only thing the server uses to
+/// recognise a client once it is connected.
+fn rpc_keep(request: &[u8]) -> Option<(UdpSocket, Vec<u8>)> {
     let sock = UdpSocket::bind("127.0.0.1:0").ok()?;
     sock.set_read_timeout(Some(Duration::from_secs(4))).ok()?;
     sock.connect(SERVER).ok()?;
@@ -31,7 +38,33 @@ fn rpc(request: &[u8]) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; 8192];
     let n = sock.recv(&mut buf).ok()?;
     buf.truncate(n);
-    Some(buf)
+    Some((sock, buf))
+}
+
+/// Hand the client slot back to the server.
+///
+/// **These tests used to be the source of a user-visible bug.** A `connect` the
+/// server answers with `B` occupies a real client slot, and simply dropping the
+/// socket does not release it: the slot stays `connected` for the whole
+/// `sv_timeout` (120 s on the test server) still holding this test's name. The
+/// engine then matches the *next* connect from the same base address onto that
+/// slot as a reconnect (`rehlds/engine/sv_main.cpp:2378-2384` — base address
+/// only, with no `client->connected` check), the reconnect branch never calls
+/// `SV_DropClient` (`sv_main.cpp:2397-2412`), and ReGameDLL hands the ghost's
+/// name to the newcomer. That is exactly how a swarm of `Bot01..Bot04` ended up
+/// in the server log as `NoCert` and `NoCdKey` — the names below.
+///
+/// `dropclient` is on the engine's client-command whitelist
+/// (`rehlds/engine/sv_user.cpp:45`) and reaches `SV_Drop_f`
+/// (`sv_main.cpp:8144`) → `SV_DropClient`, which zeroes `cl->name` and
+/// `cl->userinfo` and clears `cl->edict` (`rehlds/engine/host.cpp:504-519`).
+///
+/// Best effort: it is a courtesy to the next test, not an assertion. If the
+/// datagram is lost the only cost is the old 120 s wait.
+fn release_slot(sock: &UdpSocket) {
+    let mut chan = netchan::NetChannel::new();
+    let payload = netchan::NetChannel::string_command("dropclient");
+    let _ = sock.send(&chan.build(&payload, true));
 }
 
 /// `\key\value` info string.
@@ -95,15 +128,20 @@ fn revemu_certificate_is_accepted_by_a_real_server() {
         return;
     };
 
-    let reply = rpc(&build_connect(challenge, auth::DEFAULT_KEY, "AIPlayer"))
+    let (sock, reply) = rpc_keep(&build_connect(challenge, auth::DEFAULT_KEY, "AIPlayer"))
         .expect("server must answer the connect");
     let payload = cl::payload(&reply).expect("reply must be connectionless");
 
     let text = String::from_utf8_lossy(&payload[1..]);
-    assert_eq!(
-        payload[0], cl::S2C_CONNECTION,
+    let accepted = payload[0] == cl::S2C_CONNECTION;
+    if accepted {
+        release_slot(&sock);
+    }
+    assert!(
+        accepted,
         "expected 'B' (connection accepted), got {:?} -- server said: {}",
-        payload[0] as char, text.trim()
+        payload[0] as char,
+        text.trim()
     );
     eprintln!("connection accepted: {}", text.trim());
 }
@@ -123,8 +161,13 @@ fn missing_cdkey_field_is_rejected() {
     let mut packet = cl::build(head.as_bytes());
     packet.extend_from_slice(&auth::build_revemu(auth::DEFAULT_KEY));
 
-    let reply = rpc(&packet).expect("server must answer");
+    let (sock, reply) = rpc_keep(&packet).expect("server must answer");
     let payload = cl::payload(&reply).expect("connectionless");
+    if payload[0] == cl::S2C_CONNECTION {
+        // Reunion accepted us: give the slot straight back, or the name
+        // "NoCdKey" haunts the next client to land on it.
+        release_slot(&sock);
+    }
 
     // The answer depends on who is doing authentication:
     //
@@ -166,8 +209,13 @@ fn a_certificate_is_required() {
     let userinfo = info(&[("name", "NoCert"), ("rate", "25000")]);
     let head = format!("connect {PROTOCOL} {challenge} \"{protinfo}\" \"{userinfo}\"\n");
 
-    let reply = rpc(&cl::build(head.as_bytes())).expect("server must answer");
+    let (sock, reply) = rpc_keep(&cl::build(head.as_bytes())).expect("server must answer");
     let payload = cl::payload(&reply).expect("connectionless");
+    if payload[0] == cl::S2C_CONNECTION {
+        // Should not happen, but if some stack does accept a certificate-less
+        // connect, do not leave "NoCert" sitting in a slot for two minutes.
+        release_slot(&sock);
+    }
     assert_eq!(payload[0], b'9', "expected a reject with no certificate");
     eprintln!(
         "no-certificate reject: {}",

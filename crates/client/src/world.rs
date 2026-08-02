@@ -359,6 +359,14 @@ pub struct DecodeStats {
     /// `clc_delta`, so the server should never send one; if it does, our
     /// `last_valid_frame` bookkeeping is lying somewhere.
     pub unexpected_delta_frames: u32,
+    /// `svc_spawnbaseline` blocks the walker handed us that decoded. Normally
+    /// exactly one per map — see [`Decoder::read_baselines`].
+    pub baseline_blocks: u32,
+    /// `svc_spawnbaseline` blocks that did not decode. Any non-zero value here
+    /// means we reached a byte 22 at a genuine message boundary and it was not
+    /// a baseline block, which the server has no way to produce.
+    pub baseline_errors: u32,
+    pub last_baseline_error: Option<proto::entity::EntityError>,
 }
 
 impl Decoder {
@@ -394,26 +402,65 @@ impl Decoder {
         u16::from(self.my_slot) + 1
     }
 
-    /// Pull `svc_spawnbaseline` out of the post-`spawn` signon blob.
+    /// Parse the `svc_spawnbaseline` bit block at `at`, returning the offset
+    /// just past it.
     ///
-    /// Without this every new entity is deltaed against a zeroed state rather
-    /// than its baseline, so most fields read as zero and players appear at the
-    /// map origin. Returns whether a baseline block was found.
+    /// Without baselines every new entity is deltaed against a zeroed state
+    /// rather than its baseline, so most fields read as zero and players appear
+    /// at the map origin.
     ///
-    /// The opcode is located by scan, so a stray byte 22 in some payload will
-    /// land here -- which is why the parse result is checked rather than
-    /// trusted, and why an empty result is treated as "not found".
-    fn absorb_baselines(&mut self, msg: &[u8]) -> bool {
-        let Some(pos) = msg.iter().position(|&b| b == svc::SVC_SPAWNBASELINE) else {
-            return false;
-        };
-        let mut r = proto::bitbuf::BitReader::new(&msg[pos + 1..]);
+    /// # Where this message can legitimately be, and why it is never scanned for
+    ///
+    /// `svc_spawnbaseline` is written in exactly one place: `SV_CreateBaseline`
+    /// appends it to **`g_psv.signon`**, the server's per-map signon buffer
+    /// (`rehlds/engine/sv_main.cpp:5889-5917`), once per map — the only call is
+    /// from `SV_ActivateServer` (`sv_main.cpp:6208`), at map load, before any
+    /// client has spawned.
+    ///
+    /// `g_psv.signon` reaches a client in exactly one place too: `SZ_Write(&msg,
+    /// g_psv.signon.data, g_psv.signon.cursize)` in `SV_Spawn_f_internal`
+    /// (`sv_main.cpp:1671`) — the reply to the client's `spawn` command,
+    /// immediately followed by `SV_WriteSpawn` (`:1672`, whose own tail is
+    /// `svc_signonnum 1` at `:1472-1473`) and `SV_WriteVoiceCodec` (`:1680`).
+    /// That whole buffer is then fragmented and sent (`:1681-1682`).
+    ///
+    /// Nothing else can produce one:
+    ///
+    /// * `SV_SendEnts_f` (`rehlds/engine/sv_user.cpp:1935-1974`) — the
+    ///   `sendents` command the client sends straight after `spawn`, which is
+    ///   what actually starts the entity stream — writes **no baselines at
+    ///   all**. It sets `fully_connected = TRUE` and, only under
+    ///   `sv_delayed_spray_upload`, at most two `svc_stufftext`s.
+    /// * `SV_SendClientDatagram` (`sv_main.cpp:5000-5063`), the running-phase
+    ///   writer, never emits opcode 22 either.
+    ///
+    /// So a byte 22 anywhere in a running-phase datagram is **always** a false
+    /// positive, and the message is located the same way every other message is
+    /// — by [`crate::stream::walk`] stepping over its predecessors and halting
+    /// on it, because it is bit-packed. A byte 22 inside some message's payload
+    /// is never at a message boundary and is therefore never offered here at
+    /// all. That is a structural guarantee; the validation inside
+    /// [`proto::entity::parse_spawn_baseline`] is the backstop, not the gate.
+    ///
+    /// An empty block is refused rather than installed: `SV_CreateBaseline`'s
+    /// loop always emits entity 0 (`entnum == 0` passes `!svent->free &&
+    /// g_psvs.maxclients >= entnum`, `sv_main.cpp:5891-5894`; edict 0 is the
+    /// world and is never freed), so a baseline block with nothing in it cannot
+    /// have come from this server.
+    fn read_baselines(&mut self, msg: &[u8], at: usize) -> Option<usize> {
+        let body = at + 1;
+        let mut r = proto::bitbuf::BitReader::new(msg.get(body..)?);
         match proto::entity::parse_spawn_baseline(&mut r, &self.registry, self.maxclients) {
             Ok(b) if !b.by_number.is_empty() => {
                 self.baselines = b;
-                true
+                self.stats.baseline_blocks += 1;
+                Some(body + block_bytes(&r))
             }
-            _ => false,
+            other => {
+                self.stats.baseline_errors += 1;
+                self.stats.last_baseline_error = other.err();
+                None
+            }
         }
     }
 
@@ -430,10 +477,17 @@ impl Decoder {
     /// `msg[0] == svc_time` is false. Dispatching on the first byte silently
     /// skipped the entity block of every such packet -- about 7% of them, and
     /// exactly the ones carrying the most interesting reliable traffic.
+    ///
+    /// **Nothing short-circuits this walk.** `svc_spawnbaseline` used to be
+    /// found by scanning the whole datagram for a bare byte 22 *before* the
+    /// walk, and a hit made this function `return` — so one payload byte that
+    /// happened to be 22 threw away the entire datagram, including every
+    /// message in front of it that had not even been looked at yet. Over the
+    /// four captures in `captures/swarm/` that scan fired on 14 151 to 24 279
+    /// datagrams each. It is now [`Self::read_baselines`], reached only when the
+    /// walker halts on a real opcode boundary, and a failure there costs the
+    /// tail of one datagram and nothing more.
     pub fn feed(&mut self, msg: &[u8]) {
-        if self.absorb_baselines(msg) {
-            return;
-        }
         let mut at = 0usize;
         let mut saw_entities = false;
         let mut decoded = false;
@@ -475,6 +529,12 @@ impl Decoder {
                     }
                     None => None,
                 },
+                // Only ever legitimate in the reply to `spawn`; see
+                // `read_baselines` for why it is located here rather than hunted
+                // for. Handled in the dispatch like any other bit-packed
+                // message so that the walk resumes into `SV_WriteSpawn`'s
+                // `svc_time` / `svc_clientdata` / `svc_signonnum` behind it.
+                svc::SVC_SPAWNBASELINE => self.read_baselines(msg, stop),
                 svc::SVC_DELTAPACKETENTITIES => {
                     // We never advertise a frame via clc_delta, so the server
                     // has no basis to delta against one. Refuse rather than
@@ -827,6 +887,241 @@ mod tests {
         // Dead outranks everything.
         cd.fields.insert("deadflag".into(), Value::Int(2));
         assert!(!cd.in_game());
+    }
+
+    // -----------------------------------------------------------------------
+    // svc_spawnbaseline is located, never hunted for
+    //
+    // The regression these pin down: `absorb_baselines` (removed) used to scan the whole
+    // datagram for a bare byte 22 before the walk started, and a hit made
+    // `feed` return. A payload byte is not a message, so the scan false-
+    // positived constantly (14 151 - 24 279 datagrams per capture in
+    // `captures/swarm/`), and each hit cost the WHOLE datagram -- including the
+    // messages in front of the false 22, which were never even walked.
+    // -----------------------------------------------------------------------
+
+    /// The real 549 bytes that were once decoded as nine baselines and 63
+    /// instanced baselines: `captures/swarm/Bot02.bin` record 165, from the byte
+    /// after the stray `0x16`. See `crates/client/tests/spawnbaseline_guard.rs`.
+    const FALSE_POSITIVE: &[u8] = include_bytes!("../tests/fixtures/false_spawnbaseline.bin");
+
+    // Ids are arbitrary (the server assigns them per map via `svc_newusermsg`);
+    // the sizes are the ones ReGameDLL registers. `SayText` and `TeamInfo` go in
+    // with -1, i.e. length-prefixed; `ScoreInfo` is a fixed 9 bytes and `Money`
+    // a fixed 5 (`i32 amount`, `byte blink` -- see `usermsg.rs:745-748`).
+    const SAYTEXT: u8 = 76;
+    const SCOREINFO: u8 = 85;
+    const TEAMINFO: u8 = 86;
+    const MONEY: u8 = 88;
+
+    fn user_table() -> crate::stream::UserMsgTable {
+        use crate::stream::UserMsgDef;
+        let mut t = crate::stream::UserMsgTable::new();
+        for (id, name, size) in [
+            (SAYTEXT, "SayText", 255u8),
+            (TEAMINFO, "TeamInfo", 255),
+            (SCOREINFO, "ScoreInfo", 9),
+            (MONEY, "Money", 5),
+        ] {
+            t.insert(id, UserMsgDef { name: name.into(), size });
+        }
+        t
+    }
+
+    fn decoder() -> Decoder {
+        Decoder::new(&crate::signon::walk(SIGNON), user_table())
+    }
+
+    /// `Money`: `i32 amount`, `byte blink`.
+    fn money(amount: i32) -> Vec<u8> {
+        let mut m = vec![MONEY];
+        m.extend_from_slice(&amount.to_le_bytes());
+        m.push(0);
+        m
+    }
+
+    /// `TeamInfo`: `byte client`, then the team name as a C string.
+    fn team_info(client: u8, team: &str) -> Vec<u8> {
+        let mut payload = vec![client];
+        payload.extend_from_slice(team.as_bytes());
+        payload.push(0);
+        let mut m = vec![TEAMINFO, payload.len() as u8];
+        m.extend_from_slice(&payload);
+        m
+    }
+
+    /// `ScoreInfo`: `byte client`, then four shorts.
+    fn score_info(client: u8, frags: i16) -> Vec<u8> {
+        let mut m = vec![SCOREINFO, client];
+        for v in [frags, 0i16, 0, 0] {
+            m.extend_from_slice(&v.to_le_bytes());
+        }
+        m
+    }
+
+    /// One `svc_spawnbaseline` bit block, written the way `SV_CreateBaseline`
+    /// writes it (`sv_main.cpp:5891-5915`): `11` bits of entity number, `2` of
+    /// entityType, the delta, then the `0xFFFF` sentinel and a 6-bit instanced
+    /// count. ReGameDLL creates no instanced baselines, so that count is zero.
+    fn baseline_block(
+        reg: &DeltaRegistry,
+        maxclients: u8,
+        ents: &[(u16, HashMap<String, Value>)],
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        for (number, f) in ents {
+            w.write_bits(u32::from(*number), 11);
+            w.write_bits(u32::from(proto::entity::ENTITY_NORMAL), 2);
+            let which = proto::entity::table_for(*number, false, maxclients);
+            write_delta(&mut w, reg.get(which.name()).expect("table"), f);
+        }
+        w.write_bits(0xFFFF, 16);
+        w.write_bits(0, 6);
+        w.into_bytes()
+    }
+
+    /// A byte 22 inside a user-message payload must never reach the baseline
+    /// parser, and must not cost the messages behind it.
+    ///
+    /// `Money 5654` is `16 16 00 00` on the wire — two byte-22s in one
+    /// perfectly ordinary message. The old scan stopped on the first of them.
+    #[test]
+    fn a_stray_byte_22_in_a_payload_is_neither_baselines_nor_a_lost_datagram() {
+        let mut msg = money(5654);
+        assert!(msg.contains(&svc::SVC_SPAWNBASELINE), "no byte 22 to trip on");
+        // ScoreInfo carries a team id of its own, so it goes first: the last
+        // writer wins and the assertion below is about TeamInfo.
+        msg.extend_from_slice(&score_info(3, 7));
+        msg.extend_from_slice(&team_info(3, "CT"));
+
+        let mut d = decoder();
+        d.feed(&msg);
+
+        assert!(d.baselines.by_number.is_empty(), "payload byte read as baselines");
+        assert_eq!(d.stats.baseline_errors, 0, "the parser was never even offered it");
+        assert_eq!(d.game.money, 5654);
+        let p = d.game.player(3).expect("slot 3");
+        assert_eq!(p.team, crate::usermsg::Team::CounterTerrorist, "TeamInfo behind the 22 was lost");
+        assert_eq!(p.frags, 7, "ScoreInfo behind the 22 was lost");
+    }
+
+    /// The same thing with the bytes that actually did it, carried the way they
+    /// actually arrived: inside user-message payloads.
+    ///
+    /// `SayText` is registered with -1, so it is length-prefixed and the walker
+    /// steps over its payload without looking inside — which is the whole point.
+    #[test]
+    fn the_real_false_positive_burst_walks_through_intact() {
+        // The stray 0x16 and everything the old scan handed to the baseline
+        // parser, chunked into payloads (a length-prefixed message tops out at
+        // 255 bytes).
+        let real: Vec<u8> = std::iter::once(svc::SVC_SPAWNBASELINE)
+            .chain(FALSE_POSITIVE.iter().copied())
+            .collect();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&score_info(1, 0));
+        for chunk in real.chunks(200) {
+            msg.push(SAYTEXT);
+            msg.push(chunk.len() as u8);
+            msg.extend_from_slice(chunk);
+        }
+        // The messages the old code threw away with the rest of the datagram.
+        msg.extend_from_slice(&money(3300));
+        msg.extend_from_slice(&team_info(4, "TERRORIST"));
+
+        // A scan would fire; the walk must not.
+        assert!(
+            msg.iter().any(|&b| b == svc::SVC_SPAWNBASELINE),
+            "fixture has no byte 22, so this test proves nothing"
+        );
+
+        let mut d = decoder();
+        d.feed(&msg);
+
+        assert!(d.baselines.by_number.is_empty());
+        assert!(d.baselines.instanced.is_empty(), "63 bogus instanced baselines are back");
+        assert_eq!(d.stats.baseline_errors, 0);
+        assert_eq!(d.stats.partial, 0, "the walk did not reach the end of the datagram");
+        assert_eq!(d.stats.last_stop, None);
+        assert_eq!(d.game.money, 3300, "the Money behind the burst was lost");
+        assert_eq!(
+            d.game.player(4).expect("slot 4").team,
+            crate::usermsg::Team::Terrorist,
+            "the TeamInfo behind the burst was lost"
+        );
+    }
+
+    /// The genuine article, in the shape `SV_Spawn_f_internal` sends it: the
+    /// signon buffer's `svc_spawnbaseline` with `SV_WriteSpawn`'s messages
+    /// behind it (`sv_main.cpp:1671-1672`). It must be found by the walker, and
+    /// the walk must resume past the bit block rather than end there.
+    #[test]
+    fn a_real_spawnbaseline_is_located_by_the_walker_and_stepped_over() {
+        let signon = crate::signon::walk(SIGNON);
+        let maxclients = signon.server_info.as_ref().map(|s| s.max_players).unwrap_or(32);
+
+        let mut world = HashMap::new();
+        world.insert("modelindex".to_string(), Value::Int(1));
+        let mut player = HashMap::new();
+        player.insert("origin[0]".to_string(), Value::Float(256.0));
+        player.insert("health".to_string(), Value::Float(100.0));
+        let block = baseline_block(
+            &signon.registry,
+            maxclients,
+            &[(0, world), (1, player.clone())],
+        );
+
+        let mut msg = score_info(2, 3);
+        msg.push(svc::SVC_SPAWNBASELINE);
+        msg.extend_from_slice(&block);
+        msg.extend_from_slice(&team_info(2, "CT"));
+
+        let mut d = decoder();
+        d.feed(&msg);
+
+        assert_eq!(d.stats.baseline_blocks, 1, "the walker never offered the block");
+        assert_eq!(d.stats.baseline_errors, 0);
+        let mut nums: Vec<u16> = d.baselines.by_number.keys().copied().collect();
+        nums.sort();
+        assert_eq!(nums, vec![0, 1]);
+        assert!(d.baselines.instanced.is_empty());
+        assert_eq!(d.baselines.by_number[&1].f32("origin[0]"), 256.0);
+
+        // And the block was stepped over exactly, not merely parsed.
+        assert_eq!(d.stats.partial, 0, "walk stopped at {:?}", d.stats.last_stop);
+        assert_eq!(
+            d.game.player(2).expect("slot 2").team,
+            crate::usermsg::Team::CounterTerrorist,
+            "the walk did not resume behind the baseline block"
+        );
+    }
+
+    /// The residual case: a byte 22 that really is at a message boundary but is
+    /// not a baseline block. It cannot be stepped over — a bit-packed block of
+    /// unknown length has no length — so the tail is lost, exactly as it is for
+    /// any other bit-packed failure. What must NOT happen is the old behaviour:
+    /// losing the messages in front of it too.
+    #[test]
+    fn a_boundary_byte_22_that_is_not_baselines_costs_only_the_tail() {
+        let mut msg = money(1000);
+        msg.extend_from_slice(&team_info(5, "CT"));
+        msg.push(svc::SVC_SPAWNBASELINE);
+        msg.extend_from_slice(FALSE_POSITIVE);
+
+        let mut d = decoder();
+        d.feed(&msg);
+
+        assert!(d.baselines.by_number.is_empty(), "garbage installed as baselines");
+        assert_eq!(d.stats.baseline_errors, 1);
+        assert!(d.stats.last_baseline_error.is_some());
+        assert_eq!(d.stats.partial, 1);
+        assert_eq!(d.stats.last_stop, Some(svc::SVC_SPAWNBASELINE));
+        // Everything ahead of it survived.
+        assert_eq!(d.game.money, 1000);
+        assert_eq!(
+            d.game.player(5).expect("slot 5").team,
+            crate::usermsg::Team::CounterTerrorist
+        );
     }
 }
 

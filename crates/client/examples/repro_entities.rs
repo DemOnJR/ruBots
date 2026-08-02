@@ -8,7 +8,7 @@
 //! The walk mirrors `client::world::Decoder::feed` — the same stream walker, the
 //! same bit-packed skips, the same `parse_packet_entities_full_checked` — with
 //! one deliberate difference: the delta context is built explicitly instead of
-//! by `Decoder::absorb_baselines`, which scans for a bare byte 22 and on a
+//! by the since-removed `Decoder::absorb_baselines`, which scanned for a bare byte 22 and on a
 //! running-phase capture (no `svc_spawnbaseline` in it at all) latches onto a
 //! false positive. That matters here because the *count* of instanced baselines
 //! gates a header bit; ReGameDLL creates none
@@ -527,7 +527,7 @@ fn main() {
     };
 
     // BASELINE_AT=<record> runs `parse_spawn_baseline` at the first byte 22 in
-    // that record, which is exactly what `Decoder::absorb_baselines` does. On a
+    // that record, which is exactly what the since-removed `Decoder::absorb_baselines` did. On a
     // record that is not a `svc_spawnbaseline` at all it should fail; if it
     // succeeds, the decoder has just replaced its baselines with garbage.
     if let Ok(v) = env::var("BASELINE_AT") {
@@ -544,7 +544,7 @@ fn main() {
         let rec = v.clone();
         // In the signon the real position is where the byte walk halts; in a
         // running record there is no real one, so take the first byte 22 —
-        // which is exactly the guess `Decoder::absorb_baselines` makes.
+        // which is exactly the guess the since-removed `Decoder::absorb_baselines` made.
         let p = if v == "signon" {
             let w = client::walk_signon(msg);
             assert_eq!(w.stopped_on, Some(22), "signon does not halt on 22");
@@ -605,7 +605,7 @@ fn main() {
     }
 
     // DECODER=1 drives the real `client::world::Decoder` instead, which is what
-    // the live bot runs. The difference between the two is `absorb_baselines`.
+    // the live bot runs. The difference between the two was `absorb_baselines`, now removed in favour of the stream walker.
     if env::var("DECODER").is_ok() {
         let mut d = client::world::Decoder::new(&signon, table.clone());
         let mut announced = false;

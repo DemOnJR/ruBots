@@ -2,7 +2,7 @@
 //!
 //! `captures/swarm/Bot02.bin`, record 165: an 894-byte round-restart burst of
 //! `TeamInfo` / `ScoreInfo` / `Money` user messages. Byte 344 of it happens to
-//! be `0x16` — 22, `svc_spawnbaseline`. `client::world::Decoder::absorb_baselines`
+//! be `0x16` — 22, `svc_spawnbaseline`. `client::world::Decoder::absorb_baselines` (since removed)
 //! finds `svc_spawnbaseline` by scanning for that byte, so it handed everything
 //! after it to `proto::entity::parse_spawn_baseline`, which **accepted it**:
 //! nine baselines and sixty-three *instanced* baselines.

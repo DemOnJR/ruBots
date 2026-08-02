@@ -71,14 +71,24 @@ pub fn delta_description_table() -> DeltaTable {
     };
     // The two scale fields are themselves transmitted as fixed-point integers
     // scaled by DESCRIPTION_SCALE, so they must be divided by it on decode.
-    // Verified against the live `usercmd_t` table: with this divisor,
-    // `forwardmove`/`msec` read premultiply 1.0 and `impact_position` reads
-    // 8.0 — the true GoldSrc values — instead of 2000 and 16000. Without it,
-    // encoding `forwardmove = 250` overflows the 12-bit field (saturates to
-    // 2047) because it is multiplied by the inflated scale.
+    // The engine declares them **unsigned** `DT_FLOAT`, 32 bits, premultiply
+    // 4000.0 (`rehlds/engine/delta.cpp:90-91`).
+    //
+    // This used to say `DT_FLOAT | DT_SIGNED` with a scale of 2000, "recovered
+    // empirically" because it made the live `usercmd_t` table read 1.0 and 8.0
+    // — the right answers. It did, for a reason that is worth writing down so
+    // nobody re-derives the wrong table: bits are packed LSB-first
+    // (`MSG_WriteBits` shifts by `nCurOutputBit`, `common.cpp:396-411`) and a
+    // sign-magnitude read takes the *first* bit as the sign
+    // (`MSG_ReadSBits`, `common.cpp:766-777`). So reading a 32-bit unsigned
+    // `n = value * 4000` as 32 signed bits consumes exactly the same 32 bits
+    // and yields `±(n >> 1)`, which divided by 2000 is `value` again —
+    // **whenever `n` is even**. Every scale a stock `delta.lst` carries (1.0,
+    // 8.0, 32.0, 100.0) makes `n` even, so the wrong table never showed. An
+    // odd `n` decodes with a spurious sign and half a bit of lost precision.
     let scaled = |name: &str| FieldDesc {
         name: name.to_string(),
-        field_type: DT_FLOAT | DT_SIGNED,
+        field_type: DT_FLOAT,
         bits: 32,
         premultiply: DESCRIPTION_SCALE,
         postmultiply: 1.0,
@@ -95,9 +105,9 @@ pub fn delta_description_table() -> DeltaTable {
 }
 
 /// Fixed-point scale the `premultiply`/`postmultiply` meta-fields are sent
-/// with in a `svc_deltadescription`. Recovered empirically from the live
-/// `usercmd_t` table (see [`delta_description_table`]).
-pub const DESCRIPTION_SCALE: f32 = 2000.0;
+/// with in a `svc_deltadescription`: the `premultiply` column of the engine's
+/// own meta-description, `rehlds/engine/delta.cpp:90-91`.
+pub const DESCRIPTION_SCALE: f32 = 4000.0;
 
 /// Decode a `svc_deltadescription` body: `count` field descriptions read with
 /// the bootstrap table.
@@ -265,15 +275,32 @@ impl FieldMask {
     }
 }
 
+/// Decode a delta against `table` with no time base — see [`parse_delta_at`].
+///
+/// `DT_TIMEWINDOW_*` fields are transported *relative to the frame's server
+/// time*, so decoding them without one gives a value offset by that base.
+/// Framing is unaffected either way (neither width depends on the base), so
+/// this stays the right entry point for callers that only walk the stream.
+/// Callers that read `animtime`, `impacttime` or `starttime` as *values* want
+/// [`parse_delta_at`] with the last `svc_time`.
+pub fn parse_delta(r: &mut BitReader, table: &[FieldDesc]) -> HashMap<String, Value> {
+    parse_delta_at(r, table, 0.0)
+}
+
 /// Decode a delta against `table`, returning only the fields present.
 ///
+/// `time` is the client's message time (`g_pcl.mtime[0]` in the engine, i.e.
+/// the last `svc_time`) — the base that `DT_TIMEWINDOW_8` and
+/// `DT_TIMEWINDOW_BIG` are encoded against.
+///
 /// **Validation status:** the framing (mask, field selection, sign handling)
-/// is verified against the disassembly. The per-type numeric conversions
-/// below â€” in particular the `premultiply`/`postmultiply` scaling and the
-/// time-window and angle encodings â€” are the standard GoldSrc behaviour but
-/// were *not* confirmed instruction by instruction. They are the first thing
-/// to check against a live server capture.
-pub fn parse_delta(r: &mut BitReader, table: &[FieldDesc]) -> HashMap<String, Value> {
+/// is verified against the disassembly, and the two time-window cases are a
+/// line-for-line port of `DELTA_ParseDelta`
+/// (`rehlds/engine/delta.cpp:1037-1051`). The remaining per-type conversions
+/// â€” the `premultiply`/`postmultiply` scaling and the angle encoding â€” are
+/// the standard GoldSrc behaviour but were *not* confirmed instruction by
+/// instruction.
+pub fn parse_delta_at(r: &mut BitReader, table: &[FieldDesc], time: f32) -> HashMap<String, Value> {
     let mask = FieldMask::read(r);
     let mut out = HashMap::new();
 
@@ -296,7 +323,7 @@ pub fn parse_delta(r: &mut BitReader, table: &[FieldDesc]) -> HashMap<String, Va
                     Value::Int(raw)
                 }
             }
-            DT_FLOAT | DT_TIMEWINDOW_8 | DT_TIMEWINDOW_BIG => {
+            DT_FLOAT => {
                 let raw = if signed {
                     r.read_sbits(bits) as f32
                 } else {
@@ -310,6 +337,35 @@ pub fn parse_delta(r: &mut BitReader, table: &[FieldDesc]) -> HashMap<String, Va
                     v *= f.postmultiply;
                 }
                 Value::Float(v)
+            }
+            // `rehlds/engine/delta.cpp:1037-1040`. Three things the generic
+            // float path above gets wrong, all of them value-level:
+            // the width is a hardcoded 8 and *not* `significant_bits`; the
+            // read is `MSG_ReadSBits`, i.e. always signed regardless of the
+            // `DT_SIGNED` flag; and the transported quantity is an offset from
+            // the frame's time base, at a hardcoded scale of 100 that ignores
+            // `premultiply`/`postmultiply` entirely. Every stock table
+            // declares `animtime` as unsigned 8-bit (`delta.lst:70`,
+            // `delta.lst:129`), so the widths coincide and the stream stays in
+            // sync while the value is wrong.
+            DT_TIMEWINDOW_8 => {
+                let addt = f64::from(r.read_sbits(8));
+                Value::Float(((f64::from(time) * 100.0 - addt) / 100.0) as f32)
+            }
+            // `rehlds/engine/delta.cpp:1042-1051`. Same shape, but the width
+            // *is* `significant_bits` and the scale *is* `premultiply` — only
+            // the forced sign and the time base differ from the float path.
+            // `postmultiply` is still ignored. The engine's epsilon test for
+            // "premultiply is 1" is reproduced exactly.
+            DT_TIMEWINDOW_BIG => {
+                let addt = f64::from(r.read_sbits(bits));
+                let pre = f64::from(f.premultiply);
+                let t = if pre <= 0.9999 || pre >= 1.0001 {
+                    (f64::from(time) * pre - addt) / pre
+                } else {
+                    f64::from(time) - addt
+                };
+                Value::Float(t as f32)
             }
             DT_ANGLE => {
                 let raw = r.read_bits(bits) as f32;
@@ -338,7 +394,7 @@ pub fn parse_delta(r: &mut BitReader, table: &[FieldDesc]) -> HashMap<String, Va
 /// out — `postmultiply` is a read-side scale and is deliberately ignored here
 /// (confirmed from `sv_user.cpp`; see [[aiplayers-rust-port]]). Signed fields
 /// use sign-magnitude via [`BitWriter::write_sbits`].
-fn write_field(w: &mut BitWriter, f: &FieldDesc, v: &Value) {
+fn write_field(w: &mut BitWriter, f: &FieldDesc, v: &Value, time: f32) {
     let bits = f.bits;
     let signed = f.is_signed();
     match f.base_type() {
@@ -354,7 +410,7 @@ fn write_field(w: &mut BitWriter, f: &FieldDesc, v: &Value) {
                 w.write_bits(raw as u32, bits);
             }
         }
-        DT_FLOAT | DT_TIMEWINDOW_8 | DT_TIMEWINDOW_BIG => {
+        DT_FLOAT => {
             let mut val = v.as_f32().unwrap_or(0.0);
             if f.premultiply != 0.0 {
                 val *= f.premultiply;
@@ -365,6 +421,21 @@ fn write_field(w: &mut BitWriter, f: &FieldDesc, v: &Value) {
             } else {
                 w.write_bits(raw as u32, bits);
             }
+        }
+        // Inverses of the two time-window reads, ported from
+        // `DELTA_WriteDelta` (`rehlds/engine/delta.cpp:713-739`). The engine
+        // truncates both products toward zero *before* subtracting, so the
+        // `as i32` casts are load-bearing and must not become `round()`.
+        DT_TIMEWINDOW_8 => {
+            let val = f64::from(v.as_f32().unwrap_or(0.0));
+            let tw = (f64::from(time) * 100.0) as i32 - (val * 100.0) as i32;
+            w.write_sbits(tw, 8);
+        }
+        DT_TIMEWINDOW_BIG => {
+            let val = f64::from(v.as_f32().unwrap_or(0.0));
+            let pre = f64::from(f.premultiply);
+            let tw = (f64::from(time) * pre) as i32 - (val * pre) as i32;
+            w.write_sbits(tw, bits);
         }
         DT_ANGLE => {
             // Inverse of `raw * 360/2^bits`, wrapped into the field width.
@@ -393,6 +464,19 @@ fn write_field(w: &mut BitWriter, f: &FieldDesc, v: &Value) {
 /// tables a bot sends are), this is an exact inverse of `parse_delta`, so
 /// `parse_delta(write_delta(x)) == x`.
 pub fn write_delta(w: &mut BitWriter, table: &[FieldDesc], fields: &HashMap<String, Value>) {
+    write_delta_at(w, table, fields, 0.0);
+}
+
+/// [`write_delta`] with an explicit time base for `DT_TIMEWINDOW_*` fields —
+/// the exact inverse of [`parse_delta_at`] at the same `time`. The usercmd
+/// tables a bot sends carry no time-window field, which is why
+/// [`write_delta`]'s base of 0.0 costs nothing there.
+pub fn write_delta_at(
+    w: &mut BitWriter,
+    table: &[FieldDesc],
+    fields: &HashMap<String, Value>,
+    time: f32,
+) {
     let indices: Vec<usize> = table
         .iter()
         .enumerate()
@@ -402,7 +486,7 @@ pub fn write_delta(w: &mut BitWriter, table: &[FieldDesc], fields: &HashMap<Stri
     FieldMask::from_indices(&indices).write(w);
     for &i in &indices {
         let f = &table[i];
-        write_field(w, f, &fields[&f.name]);
+        write_field(w, f, &fields[&f.name], time);
     }
 }
 
@@ -662,6 +746,350 @@ mod tests {
         // Booleans are single bits.
         assert_eq!(by("ducking").bits, 1);
         assert_eq!(by("bparam1").bits, 1);
+    }
+
+    // ---------------------------------------------------------------- //
+    // Ported engine write paths.
+    //
+    // These mirror `DELTA_WriteDelta` (`rehlds/engine/delta.cpp:640-745`)
+    // case for case, so the assertions below cannot be satisfied by a
+    // decoder that merely agrees with *our* encoder.
+    // ---------------------------------------------------------------- //
+
+    /// `case DT_TIMEWINDOW_8:` — `delta.cpp:713-725`. Width is a literal 8 and
+    /// the write is `MSG_WriteSBits`; `premultiply` never appears.
+    fn rehlds_write_timewindow_8(w: &mut BitWriter, time_base: f64, field_time: f64) {
+        let tw = (time_base * 100.0) as i32 - (field_time * 100.0) as i32;
+        w.write_sbits(tw, 8);
+    }
+
+    /// `case DT_TIMEWINDOW_BIG:` — `delta.cpp:727-739`. Width is
+    /// `significant_bits`, the scale is `premultiply`, the write is still
+    /// `MSG_WriteSBits`.
+    fn rehlds_write_timewindow_big(
+        w: &mut BitWriter,
+        f: &FieldDesc,
+        time_base: f64,
+        field_time: f64,
+    ) {
+        let pre = f64::from(f.premultiply);
+        let tw = (time_base * pre) as i32 - (field_time * pre) as i32;
+        w.write_sbits(tw, f.bits);
+    }
+
+    /// One `delta_description_t` written the way the engine writes it: the
+    /// full seven-field mask, then each field through the `g_MetaDescription`
+    /// row that describes it (`delta.cpp:86-92`) and the matching arm of the
+    /// write switch. Note both scale fields go out through the *unsigned*
+    /// `DT_FLOAT` arm — `MSG_WriteBits((uint32)(val * 4000.0), 32)`.
+    fn rehlds_write_description(w: &mut BitWriter, d: &FieldDesc) {
+        FieldMask::from_indices(&[0, 1, 2, 3, 4, 5, 6]).write(w);
+        w.write_bits(d.field_type, 32); // fieldType:         DT_INTEGER, 32
+        w.write_string(&d.name); //        fieldName:         DT_STRING
+        w.write_bits(0, 16); //            fieldOffset:       DT_INTEGER, 16
+        w.write_bits(4, 8); //             fieldSize:         DT_INTEGER, 8
+        w.write_bits(d.bits, 8); //        significant_bits:  DT_INTEGER, 8
+        w.write_bits((f64::from(d.premultiply) * 4000.0) as u32, 32);
+        w.write_bits((f64::from(d.postmultiply) * 4000.0) as u32, 32);
+    }
+
+    /// The bootstrap table is not empirical — it is `g_MetaDescription`,
+    /// `rehlds/engine/delta.cpp:86-92`. Transcribed here so a future edit has
+    /// to disagree with the engine out loud.
+    #[test]
+    fn bootstrap_table_matches_the_rehlds_meta_description() {
+        // (fieldType, significant_bits, premultiply) per row, in wire order.
+        let want: [(u32, u32, f32); 7] = [
+            (DT_INTEGER, 32, 1.0),
+            (DT_STRING, 1, 1.0),
+            (DT_INTEGER, 16, 1.0),
+            (DT_INTEGER, 8, 1.0),
+            (DT_INTEGER, 8, 1.0),
+            (DT_FLOAT, 32, 4000.0),
+            (DT_FLOAT, 32, 4000.0),
+        ];
+        let got = delta_description_table();
+        assert_eq!(got.len(), want.len());
+        for (i, (ty, bits, pre)) in want.iter().enumerate() {
+            assert_eq!(got[i].field_type, *ty, "row {i} ({}) type", got[i].name);
+            assert_eq!(got[i].bits, *bits, "row {i} ({}) width", got[i].name);
+            assert_eq!(got[i].premultiply, *pre, "row {i} ({}) scale", got[i].name);
+            assert_eq!(got[i].postmultiply, 1.0, "row {i} ({}) post", got[i].name);
+        }
+        // The scale rows are unsigned. Reading them signed steals the low bit
+        // of the value and calls it a sign.
+        assert!(!got[5].is_signed() && !got[6].is_signed());
+        assert_eq!(DESCRIPTION_SCALE, 4000.0);
+    }
+
+    /// The case that exposes `DT_FLOAT|DT_SIGNED` + scale 2000: a premultiply
+    /// whose encoded form is **odd**.
+    ///
+    /// `0.03125 * 4000 = 125`. Read unsigned at scale 4000 that is `0.03125`.
+    /// Read sign-magnitude at scale 2000 the leading (low) bit is taken for a
+    /// sign, leaving magnitude `125 >> 1 = 62`, i.e. `-0.031` — wrong value
+    /// *and* wrong sign, from a stream that framed perfectly.
+    #[test]
+    fn a_description_with_an_odd_encoded_scale_decodes_to_the_engines_value() {
+        let field = FieldDesc {
+            name: "impact_position".into(),
+            field_type: DT_FLOAT | DT_SIGNED,
+            bits: 16,
+            premultiply: 0.03125,
+            postmultiply: 1.0,
+        };
+        assert_eq!(
+            (f64::from(field.premultiply) * 4000.0) as u32,
+            125,
+            "the fixture must encode to an odd value or it proves nothing"
+        );
+
+        let mut w = BitWriter::new();
+        rehlds_write_description(&mut w, &field);
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let got = parse_description(&mut r, 1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "impact_position");
+        assert_eq!(got[0].field_type, DT_FLOAT | DT_SIGNED);
+        assert_eq!(got[0].bits, 16);
+        assert_eq!(got[0].premultiply, 0.03125);
+    }
+
+    /// Why the wrong bootstrap table survived so long: for an *even* encoded
+    /// scale the two readings coincide exactly, and every scale a stock
+    /// `delta.lst` carries (1.0, 8.0, 32.0, 100.0) is even once multiplied.
+    #[test]
+    fn an_even_encoded_scale_decodes_the_same_either_way() {
+        for pre in [1.0f32, 8.0, 32.0, 100.0] {
+            let field = FieldDesc {
+                name: "origin[0]".into(),
+                field_type: DT_FLOAT | DT_SIGNED,
+                bits: 24,
+                premultiply: pre,
+                postmultiply: 1.0,
+            };
+            let encoded = (f64::from(pre) * 4000.0) as u32;
+            assert_eq!(encoded % 2, 0, "{pre} encodes to an even {encoded}");
+
+            let mut w = BitWriter::new();
+            rehlds_write_description(&mut w, &field);
+            let bytes = w.into_bytes();
+            let mut r = BitReader::new(&bytes);
+            let got = parse_description(&mut r, 1);
+            assert_eq!(got[0].premultiply, pre);
+            // The old reading: low bit as sign, the rest over 2000.
+            assert_eq!((encoded >> 1) as f32 / 2000.0, pre);
+        }
+    }
+
+    /// `animtime` exactly as `delta.lst:70` and `:129` declare it — field 0 of
+    /// both entity tables, and *unsigned* in the declaration.
+    fn animtime_field() -> FieldDesc {
+        FieldDesc {
+            name: "animtime".into(),
+            field_type: DT_TIMEWINDOW_8,
+            bits: 8,
+            premultiply: 1.0,
+            postmultiply: 1.0,
+        }
+    }
+
+    #[test]
+    fn timewindow_8_is_signed_and_relative_to_the_time_base() {
+        let table = vec![animtime_field()];
+        let time = 10.0f64;
+
+        for animtime in [9.75f64, 10.25] {
+            let mut w = BitWriter::new();
+            FieldMask::from_indices(&[0]).write(&mut w);
+            rehlds_write_timewindow_8(&mut w, time, animtime);
+            let bytes = w.into_bytes();
+
+            let mut r = BitReader::new(&bytes);
+            let got = parse_delta_at(&mut r, &table, time as f32);
+            let v = match got["animtime"] {
+                Value::Float(v) => v,
+                ref other => panic!("animtime came back as {other:?}"),
+            };
+            assert!(
+                (f64::from(v) - animtime).abs() < 1e-4,
+                "animtime {animtime} decoded as {v}"
+            );
+        }
+    }
+
+    /// The old code decoded both time windows through the generic float arm:
+    /// an unsigned read of the *declared* width, divided by `premultiply` and
+    /// multiplied by `postmultiply`. A `DT_FLOAT` descriptor with the same
+    /// numbers reproduces that path exactly, so it stands in for "what this
+    /// used to return" without keeping the dead branch around.
+    fn as_the_old_float_path(f: &FieldDesc) -> FieldDesc {
+        FieldDesc { field_type: DT_FLOAT, ..f.clone() }
+    }
+
+    /// The regression this pins down: `animtime = 10.25` against a base of
+    /// 10.0 travels as `-25`, i.e. a set sign bit and magnitude 25. Read as
+    /// eight unsigned bits that is 51 — a plausible-looking number, the same
+    /// eight bits wide, so nothing downstream ever desyncs.
+    #[test]
+    fn timewindow_8_read_unsigned_gives_a_wrong_but_well_framed_value() {
+        let f = animtime_field();
+        let mut w = BitWriter::new();
+        FieldMask::from_indices(&[0]).write(&mut w);
+        rehlds_write_timewindow_8(&mut w, 10.0, 10.25);
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let got = parse_delta_at(&mut r, std::slice::from_ref(&f), 10.0);
+        assert_eq!(got["animtime"], Value::Float(10.25));
+
+        let mut old = BitReader::new(&bytes);
+        let was = parse_delta(&mut old, &[as_the_old_float_path(&f)]);
+        assert_eq!(was["animtime"], Value::Float(51.0), "what it used to return");
+
+        // ...and the two consume the same bits, which is why this never
+        // desynced: 3 count bits + 1 mask byte + 8 field bits.
+        assert_eq!((r.byte_pos(), r.bit_offset()), (old.byte_pos(), old.bit_offset()));
+        assert_eq!((r.byte_pos(), r.bit_offset()), (2, 3));
+    }
+
+    /// `impacttime` / `starttime` as `delta.lst:94-95` declare them: 13 bits,
+    /// premultiply 100, and unsigned in the declaration.
+    fn impacttime_field() -> FieldDesc {
+        FieldDesc {
+            name: "impacttime".into(),
+            field_type: DT_TIMEWINDOW_BIG,
+            bits: 13,
+            premultiply: 100.0,
+            postmultiply: 1.0,
+        }
+    }
+
+    #[test]
+    fn timewindow_big_is_signed_at_its_declared_width_and_relative() {
+        let f = impacttime_field();
+        let table = vec![f.clone()];
+        let time = 20.0f64;
+
+        for impacttime in [19.25f64, 20.75] {
+            let mut w = BitWriter::new();
+            FieldMask::from_indices(&[0]).write(&mut w);
+            rehlds_write_timewindow_big(&mut w, &f, time, impacttime);
+            let bytes = w.into_bytes();
+
+            let mut r = BitReader::new(&bytes);
+            let got = parse_delta_at(&mut r, &table, time as f32);
+            let v = match got["impacttime"] {
+                Value::Float(v) => v,
+                ref other => panic!("impacttime came back as {other:?}"),
+            };
+            assert!(
+                (f64::from(v) - impacttime).abs() < 1e-4,
+                "impacttime {impacttime} decoded as {v}"
+            );
+        }
+    }
+
+    /// The old reading of a `DT_TIMEWINDOW_BIG` in the past: `20.75` against a
+    /// base of `20.0` travels as `-75`, which read as 13 unsigned bits and
+    /// divided by `premultiply` is `1.51` — off by an entire time base.
+    #[test]
+    fn timewindow_big_read_unsigned_gives_a_wrong_but_well_framed_value() {
+        let f = impacttime_field();
+        let mut w = BitWriter::new();
+        FieldMask::from_indices(&[0]).write(&mut w);
+        rehlds_write_timewindow_big(&mut w, &f, 20.0, 20.75);
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let got = parse_delta_at(&mut r, std::slice::from_ref(&f), 20.0);
+        assert_eq!(got["impacttime"], Value::Float(20.75));
+
+        let mut old = BitReader::new(&bytes);
+        let was = parse_delta(&mut old, &[as_the_old_float_path(&f)]);
+        assert_eq!(was["impacttime"], Value::Float(1.51), "what it used to return");
+
+        // 3 count bits + 1 mask byte + 13 field bits = 24, either way.
+        assert_eq!((r.byte_pos(), r.bit_offset()), (old.byte_pos(), old.bit_offset()));
+        assert_eq!((r.byte_pos(), r.bit_offset()), (3, 0));
+    }
+
+    /// A `premultiply` inside the engine's own epsilon window takes the
+    /// identity branch — `t = mtime[0] - addt`, no division
+    /// (`delta.cpp:1048-1050`).
+    #[test]
+    fn timewindow_big_with_unit_premultiply_takes_the_identity_branch() {
+        let f = FieldDesc {
+            name: "starttime".into(),
+            field_type: DT_TIMEWINDOW_BIG,
+            bits: 13,
+            premultiply: 1.0,
+            postmultiply: 1.0,
+        };
+        let table = vec![f.clone()];
+        let mut w = BitWriter::new();
+        FieldMask::from_indices(&[0]).write(&mut w);
+        rehlds_write_timewindow_big(&mut w, &f, 40.0, 37.0);
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(parse_delta_at(&mut r, &table, 40.0)["starttime"], Value::Float(37.0));
+    }
+
+    /// `postmultiply` is applied to floats and integers but **not** to either
+    /// time window (`delta.cpp:1037-1051` reads neither scale for
+    /// `DT_TIMEWINDOW_8` and only `premultiply` for `DT_TIMEWINDOW_BIG`).
+    #[test]
+    fn timewindow_ignores_postmultiply() {
+        let mut f = animtime_field();
+        f.postmultiply = 7.0;
+        f.premultiply = 3.0; // also ignored: the scale is a hardcoded 100
+        let table = vec![f];
+        let mut w = BitWriter::new();
+        FieldMask::from_indices(&[0]).write(&mut w);
+        rehlds_write_timewindow_8(&mut w, 5.0, 4.5);
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(parse_delta_at(&mut r, &table, 5.0)["animtime"], Value::Float(4.5));
+    }
+
+    /// Our encoder is the inverse of our decoder at the same base, for both
+    /// widths and on both sides of the base.
+    #[test]
+    fn timewindow_round_trips_through_write_delta_at() {
+        let table = vec![animtime_field(), impacttime_field()];
+        let time = 33.5f32;
+        let mut want = HashMap::new();
+        want.insert("animtime".to_string(), Value::Float(33.25));
+        want.insert("impacttime".to_string(), Value::Float(34.0));
+
+        let mut w = BitWriter::new();
+        write_delta_at(&mut w, &table, &want, time);
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let got = parse_delta_at(&mut r, &table, time);
+        assert_eq!(got["animtime"], Value::Float(33.25));
+        assert_eq!(got["impacttime"], Value::Float(34.0));
+    }
+
+    /// `parse_delta` keeps its signature and means "time base 0.0", so every
+    /// existing caller reads the same number of bits it always did.
+    #[test]
+    fn parse_delta_is_parse_delta_at_zero() {
+        let table = vec![animtime_field()];
+        let mut w = BitWriter::new();
+        FieldMask::from_indices(&[0]).write(&mut w);
+        rehlds_write_timewindow_8(&mut w, 10.0, 9.75);
+        let bytes = w.into_bytes();
+
+        let mut a = BitReader::new(&bytes);
+        let mut b = BitReader::new(&bytes);
+        assert_eq!(parse_delta(&mut a, &table), parse_delta_at(&mut b, &table, 0.0));
+        assert_eq!(a.byte_pos(), b.byte_pos());
+        // 25 ticks *behind* a base of zero, i.e. -0.25.
+        assert_eq!(parse_delta(&mut BitReader::new(&bytes), &table)["animtime"], Value::Float(-0.25));
     }
 }
 
