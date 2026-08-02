@@ -74,6 +74,12 @@ pub struct Session {
     pub clientdata: Option<crate::world::ClientData>,
     /// Paced console commands (buy aliases, weapon switches, chat).
     pub console: crate::console::ConsoleQueue,
+    /// The bot's brain. `None` means "send neutral commands", which is what a
+    /// capture or protocol test wants.
+    pub brain: Option<bot::Controller>,
+    /// Objective the bot is heading for, supplied by the nav layer.
+    pub site: Option<[f32; 3]>,
+    last_think: Option<Instant>,
     /// Which round we last bought in, so a buy happens once per spawn rather
     /// than every frame we happen to be standing in the zone.
     bought_at_reset: Option<u32>,
@@ -123,6 +129,9 @@ impl Session {
             clock: crate::clock::MoveClock::new(Instant::now()),
             clientdata: None,
             console: crate::console::ConsoleQueue::new(),
+            brain: None,
+            site: None,
+            last_think: None,
             bought_at_reset: None,
             decoder: None,
             cmd_history: std::collections::VecDeque::new(),
@@ -859,6 +868,37 @@ impl Session {
         Ok(())
     }
 
+    /// Run the bot for one frame, draining any console commands it asks for.
+    ///
+    /// Returns `None` when there is nothing to think with — no brain, or no
+    /// decoded world yet — so the caller's own intent stands.
+    fn think(&mut self) -> Option<bot::Intent> {
+        let now = Instant::now();
+        let dt = self
+            .last_think
+            .map(|t| now.saturating_duration_since(t).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.25);
+        self.last_think = Some(now);
+
+        let d = self.decoder.as_ref()?;
+        self.brain.as_ref()?;
+
+        // Round-trip latency: everything in the world view is this stale, and
+        // the aim layer needs to know in order to lead a moving target.
+        let latency = 0.0;
+        let world = crate::view::project(d, Vec::new(), None, latency);
+        let site = self.site;
+        let intent = self.brain.as_mut()?.think(&world, site, dt);
+
+        for cmd in &intent.commands {
+            if let Some(text) = cmd.to_console() {
+                self.console.push(text);
+            }
+        }
+        Some(intent)
+    }
+
     /// Queue a loadout when we are alive, in a buy zone, and have not already
     /// bought for this spawn.
     ///
@@ -1185,6 +1225,12 @@ impl Session {
         if let Some(cmd) = self.console.next(Instant::now(), self.reliables_settled()) {
             self.send_command(&cmd);
         }
+
+        // Let the bot decide, if it has a brain and a world to look at.
+        // Falls back to the caller's intent otherwise, which is what the
+        // protocol captures want.
+        let decided = self.think();
+        let intent = decided.as_ref().unwrap_or(intent);
 
         let msecs = self.clock.due(Instant::now());
         let body = if msecs.is_empty() {

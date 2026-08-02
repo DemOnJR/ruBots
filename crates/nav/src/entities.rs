@@ -81,6 +81,22 @@ impl Aabb {
 /// The radius the game uses for the point forms of the zone entities.
 pub const LEGACY_ZONE_RADIUS: f32 = 256.0;
 
+/// A brush entity that blocks a player.
+///
+/// **These do not exist in `models[0]`.** The world's collision hulls contain
+/// worldspawn's brushes and nothing else, so every crate, desk and pillar built
+/// as a `func_wall` is invisible to a trace against the world — and a navigator
+/// that only traces the world will happily walk a bot straight through them.
+/// cs_office alone has 175 of these. They have to be traced separately, via
+/// [`crate::bsp::Bsp::hull_trace_model`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SolidBrush {
+    /// Index into `Bsp::models` — what `hull_trace_model` wants.
+    pub model: usize,
+    /// World-space box, for a cheap rejection test before tracing.
+    pub bounds: Aabb,
+}
+
 /// What the round is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scenario {
@@ -259,6 +275,8 @@ pub struct MapInfo {
     pub ct_spawns: Vec<Vec3>,
     pub hostage_spawns: Vec<Vec3>,
     pub ladders: Vec<Aabb>,
+    /// Brush entities that block movement — see [`SolidBrush`].
+    pub solid_brushes: Vec<SolidBrush>,
 }
 
 impl Default for Scenario {
@@ -282,7 +300,28 @@ pub mod classname {
     pub const CT_SPAWN: &str = "info_player_start";
     pub const HOSTAGE: &str = "hostage_entity";
     pub const SCIENTIST: &str = "monster_scientist";
+
+    /// Brush entities that spawn `SOLID_BSP` and stay put.
+    ///
+    /// `func_illusionary` and `func_water` are `SOLID_NOT` and are absent on
+    /// purpose. So are the doors: `func_door` blocks only while closed, and
+    /// baking a closed door in would permanently cut routes the map expects to
+    /// be open — which is the more damaging of the two errors. `func_train`,
+    /// `func_plat` and friends move, so a static box for them would be a lie.
+    pub const SOLID_BRUSHES: [&str; 5] = [
+        "func_wall",
+        "func_wall_toggle",
+        "func_breakable",
+        "func_pushable",
+        "func_button",
+    ];
 }
+
+/// `SF_WALL_TOOGLE_START_OFF` (`regamedll/dlls/bmodels.h:47`): the entity
+/// spawns non-solid.
+const SF_WALL_TOGGLE_START_OFF: u32 = 1 << 0;
+/// `SF_WALL_TOOGLE_NOTSOLID` (`regamedll/dlls/bmodels.h:48`).
+const SF_WALL_TOGGLE_NOTSOLID: u32 = 1 << 3;
 
 impl MapInfo {
     /// Read the map's objectives straight out of a parsed BSP.
@@ -337,6 +376,23 @@ impl MapInfo {
 
         let ladders = boxes(classname::FUNC_LADDER)?;
         let buy_zones = boxes(classname::FUNC_BUYZONE)?;
+
+        let mut solid_brushes = Vec::new();
+        for e in ents {
+            if !classname::SOLID_BRUSHES.contains(&e.classname()) {
+                continue;
+            }
+            if e.classname() == "func_wall_toggle" {
+                let sf: u32 = e.get("spawnflags").and_then(|s| s.parse().ok()).unwrap_or(0);
+                if sf & (SF_WALL_TOGGLE_START_OFF | SF_WALL_TOGGLE_NOTSOLID) != 0 {
+                    continue;
+                }
+            }
+            let idx = e.brush_model().ok_or_else(|| {
+                EntityError::MissingBrushModel(e.classname().to_string())
+            })?;
+            solid_brushes.push(SolidBrush { model: idx, bounds: brush(e)? });
+        }
 
         // --- bomb sites: brush form first, then the legacy point form.
         // CheckMapConditions:1642-1656 tests them in exactly this order.
@@ -395,6 +451,7 @@ impl MapInfo {
             ct_spawns,
             hostage_spawns,
             ladders,
+            solid_brushes,
         })
     }
 
@@ -654,6 +711,47 @@ mod tests {
         );
         let info = MapInfo::from_entities(&ents, &bsp).expect("should derive");
         assert_eq!(info.hostage_spawns, vec![[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn solid_brush_entities_are_collected_and_the_see_through_ones_are_not() {
+        let bsp = bsp_with_models(vec![
+            model([0.0; 3], [1.0; 3]),
+            model([0.0; 3], [8.0; 3]),
+            model([100.0; 3], [108.0; 3]),
+            model([200.0; 3], [208.0; 3]),
+        ]);
+        let ents = parse(
+            "{ \"classname\" \"func_wall\" \"model\" \"*1\" }\
+             { \"classname\" \"func_illusionary\" \"model\" \"*2\" }\
+             { \"classname\" \"func_breakable\" \"model\" \"*3\" }\
+             { \"classname\" \"func_door\" \"model\" \"*2\" }",
+        );
+        let info = MapInfo::from_entities(&ents, &bsp).expect("should derive");
+        assert_eq!(
+            info.solid_brushes,
+            vec![
+                SolidBrush { model: 1, bounds: Aabb::new([0.0; 3], [8.0; 3]) },
+                SolidBrush { model: 3, bounds: Aabb::new([200.0; 3], [208.0; 3]) },
+            ],
+            "func_illusionary is SOLID_NOT and func_door opens; neither belongs"
+        );
+    }
+
+    #[test]
+    fn a_func_wall_toggle_that_starts_off_is_not_solid() {
+        let bsp = bsp_with_models(vec![model([0.0; 3], [1.0; 3]), model([0.0; 3], [8.0; 3])]);
+        for sf in ["1", "8", "9"] {
+            let ents = parse(&format!(
+                "{{ \"classname\" \"func_wall_toggle\" \"model\" \"*1\" \"spawnflags\" \"{sf}\" }}"
+            ));
+            let info = MapInfo::from_entities(&ents, &bsp).expect("should derive");
+            assert!(info.solid_brushes.is_empty(), "spawnflags {sf} should be non-solid");
+        }
+        // Without the flag it is solid.
+        let ents = parse("{ \"classname\" \"func_wall_toggle\" \"model\" \"*1\" }");
+        let info = MapInfo::from_entities(&ents, &bsp).expect("should derive");
+        assert_eq!(info.solid_brushes.len(), 1);
     }
 
     #[test]

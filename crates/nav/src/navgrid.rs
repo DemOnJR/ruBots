@@ -26,8 +26,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::bsp::{Bsp, Hull, Vec3};
-use crate::entities::{Aabb, MapInfo};
+use crate::bsp::{Bsp, Hull, Trace, Vec3};
+use crate::entities::{Aabb, MapInfo, SolidBrush};
 use crate::route::{self, NavSource};
 
 /// Node flags.
@@ -246,45 +246,182 @@ pub fn checksum(bsp_bytes: &[u8]) -> u64 {
     h
 }
 
+/// The collision a player actually meets: the world hull **and** every solid
+/// brush entity.
+///
+/// The world's clipnode trees hold worldspawn's brushes and nothing else. Every
+/// crate, desk and pillar built as a `func_wall` or `func_breakable` is a
+/// separate submodel with its own hull tree, and a trace against the world
+/// passes straight through all of them — cs_office has 175. Getting this wrong
+/// does not produce a subtly worse graph, it produces bots that walk through
+/// furniture.
+pub struct World<'a> {
+    bsp: &'a Bsp,
+    blockers: Vec<SolidBrush>,
+    /// Union of every blocker's box, so a segment nowhere near one is rejected
+    /// by a single test instead of a loop.
+    span: Option<Aabb>,
+}
+
+fn expand_for(b: &Aabb, hull: Hull) -> Aabb {
+    // Minkowski expansion, as `PM_TestPlayerPosition` does it
+    // (`rehlds/engine/pmovetst.cpp:303-308`): the box a *point* must avoid.
+    let (hmins, hmaxs) = (hull.mins(), hull.maxs());
+    Aabb::new(
+        [
+            b.mins[0] - hmaxs[0],
+            b.mins[1] - hmaxs[1],
+            b.mins[2] - hmaxs[2],
+        ],
+        [
+            b.maxs[0] - hmins[0],
+            b.maxs[1] - hmins[1],
+            b.maxs[2] - hmins[2],
+        ],
+    )
+}
+
+fn segment_box(a: Vec3, b: Vec3) -> Aabb {
+    Aabb::new(
+        [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])],
+        [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])],
+    )
+}
+
+impl<'a> World<'a> {
+    /// The world hull only. Hand-built test maps have no brush entities, and
+    /// nor does a caller who only wants line of sight.
+    pub fn bare(bsp: &'a Bsp) -> Self {
+        Self { bsp, blockers: Vec::new(), span: None }
+    }
+
+    pub fn new(bsp: &'a Bsp, info: &MapInfo) -> Self {
+        let blockers: Vec<SolidBrush> = info
+            .solid_brushes
+            .iter()
+            .filter(|b| b.model < bsp.models.len())
+            .copied()
+            .collect();
+        let span = blockers.iter().map(|b| b.bounds).reduce(|a, b| {
+            Aabb::new(
+                [
+                    a.mins[0].min(b.mins[0]),
+                    a.mins[1].min(b.mins[1]),
+                    a.mins[2].min(b.mins[2]),
+                ],
+                [
+                    a.maxs[0].max(b.maxs[0]),
+                    a.maxs[1].max(b.maxs[1]),
+                    a.maxs[2].max(b.maxs[2]),
+                ],
+            )
+        });
+        Self { bsp, blockers, span }
+    }
+
+    pub fn bsp(&self) -> &Bsp {
+        self.bsp
+    }
+
+    pub fn blockers(&self) -> &[SolidBrush] {
+        &self.blockers
+    }
+
+    /// Nearest hit across the world and every overlapping brush entity.
+    pub fn trace(&self, hull: Hull, a: Vec3, b: Vec3) -> Trace {
+        let mut best = self.bsp.hull_trace(hull, a, b);
+        if best.start_solid {
+            return best;
+        }
+        let Some(span) = self.span else {
+            return best;
+        };
+        let seg = segment_box(a, b);
+        if !seg.intersects(&expand_for(&span, hull)) {
+            return best;
+        }
+        for br in &self.blockers {
+            if !seg.intersects(&expand_for(&br.bounds, hull)) {
+                continue;
+            }
+            let t = self.bsp.hull_trace_model(br.model, hull, a, b);
+            if t.start_solid {
+                // Same convention as a single tree: a trace that begins inside
+                // solid reports it and leaves the fraction alone.
+                best.start_solid = true;
+                best.fraction = 1.0;
+                return best;
+            }
+            if t.fraction < best.fraction {
+                best = t;
+            }
+        }
+        best
+    }
+
+    pub fn clear(&self, hull: Hull, a: Vec3, b: Vec3) -> bool {
+        self.trace(hull, a, b).is_clear()
+    }
+
+    /// Can a player of this hull have its origin at `p`?
+    pub fn fits(&self, hull: Hull, p: Vec3) -> bool {
+        if self.bsp.hull_point_contents(hull, p) == crate::bsp::contents::SOLID {
+            return false;
+        }
+        for br in &self.blockers {
+            if !expand_for(&br.bounds, hull).contains(p) {
+                continue;
+            }
+            if self.bsp.hull_point_contents_model(br.model, hull, p)
+                == crate::bsp::contents::SOLID
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn drop_to_floor(&self, x: f32, y: f32, from_z: f32, distance: f32) -> Option<Vec3> {
+        let t = self.trace(Hull::Stand, [x, y, from_z], [x, y, from_z - distance]);
+        if t.start_solid || t.fraction >= 1.0 {
+            return None;
+        }
+        // A face steeper than about 45 degrees is not ground: the engine takes
+        // the player off it and they slide (`pm_shared.cpp:1220`). A node there
+        // would be a place the bot cannot actually stay.
+        if !t.is_walkable_floor() {
+            return None;
+        }
+        Some(t.end)
+    }
+
+    /// The highest floor in the column `(x, y)` between `from + MAX_JUMP` and
+    /// `from - MAX_FALL` — the whole band one move can reach.
+    ///
+    /// Three starts, not one. Lifting the probe by a jump's worth is what finds
+    /// a ledge you could jump onto, but under a low ceiling that lift begins
+    /// *inside* solid, and "the probe started in a wall" is not the same fact as
+    /// "there is no floor here". Dropping back to a step's worth and then to
+    /// level with the source recovers those columns. de_dust2 has a node under
+    /// exactly such a ceiling, which is how this was found.
+    pub fn floor_in_window(&self, x: f32, y: f32, from: f32) -> Option<Vec3> {
+        for lift in [MAX_JUMP, STEP_SIZE, 0.0] {
+            if let Some(g) = self.drop_to_floor(x, y, from + lift, lift + MAX_FALL) {
+                return Some(g);
+            }
+        }
+        None
+    }
+}
+
 /// Drop a standing player onto the floor under `p`.
 ///
 /// Probes from `p + (0,0,18)` — one step's worth of slack, so a position a
 /// little inside the floor still snaps — down to `p - (0,0,200)`. Returns the
-/// legal standing **origin**, or `None` if the start is already inside solid or
-/// there is no floor within reach.
-pub fn ground_snap(bsp: &Bsp, p: Vec3) -> Option<Vec3> {
-    drop_to_floor(bsp, p[0], p[1], p[2] + STEP_SIZE, STEP_SIZE + MAX_FALL)
-}
-
-fn drop_to_floor(bsp: &Bsp, x: f32, y: f32, from_z: f32, distance: f32) -> Option<Vec3> {
-    let t = bsp.hull_trace(Hull::Stand, [x, y, from_z], [x, y, from_z - distance]);
-    if t.start_solid || t.fraction >= 1.0 {
-        None
-    } else {
-        Some(t.end)
-    }
-}
-
-/// The highest floor in the column `(x, y)` between `from + MAX_JUMP` and
-/// `from - MAX_FALL` — the whole band one move can reach.
-///
-/// Three starts, not one. Lifting the probe by a jump's worth is what finds a
-/// ledge you could jump onto, but under a low ceiling that lift begins *inside*
-/// solid, and "the probe started in a wall" is not the same fact as "there is
-/// no floor here". Dropping back to a step's worth and then to level with the
-/// source recovers those columns. de_dust2 has a node under exactly such a
-/// ceiling, which is how this was found.
-fn floor_in_window(bsp: &Bsp, x: f32, y: f32, from: f32) -> Option<Vec3> {
-    for lift in [MAX_JUMP, STEP_SIZE, 0.0] {
-        if let Some(g) = drop_to_floor(bsp, x, y, from + lift, lift + MAX_FALL) {
-            return Some(g);
-        }
-    }
-    None
-}
-
-fn clear(bsp: &Bsp, hull: Hull, a: Vec3, b: Vec3) -> bool {
-    bsp.hull_trace(hull, a, b).is_clear()
+/// legal standing **origin**, or `None` if the start is already inside solid,
+/// there is no floor within reach, or what it found is too steep to stand on.
+pub fn ground_snap(world: &World, p: Vec3) -> Option<Vec3> {
+    world.drop_to_floor(p[0], p[1], p[2] + STEP_SIZE, STEP_SIZE + MAX_FALL)
 }
 
 /// A horizontal move with the engine's step-up.
@@ -294,13 +431,13 @@ fn clear(bsp: &Bsp, hull: Hull, a: Vec3, b: Vec3) -> bool {
 /// `:1214`). Without modelling that, every kerb in the map would read as a
 /// wall, because the expanded hull turns a 4-unit step into a 4-unit cliff face
 /// sitting 16 units out from the real one.
-fn step_move(bsp: &Bsp, hull: Hull, a: Vec3, b: Vec3) -> bool {
-    if clear(bsp, hull, a, b) {
+fn step_move(world: &World, hull: Hull, a: Vec3, b: Vec3) -> bool {
+    if world.clear(hull, a, b) {
         return true;
     }
     let ah = raise(a, STEP_SIZE);
     let bh = raise(b, STEP_SIZE);
-    clear(bsp, hull, a, ah) && clear(bsp, hull, ah, bh) && clear(bsp, hull, bh, b)
+    world.clear(hull, a, ah) && world.clear(hull, ah, bh) && world.clear(hull, bh, b)
 }
 
 /// Can a player get from origin `from` to origin `to` in one move, and how?
@@ -312,18 +449,18 @@ fn step_move(bsp: &Bsp, hull: Hull, a: Vec3, b: Vec3) -> bool {
 /// that merely resemble each other.
 ///
 /// Both arguments are player origins. `None` means no legal move.
-pub fn classify(bsp: &Bsp, from: Vec3, to: Vec3) -> Option<Move> {
+pub fn classify(world: &World, from: Vec3, to: Vec3) -> Option<Move> {
     let dz = to[2] - from[2];
 
     if dz.abs() <= STEP_SIZE {
-        if step_move(bsp, Hull::Stand, from, to) {
+        if step_move(world, Hull::Stand, from, to) {
             return Some(Move::Walk);
         }
         // Standing does not fit. A ducking origin sits 18 above the feet
         // instead of 36, so drop both ends by 18 to keep the feet where they
         // were and ask hull 3 the same question.
         let d = Hull::Stand.eye_to_feet() - Hull::Duck.eye_to_feet();
-        if step_move(bsp, Hull::Duck, raise(from, -d), raise(to, -d)) {
+        if step_move(world, Hull::Duck, raise(from, -d), raise(to, -d)) {
             return Some(Move::Crouch);
         }
         return None;
@@ -333,7 +470,7 @@ pub fn classify(bsp: &Bsp, from: Vec3, to: Vec3) -> Option<Move> {
         // Rise straight up first -- that vertical trace is the head-clearance
         // check -- and only then move across.
         let apex = [from[0], from[1], to[2]];
-        if clear(bsp, Hull::Stand, from, apex) && clear(bsp, Hull::Stand, apex, to) {
+        if world.clear(Hull::Stand, from, apex) && world.clear(Hull::Stand, apex, to) {
             return Some(Move::Jump);
         }
         return None;
@@ -343,7 +480,7 @@ pub fn classify(bsp: &Bsp, from: Vec3, to: Vec3) -> Option<Move> {
         // Walk off the ledge, then fall. If a railing blocks the first leg
         // there is nothing to fall from.
         let over = [to[0], to[1], from[2]];
-        if clear(bsp, Hull::Stand, from, over) && clear(bsp, Hull::Stand, over, to) {
+        if world.clear(Hull::Stand, from, over) && world.clear(Hull::Stand, over, to) {
             return Some(Move::Fall);
         }
         return None;
@@ -355,7 +492,7 @@ pub fn classify(bsp: &Bsp, from: Vec3, to: Vec3) -> Option<Move> {
 // ---------------------------------------------------------------- building
 
 struct Builder<'a> {
-    bsp: &'a Bsp,
+    world: &'a World<'a>,
     nodes: Vec<NavNode>,
     /// `(lattice x, lattice y) -> node indices in that column, in the order
     /// they were created`. A `Vec` rather than a z bucket so that two probes of
@@ -377,10 +514,10 @@ fn lattice_pos(ix: i32, iy: i32) -> (f32, f32) {
 }
 
 impl<'a> Builder<'a> {
-    fn new(bsp: &'a Bsp) -> Self {
-        let w = bsp.models[0];
+    fn new(world: &'a World<'a>) -> Self {
+        let w = world.bsp().models[0];
         Self {
-            bsp,
+            world,
             nodes: Vec::new(),
             columns: HashMap::new(),
             airborne: Vec::new(),
@@ -445,9 +582,7 @@ impl<'a> Builder<'a> {
         for (dx, dy) in SEED_RING {
             let (jx, jy) = (ix + dx, iy + dy);
             let (x, y) = lattice_pos(jx, jy);
-            if let Some(g) =
-                drop_to_floor(self.bsp, x, y, p[2] + STEP_SIZE, STEP_SIZE + MAX_FALL)
-            {
+            if let Some(g) = ground_snap(self.world, [x, y, p[2]]) {
                 return Some(self.insert(jx, jy, g, flags, false));
             }
         }
@@ -486,7 +621,7 @@ impl<'a> Builder<'a> {
         let top = zone.maxs[2] + feet_to_origin;
         loop {
             let p = [x, y, z];
-            if self.bsp.hull_point_contents(Hull::Stand, p) != crate::bsp::contents::SOLID {
+            if self.world.fits(Hull::Stand, p) {
                 chain.push(self.insert(jx, jy, p, flags::LADDER, true));
             }
             if z >= top {
@@ -500,7 +635,7 @@ impl<'a> Builder<'a> {
         for w in chain.windows(2) {
             let (a, b) = (w[0], w[1]);
             let (pa, pb) = (self.nodes[a as usize].origin, self.nodes[b as usize].origin);
-            if clear(self.bsp, Hull::Stand, pa, pb) {
+            if self.world.clear(Hull::Stand, pa, pb) {
                 self.link(a, b, Move::Ladder);
                 self.link(b, a, Move::Ladder);
             }
@@ -513,9 +648,7 @@ impl<'a> Builder<'a> {
         let mut z = zone.mins[2] + feet_to_origin;
         let top = zone.maxs[2] + feet_to_origin;
         loop {
-            if self.bsp.hull_point_contents(Hull::Stand, [x, y, z])
-                != crate::bsp::contents::SOLID
-            {
+            if self.world.fits(Hull::Stand, [x, y, z]) {
                 return Some(z);
             }
             if z >= top {
@@ -552,7 +685,7 @@ impl<'a> Builder<'a> {
 
                 // Candidate 1: whatever floor is in that column inside the
                 // reachable window.
-                let found = floor_in_window(self.bsp, x, y, p[2]);
+                let found = self.world.floor_in_window(x, y, p[2]);
                 let mut candidates: Vec<u32> = Vec::new();
                 if let Some(g) = found {
                     let before = self.nodes.len();
@@ -579,7 +712,7 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     let q = self.nodes[j as usize].origin;
-                    let Some(kind) = classify(self.bsp, p, q) else {
+                    let Some(kind) = classify(self.world, p, q) else {
                         continue;
                     };
                     // A node hanging on a ladder is only reachable by stepping
@@ -602,7 +735,8 @@ impl<'a> Builder<'a> {
 impl NavGrid {
     /// Generate a grid for a parsed map.
     pub fn generate(bsp: &Bsp, info: &MapInfo, checksum: u64) -> Self {
-        let mut b = Builder::new(bsp);
+        let world = World::new(bsp, info);
+        let mut b = Builder::new(&world);
 
         // Ladder columns first, so the flood fill links to them rather than
         // creating a second node on top of them.
@@ -968,43 +1102,47 @@ mod tests {
     #[test]
     fn ground_snap_lands_a_standing_origin_on_the_floor() {
         let m = flat_map();
-        let g = ground_snap(&m, [0.0, 0.0, 100.0]).expect("floor is right there");
+        let w = World::bare(&m);
+        let g = ground_snap(&w, [0.0, 0.0, 100.0]).expect("floor is right there");
         assert!((g[2] - 36.0).abs() < 0.1, "standing origin should be 36 up, got {}", g[2]);
         // Starting below the floor is start_solid, which is not a floor.
-        assert_eq!(ground_snap(&m, [0.0, 0.0, -100.0]), None);
+        assert_eq!(ground_snap(&w, [0.0, 0.0, -100.0]), None);
         // Starting too high finds nothing within reach.
-        assert_eq!(ground_snap(&m, [0.0, 0.0, 5000.0]), None);
+        assert_eq!(ground_snap(&w, [0.0, 0.0, 5000.0]), None);
     }
 
     #[test]
     fn flat_ground_classifies_as_a_walk() {
         let m = flat_map();
+        let w = World::bare(&m);
         let a = [0.0, 0.0, 36.0];
         let b = [CELL, 0.0, 36.0];
-        assert_eq!(classify(&m, a, b), Some(Move::Walk));
-        assert_eq!(classify(&m, b, a), Some(Move::Walk));
+        assert_eq!(classify(&w, a, b), Some(Move::Walk));
+        assert_eq!(classify(&w, b, a), Some(Move::Walk));
     }
 
     #[test]
     fn a_step_beyond_the_engines_limits_is_not_an_edge() {
         let m = flat_map();
+        let w = World::bare(&m);
         let a = [0.0, 0.0, 36.0];
         // Above mp_jump_height.
-        assert_eq!(classify(&m, a, [CELL, 0.0, 36.0 + 60.0]), None);
+        assert_eq!(classify(&w, a, [CELL, 0.0, 36.0 + 60.0]), None);
         // Below the fall limit.
-        assert_eq!(classify(&m, a, [CELL, 0.0, 36.0 - 400.0]), None);
+        assert_eq!(classify(&w, a, [CELL, 0.0, 36.0 - 400.0]), None);
     }
 
     #[test]
     fn a_rise_within_jump_height_over_open_air_is_a_jump_and_the_reverse_a_fall() {
         let m = flat_map();
+        let w = World::bare(&m);
         let a = [0.0, 0.0, 36.0];
-        assert_eq!(classify(&m, a, [CELL, 0.0, 36.0 + 40.0]), Some(Move::Jump));
-        assert_eq!(classify(&m, [CELL, 0.0, 36.0 + 40.0], a), Some(Move::Fall));
+        assert_eq!(classify(&w, a, [CELL, 0.0, 36.0 + 40.0]), Some(Move::Jump));
+        assert_eq!(classify(&w, [CELL, 0.0, 36.0 + 40.0], a), Some(Move::Fall));
         // A fall is one-way in the sense that the reverse of a *big* drop is
         // not a jump.
-        assert_eq!(classify(&m, [CELL, 0.0, 36.0 + 150.0], a), Some(Move::Fall));
-        assert_eq!(classify(&m, a, [CELL, 0.0, 36.0 + 150.0]), None);
+        assert_eq!(classify(&w, [CELL, 0.0, 36.0 + 150.0], a), Some(Move::Fall));
+        assert_eq!(classify(&w, a, [CELL, 0.0, 36.0 + 150.0]), None);
     }
 
     /// The doorway from `bsp.rs`, rebuilt with a floor either side, so the
@@ -1046,12 +1184,143 @@ mod tests {
     #[test]
     fn a_low_doorway_classifies_as_a_crouch_not_a_walk() {
         let m = crouch_corridor();
+        let w = World::bare(&m);
         // Either side of the 0..32 lintel, on the floor.
         let a = [-40.0, 0.0, 36.0];
         let b = [40.0, 0.0, 36.0];
-        assert!(!clear(&m, Hull::Stand, a, b), "standing must be blocked");
-        assert_eq!(classify(&m, a, b), Some(Move::Crouch));
-        assert_eq!(classify(&m, b, a), Some(Move::Crouch));
+        assert!(!w.clear(Hull::Stand, a, b), "standing must be blocked");
+        assert_eq!(classify(&w, a, b), Some(Move::Crouch));
+        assert_eq!(classify(&w, b, a), Some(Move::Crouch));
+    }
+
+    /// [`flat_map`] plus a solid crate submodel from (100,-40,0) to
+    /// (200,40,80), built the way a `func_wall` appears in a real map: its own
+    /// clipnode tree, invisible to the world hull.
+    ///
+    /// The crate's tree is hull 1's expansion (16 out, 36 down, 36 up); every
+    /// hull index points at it, which is fine because the test only ever asks
+    /// about [`Hull::Stand`].
+    fn crate_map() -> (Bsp, MapInfo) {
+        let mut m = flat_map();
+        let base = m.planes.len() as u32;
+        let (mins, maxs) = ([100.0f32, -40.0, 0.0], [200.0f32, 40.0, 80.0]);
+        let hmins = Hull::Stand.mins();
+        let hmaxs = Hull::Stand.maxs();
+        for (axis, d) in [
+            (0usize, mins[0] - hmaxs[0]),
+            (0, maxs[0] - hmins[0]),
+            (1, mins[1] - hmaxs[1]),
+            (1, maxs[1] - hmins[1]),
+            (2, mins[2] - hmaxs[2]),
+            (2, maxs[2] - hmins[2]),
+        ] {
+            let mut n = [0.0f32; 3];
+            n[axis] = 1.0;
+            m.planes.push(Plane { normal: n, dist: d, kind: axis as i32 });
+        }
+        let root = m.clipnodes.len() as i16;
+        // Six half-spaces. Even i is a "low" face: at or past it, keep testing;
+        // before it, we are outside the box. Odd i is a "high" face: past it we
+        // are outside, before it keep testing. Inside all six is solid.
+        for i in 0..6i16 {
+            let plane = base + i as u32;
+            let children = if i % 2 == 0 {
+                [root + i + 1, -1]
+            } else if i == 5 {
+                [-1, -2]
+            } else {
+                [-1, root + i + 1]
+            };
+            m.clipnodes.push(ClipNode { plane, children });
+        }
+        m.models.push(Model {
+            mins,
+            maxs,
+            origin: [0.0; 3],
+            headnode: [0, root as i32, root as i32, root as i32],
+        });
+        let info = MapInfo {
+            t_spawns: vec![[0.0, 0.0, 40.0]],
+            solid_brushes: vec![SolidBrush { model: 1, bounds: Aabb::new(mins, maxs) }],
+            ..Default::default()
+        };
+        (m, info)
+    }
+
+    #[test]
+    fn a_solid_brush_entity_blocks_a_trace_the_world_hull_lets_through() {
+        let (m, info) = crate_map();
+        let a = [0.0, 0.0, 36.0];
+        let b = [300.0, 0.0, 36.0];
+
+        // The world hull has never heard of the crate.
+        assert!(
+            World::bare(&m).clear(Hull::Stand, a, b),
+            "the world tree should not contain the brush entity"
+        );
+        // With the entity in play, the same segment is blocked.
+        let w = World::new(&m, &info);
+        assert!(!w.clear(Hull::Stand, a, b), "the crate must block the trace");
+        let t = w.trace(Hull::Stand, a, b);
+        assert!(
+            (t.end[0] - 84.0).abs() < 1.0,
+            "should stop 16 short of the crate at x=100, got {}",
+            t.end[0]
+        );
+        // And a point inside it is not a place a player fits.
+        assert!(!w.fits(Hull::Stand, [150.0, 0.0, 36.0]));
+        assert!(w.fits(Hull::Stand, [0.0, 0.0, 36.0]));
+        assert!(World::bare(&m).fits(Hull::Stand, [150.0, 0.0, 36.0]));
+    }
+
+    #[test]
+    fn generation_routes_around_a_solid_brush_entity_instead_of_through_it() {
+        let (m, info) = crate_map();
+        let inside = Aabb::new([100.0, -40.0, 0.0], [200.0, 40.0, 80.0]);
+
+        let with = NavGrid::generate(&m, &info, 0);
+        let mut bare_info = info.clone();
+        bare_info.solid_brushes.clear();
+        let without = NavGrid::generate(&m, &bare_info, 0);
+
+        let occupied = |g: &NavGrid| {
+            g.nodes
+                .iter()
+                .filter(|n| {
+                    let player = Aabb::new(
+                        add(n.origin, Hull::Stand.mins()),
+                        add(n.origin, Hull::Stand.maxs()),
+                    );
+                    player.intersects(&inside)
+                })
+                .count()
+        };
+        assert!(
+            occupied(&without) > 0,
+            "without the entity the fill should walk right through the crate"
+        );
+        assert_eq!(occupied(&with), 0, "no node may overlap a solid brush entity");
+
+        // The far side is still reachable -- the fill goes round, not through.
+        let near = with.nearest([0.0, 0.0, 36.0]).expect("a node near the spawn");
+        let far = with.nearest([320.0, 0.0, 36.0]).expect("a node past the crate");
+        assert!(with.find_path(near, far).is_some(), "the crate cut the map in two");
+    }
+
+    #[test]
+    fn a_cache_survives_a_trip_through_the_filesystem() {
+        let m = flat_map();
+        let g = NavGrid::generate(&m, &spawn_info(&[[0.0, 0.0, 40.0]]), 0x1234_5678);
+        let path = std::env::temp_dir().join("nav_grid_round_trip.navg");
+        g.save(&path).expect("should write");
+        let back = NavGrid::load(&path, 0x1234_5678).expect("should read");
+        assert_eq!(back, g);
+        assert!(matches!(
+            NavGrid::load(&path, 0),
+            Err(NavError::StaleCache { .. })
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(NavGrid::load(&path, 0), Err(NavError::TooShort)));
     }
 
     #[test]
@@ -1080,12 +1349,13 @@ mod tests {
     #[test]
     fn every_generated_edge_is_re_admitted_by_classify() {
         let m = flat_map();
+        let w = World::bare(&m);
         let g = NavGrid::generate(&m, &spawn_info(&[[0.0, 0.0, 40.0]]), 0);
         for (i, n) in g.nodes.iter().enumerate() {
             for l in &n.links {
                 let q = g.nodes[l.to as usize].origin;
                 assert_eq!(
-                    classify(&m, n.origin, q),
+                    classify(&w, n.origin, q),
                     Some(l.kind),
                     "edge {i} -> {} was recorded as {:?} but classify disagrees",
                     l.to,
@@ -1363,6 +1633,7 @@ mod tests {
     fn every_step_of_a_real_route_is_re_admitted_by_the_engine_hull() {
         let Some(g) = real_grid("de_dust2") else { return };
         let (bsp, info, grid) = (&g.0, &g.1, &g.2);
+        let world = World::new(bsp, info);
         let t = grid
             .nearest(info.t_spawns[0])
             .expect("a node near the T spawn");
@@ -1376,7 +1647,7 @@ mod tests {
             let (a, b) = (grid.nodes[w[0]].origin, grid.nodes[w[1]].origin);
             let recorded = grid.move_between(w[0], w[1]).expect("path used a real edge");
             assert_eq!(
-                classify(&bsp, a, b),
+                classify(&world, a, b),
                 Some(recorded),
                 "step {} -> {} ({a:?} -> {b:?}) is not a legal move",
                 w[0],
@@ -1392,11 +1663,11 @@ mod tests {
     fn no_generated_node_is_inside_solid() {
         for name in ["de_dust2", "cs_office", "cs_assault"] {
             let Some(g) = real_grid(name) else { return };
-            let (bsp, grid) = (&g.0, &g.2);
+            let (bsp, info, grid) = (&g.0, &g.1, &g.2);
+            let world = World::new(bsp, info);
             for (i, n) in grid.nodes.iter().enumerate() {
-                assert_ne!(
-                    bsp.hull_point_contents(Hull::Stand, n.origin),
-                    contents::SOLID,
+                assert!(
+                    world.fits(Hull::Stand, n.origin),
                     "{name}: node {i} at {:?} is inside solid",
                     n.origin
                 );
@@ -1416,13 +1687,14 @@ mod tests {
     fn no_generated_node_is_floating() {
         for name in ["de_dust2", "cs_office"] {
             let Some(g) = real_grid(name) else { return };
-            let (bsp, grid) = (&g.0, &g.2);
+            let (bsp, info, grid) = (&g.0, &g.1, &g.2);
+            let world = World::new(bsp, info);
             for (i, n) in grid.nodes.iter().enumerate() {
                 if n.flags & flags::LADDER != 0 {
                     continue; // ladder nodes hang on purpose
                 }
                 let below = [n.origin[0], n.origin[1], n.origin[2] - 8.0];
-                let t = bsp.hull_trace(Hull::Stand, n.origin, below);
+                let t = world.trace(Hull::Stand, n.origin, below);
                 assert!(!t.start_solid, "{name}: node {i} at {:?} is in solid", n.origin);
                 assert!(
                     t.fraction < 1.0 && (t.end[2] - n.origin[2]).abs() < 1.0,
@@ -1438,20 +1710,27 @@ mod tests {
     #[test]
     fn a_floor_under_a_low_ceiling_is_still_found() {
         let m = flat_map();
+        let w = World::bare(&m);
         // The synthetic map has no ceiling, so all three probe heights agree.
-        let a = floor_in_window(&m, 0.0, 0.0, 36.0).expect("floor");
+        let a = w.floor_in_window(0.0, 0.0, 36.0).expect("floor");
         assert!((a[2] - 36.0).abs() < 0.1);
         // Under a real low ceiling, the lifted probes start in solid and the
         // level one is the only thing that finds the floor. crouch_corridor's
         // lintel spans 0..32 and its hull-1 tree is solid from z = 12 up, so a
         // probe from 36 + 44 is inside it.
         let c = crouch_corridor();
+        let cw = World::bare(&c);
         assert!(
-            drop_to_floor(&c, 16.0, 0.0, 36.0 + MAX_JUMP, MAX_JUMP + MAX_FALL).is_none(),
+            cw.trace(
+                Hull::Stand,
+                [16.0, 0.0, 36.0 + MAX_JUMP],
+                [16.0, 0.0, 36.0 - MAX_FALL],
+            )
+            .start_solid,
             "the lifted probe should start inside the lintel"
         );
         assert!(
-            floor_in_window(&c, -40.0, 0.0, 36.0).is_some(),
+            cw.floor_in_window(-40.0, 0.0, 36.0).is_some(),
             "the open corridor either side must still find its floor"
         );
     }
@@ -1460,7 +1739,8 @@ mod tests {
     #[test]
     fn every_edge_on_a_real_map_is_re_admitted() {
         let Some(g) = real_grid("cs_assault") else { return };
-        let (bsp, grid) = (&g.0, &g.2);
+        let (bsp, info, grid) = (&g.0, &g.1, &g.2);
+        let world = World::new(bsp, info);
         let mut checked = 0;
         for (i, n) in grid.nodes.iter().enumerate() {
             for l in &n.links {
@@ -1474,13 +1754,13 @@ mod tests {
                         l.to
                     );
                     assert!(
-                        bsp.hull_trace(Hull::Stand, n.origin, q).is_clear(),
+                        world.clear(Hull::Stand, n.origin, q),
                         "ladder link {i} -> {} passes through solid",
                         l.to
                     );
                 } else {
                     assert_eq!(
-                        classify(bsp, n.origin, q),
+                        classify(&world, n.origin, q),
                         Some(l.kind),
                         "edge {i} -> {} recorded as {:?}",
                         l.to,
@@ -1498,7 +1778,7 @@ mod tests {
     fn every_spawn_and_objective_on_de_dust2_has_a_node_near_it() {
         let Some(g) = real_grid("de_dust2") else { return };
         let (info, grid) = (&g.1, &g.2);
-        let mut check = |label: &str, p: Vec3| {
+        let check = |label: &str, p: Vec3| {
             let i = grid.nearest(p).expect("a non-empty grid");
             let d = route::dist(grid.nodes[i].origin, p);
             assert!(d < 96.0, "{label} at {p:?} is {d:.0} units from any node");

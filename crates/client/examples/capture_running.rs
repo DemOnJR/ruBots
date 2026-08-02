@@ -151,6 +151,11 @@ fn main() {
         );
     }
     session.start_decoding();
+    // Give the bot a brain unless we are capturing raw protocol.
+    if env::var("AIPLAYERS_NO_BRAIN").is_err() {
+        session.brain = Some(bot::Controller::new(0xA1F0, bot::Difficulty::Normal));
+        eprintln!("  bot brain enabled");
+    }
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
         Ok(true) => eprintln!("  *** SERVER IS STREAMING - we are fully connected ***"),
@@ -178,7 +183,11 @@ fn main() {
             let _ = session.pump(&mut t, &[netchan::clc::NOP]);
         }
         eprintln!("  joining team, retrying until the server actually spawns us");
-        match session.join_and_spawn(&mut t, Session::TEAM_TERRORIST, Duration::from_secs(15)) {
+        let team: u8 = env::var("AIPLAYERS_TEAM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Session::TEAM_TERRORIST);
+        match session.join_and_spawn(&mut t, team, Duration::from_secs(15)) {
             Ok(true) => eprintln!("  *** TEAM ACCEPTED -- joined ***"),
             Ok(false) => eprintln!("  !!! team was never accepted"),
             Err(e) => eprintln!("  join error: {e}"),

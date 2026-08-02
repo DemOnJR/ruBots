@@ -938,6 +938,70 @@ mod tests {
             .is_clear());
     }
 
+    /// A map with one plane, solid on whichever side the caller asks for.
+    fn plane_map(normal: Vec3, solid_front: bool) -> Bsp {
+        let children = if solid_front { [-2, -1] } else { [-1, -2] };
+        Bsp {
+            planes: vec![Plane { normal, dist: 0.0, kind: 3 }],
+            nodes: vec![Node { plane: 0, children }],
+            leaves: vec![
+                Leaf { contents: contents::EMPTY },
+                Leaf { contents: contents::SOLID },
+            ],
+            clipnodes: vec![ClipNode { plane: 0, children }],
+            models: vec![Model {
+                mins: [-1000.0; 3],
+                maxs: [1000.0; 3],
+                origin: [0.0; 3],
+                headnode: [0, 0, 0, 0],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_trace_reports_the_surface_it_stopped_on() {
+        // Wall at x = 0, solid behind: approaching from +x, the normal points
+        // back at us.
+        let m = plane_map([1.0, 0.0, 0.0], false);
+        let t = m.trace([10.0, 0.0, 0.0], [-10.0, 0.0, 0.0]);
+        assert!(t.fraction < 1.0);
+        assert_eq!(t.plane, [1.0, 0.0, 0.0]);
+        assert!(!t.is_walkable_floor(), "a vertical wall is not a floor");
+
+        // Solid in *front* of the same plane: approaching from -x now, so the
+        // normal is flipped, exactly as PM_RecursiveHullCheck flips it.
+        let m = plane_map([1.0, 0.0, 0.0], true);
+        let t = m.trace([-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
+        assert!(t.fraction < 1.0);
+        assert_eq!(t.plane, [-1.0, 0.0, 0.0]);
+
+        // Nothing hit, no plane.
+        let miss = m.trace([-50.0, 0.0, 0.0], [-10.0, 0.0, 0.0]);
+        assert!(miss.is_clear());
+        assert_eq!(miss.plane, [0.0; 3]);
+        assert!(!miss.is_walkable_floor());
+    }
+
+    #[test]
+    fn the_walkable_floor_test_is_the_engines_threshold() {
+        assert_eq!(WALKABLE_NORMAL_Z, 0.7);
+        // A face at 0.8 up is ground; the same face at 0.6 is a slope the
+        // engine slides the player off (pm_shared.cpp:1220).
+        for (nz, walkable) in [(1.0f32, true), (0.8, true), (0.7, true), (0.6, false)] {
+            let nx = (1.0 - nz * nz).sqrt();
+            let m = plane_map([nx, 0.0, nz], false);
+            let t = m.trace([0.0, 0.0, 100.0], [0.0, 0.0, -100.0]);
+            assert!(t.fraction < 1.0, "nz={nz} should have hit");
+            assert_eq!(
+                t.is_walkable_floor(),
+                walkable,
+                "nz={nz} normal={:?}",
+                t.plane
+            );
+        }
+    }
+
     #[test]
     fn tracing_a_model_that_does_not_exist_is_a_clear_trace() {
         let m = doorway_map();

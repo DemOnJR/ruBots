@@ -41,6 +41,16 @@ use std::collections::HashMap;
 
 use crate::svc;
 
+/// Per-frame player flags ReGameDLL packs into `clientdata_t.iuser3`
+/// (`regamedll/dlls/client.cpp:5100-5121`, values from `cdll_dll.h:70-73`).
+pub const PLAYER_CAN_SHOOT: i64 = 1 << 0;
+pub const PLAYER_FREEZE_TIME_OVER: i64 = 1 << 1;
+pub const PLAYER_IN_BOMB_ZONE: i64 = 1 << 2;
+pub const PLAYER_HOLDING_SHIELD: i64 = 1 << 3;
+
+/// `FL_ONGROUND`, `rehlds/common/const.h:49`.
+pub const FL_ONGROUND: i64 = 1 << 9;
+
 /// Our own player state for one server frame.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientData {
@@ -139,7 +149,33 @@ impl ClientData {
     }
 
     pub fn in_bomb_zone(&self) -> bool {
-        self.iuser3() & (1 << 2) != 0
+        self.iuser3() & PLAYER_IN_BOMB_ZONE != 0
+    }
+
+    /// `PLAYER_CAN_SHOOT` — the game DLL's own verdict on whether firing will
+    /// do anything, which folds in freeze time, defusing, and holding a shield
+    /// (`client.cpp:5100-5110`). Cheaper and more correct than re-deriving it.
+    pub fn can_shoot(&self) -> bool {
+        self.iuser3() & PLAYER_CAN_SHOOT != 0
+    }
+
+    /// `PLAYER_FREEZE_TIME_OVER`.
+    ///
+    /// **The name is inverted in the source.** It is set *during* the freeze
+    /// period (`client.cpp:5104-5106`), not after it, so this reports "frozen".
+    pub fn freeze_period(&self) -> bool {
+        self.iuser3() & PLAYER_FREEZE_TIME_OVER != 0
+    }
+
+    /// `pev->flags`, of which we mostly want `FL_ONGROUND`.
+    pub fn flags(&self) -> i64 {
+        self.fields.get("flags").and_then(Value::as_i64).unwrap_or(0)
+    }
+
+    /// On the ground. Required to plant, and to start a defuse
+    /// (`wpn_c4.cpp:114`, `ggrenade.cpp:1256`).
+    pub fn on_ground(&self) -> bool {
+        self.flags() & FL_ONGROUND != 0
     }
 
     /// `deadflag == DEAD_NO`.
