@@ -169,17 +169,37 @@ impl UserCmd {
 /// whole bytes. Pass the result to [`build_clc_move`], which adds the opcode,
 /// length and sequence checksum and munges it.
 ///
-/// `numbackup` is left at zero: a bot that sends a command every packet needs
-/// no backup commands, and backup framing above 12 payload bytes is the one
-/// piece not yet reproduced from a real client (see [`build_clc_move`]).
-pub fn build_move_payload(packet_loss: u8, cmds: &[UserCmd], table: &[FieldDesc]) -> Vec<u8> {
-    let mut out = vec![packet_loss, 0, cmds.len() as u8];
+/// `cmds` is **oldest first**, and the first `numbackup` of them are the
+/// backup copies of commands already sent in earlier packets.
+///
+/// Backup commands are not optional padding. When a packet is lost the server
+/// notices the sequence gap and replays to cover it: with backups it replays
+/// the *actual* commands, and without them it repeats `host_client->lastcmd`
+/// instead (`sv_user.cpp:1710-1730`). That both loses the real input and adds
+/// `msec` to `cmdtime` for a command we never re-sent, which drifts the
+/// server's move-time accounting. A real CS 1.6 client measured on the wire
+/// sends `numbackup = 2, numcmds = 2` in **every** `clc_move`, 14,898 of them
+/// over twelve minutes without exception.
+pub fn build_move_payload_backup(
+    packet_loss: u8,
+    cmds: &[UserCmd],
+    numbackup: u8,
+    table: &[FieldDesc],
+) -> Vec<u8> {
+    let numbackup = numbackup.min(cmds.len() as u8);
+    let numcmds = cmds.len() as u8 - numbackup;
+    let mut out = vec![packet_loss, numbackup, numcmds];
     let mut baseline = UserCmd::default();
     for cmd in cmds {
         out.extend_from_slice(&cmd.encode_delta(&baseline, table));
         baseline = *cmd;
     }
     out
+}
+
+/// [`build_move_payload_backup`] with no backup commands.
+pub fn build_move_payload(packet_loss: u8, cmds: &[UserCmd], table: &[FieldDesc]) -> Vec<u8> {
+    build_move_payload_backup(packet_loss, cmds, 0, table)
 }
 
 /// A `clc_move` body: the check byte plus the munged delta payload.

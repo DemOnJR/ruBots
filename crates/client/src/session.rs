@@ -74,6 +74,9 @@ pub struct Session {
     /// velocity, health, weapons. This is the objective test of whether our
     /// movement commands are being applied.
     pub clientdata: Option<crate::world::ClientData>,
+    /// The last few commands we sent, re-sent as `numbackup` so a lost packet
+    /// costs no input. A real client always carries two.
+    cmd_history: std::collections::VecDeque<proto::usercmd::UserCmd>,
     /// Newest server frame we have fully decoded, and may therefore advertise
     /// in `clc_delta`. `None` until the entity decoder exists — advertising a
     /// frame we never parsed makes the server delta against a world we do not
@@ -113,6 +116,7 @@ impl Session {
             content: crate::content::GameContent::discover(),
             clock: crate::clock::MoveClock::new(Instant::now()),
             clientdata: None,
+            cmd_history: std::collections::VecDeque::new(),
             last_valid_frame: None,
         }
     }
@@ -748,6 +752,10 @@ impl Session {
         Ok(())
     }
 
+    /// How many previously-sent commands ride along in each `clc_move`.
+    /// Measured from a real client: always exactly two.
+    pub const NUM_BACKUP: usize = 2;
+
     /// Team slots for `jointeam` (`regamedll/dlls/client.h:32-42`).
     pub const TEAM_TERRORIST: u8 = 1;
     pub const TEAM_CT: u8 = 2;
@@ -1003,11 +1011,21 @@ impl Session {
             return vec![netchan::clc::NOP];
         };
 
-        let cmds: Vec<_> = msecs
-            .iter()
-            .map(|&m| crate::control::intent_to_usercmd(intent, m))
-            .collect();
-        let payload = proto::usercmd::build_move_payload(self.packet_loss(), &cmds, &table);
+        // Backup commands first, then this frame's new ones. A real client
+        // sends numbackup=2 on every single move; without them a lost packet
+        // makes the server replay `lastcmd` instead of what we actually did.
+        let mut cmds: Vec<proto::usercmd::UserCmd> = self.cmd_history.iter().copied().collect();
+        let numbackup = cmds.len() as u8;
+        for &m in msecs {
+            let cmd = crate::control::intent_to_usercmd(intent, m);
+            cmds.push(cmd);
+            self.cmd_history.push_back(cmd);
+            while self.cmd_history.len() > Self::NUM_BACKUP {
+                self.cmd_history.pop_front();
+            }
+        }
+        let payload =
+            proto::usercmd::build_move_payload_backup(self.packet_loss(), &cmds, numbackup, &table);
         // The move payload is keyed on the sequence this packet will carry.
         let seq = self.chan.outgoing_sequence as i32;
         let mut msg = proto::usercmd::build_clc_move(&payload, seq);
