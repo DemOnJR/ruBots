@@ -1189,7 +1189,7 @@ impl Session {
         // the server is ready to be answered.
         let menu_by = Instant::now() + Self::JOIN_MENU_WAIT;
         while Instant::now() < menu_by && !self.saw_team_menu() {
-            self.pump(t, &[netchan::clc::NOP])?;
+            self.pump_moving(t)?;
         }
         self.settle(t, Self::JOIN_SETTLE)?;
         self.send_command(&format!("jointeam {team}"));
@@ -1219,7 +1219,7 @@ impl Session {
         // class is repeated.
         let mut next_try = Instant::now() + Self::JOIN_RETRY;
         while Instant::now() < deadline {
-            self.pump(t, &[netchan::clc::NOP])?;
+            self.pump_moving(t)?;
             if self.spawned() {
                 return Ok(true);
             }
@@ -1231,11 +1231,36 @@ impl Session {
         Ok(self.joined())
     }
 
+    /// Pump while sending REAL movement commands.
+    ///
+    /// This is not a nicety, it is what makes the server think at all. The
+    /// engine calls `SV_PlayerRunPreThink` from exactly one place --
+    /// **inside `SV_RunCmd`** (`sv_user.cpp:850`) -- and `SV_RunCmd` only runs
+    /// when a `clc_move` arrives. So a client that sends only `clc_nop`
+    /// keepalives gets no `PreThink`, hence no `CBasePlayer::JoiningThink` and
+    /// no `CHalfLifeMultiplay::PlayerThink`, and its join state machine is
+    /// frozen wherever it was.
+    ///
+    /// That froze ours at SHOWTEAMSELECT, so `jointeam` always landed in the
+    /// wrong window: PlayerThink then clobbered `m_iMenu`, `joinclass` was
+    /// refused forever with #Command_Not_Available, and `RoundRespawn` skipped
+    /// the player for the rest of the map (`player.cpp:4106`). A real client
+    /// streams `clc_move` from the moment it is connected, which is why it
+    /// never sees any of this.
+    fn pump_moving<T: Transport>(&mut self, t: &mut T) -> io::Result<Vec<Vec<u8>>> {
+        let msecs = self.clock.due(Instant::now());
+        if msecs.is_empty() {
+            return self.pump(t, &[netchan::clc::NOP]);
+        }
+        let body = self.build_move_body(&msecs, &bot::Intent::default());
+        self.pump(t, &body)
+    }
+
     /// Pump for `d`, doing nothing else.
     fn settle<T: Transport>(&mut self, t: &mut T, d: Duration) -> io::Result<()> {
         let until = Instant::now() + d;
         while Instant::now() < until {
-            self.pump(t, &[netchan::clc::NOP])?;
+            self.pump_moving(t)?;
         }
         Ok(())
     }
