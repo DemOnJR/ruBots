@@ -341,6 +341,11 @@ fn main() {
                         dec.rung, dec.carrying_bomb, dec.arming, dec.attack, dec.use_action,
                         dec.to_goal,
                     );
+                    eprintln!(
+                        "      hostage: escort {:<9} seen {} led {} to_hostage {:.0} edges {}",
+                        dec.escort, dec.hostages, dec.hostages_led, dec.to_hostage,
+                        dec.use_edges,
+                    );
                 }
                 if let Some(d) = session.decoder.as_ref() {
                     eprintln!(
@@ -359,6 +364,37 @@ fn main() {
                     if let Some(e) = d.stats.last_entity_error {
                         eprintln!("      entity decode: {e}");
                     }
+                    // Who we think is on which side, for every slot the server
+                    // has spoken about -- the whole roster, not the four
+                    // players that happen to be in the PVS. A friendly-fire
+                    // kill is a claim about this line, so it has to be in the
+                    // log to be checkable after the fact.
+                    let roster: Vec<String> = (1..=d.game.max_clients)
+                        .filter_map(|slot| d.game.player(slot).map(|p| (slot, p)))
+                        .filter(|(_, p)| p.seen || p.userid.is_some())
+                        .map(|(slot, p)| {
+                            format!(
+                                "{slot}:{}{}",
+                                match p.team {
+                                    client::usermsg::Team::Terrorist => "T",
+                                    client::usermsg::Team::CounterTerrorist => "CT",
+                                    client::usermsg::Team::Spectator => "SPEC",
+                                    client::usermsg::Team::Unassigned => "?",
+                                },
+                                if p.dead { "*" } else { "" },
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "      teams: [{}] | implausible {} ({}) occupants {}",
+                        roster.join(" "),
+                        d.game.implausible_team_updates,
+                        d.game
+                            .last_implausible_team_update
+                            .as_deref()
+                            .unwrap_or("-"),
+                        d.game.occupant_changes,
+                    );
                     for p in players.iter().take(4) {
                         eprintln!(
                             "        player #{} {:?} at [{:.0} {:.0} {:.0}] yaw {:.0}{}",

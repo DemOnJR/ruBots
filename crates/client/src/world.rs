@@ -382,6 +382,12 @@ impl Decoder {
         // `my_team()` answers Unassigned forever.
         let mut game = crate::usermsg::GameState::default();
         game.self_index = Some(my_slot.saturating_add(1));
+        // Slots above `maxclients` cannot exist, which is what lets the game
+        // state reject a team update addressed to one as noise rather than
+        // believing it.
+        if maxclients >= 1 {
+            game.max_clients = maxclients;
+        }
 
         Self {
             registry: signon.registry.clone(),
@@ -502,6 +508,17 @@ impl Decoder {
                     crate::stream::Item::Engine { id, payload } if *id == svc::SVC_TIME => {
                         if let Ok(b) = <[u8; 4]>::try_from(payload.as_slice()) {
                             self.time = f32::from_le_bytes(b);
+                        }
+                    }
+                    // Who is in each slot. The walker already steps over this
+                    // exactly; decoding it is what stops a slot's team
+                    // outliving its owner — see
+                    // `GameState::apply_user_info`.
+                    crate::stream::Item::Engine { id, payload }
+                        if *id == svc::SVC_UPDATEUSERINFO =>
+                    {
+                        if let Some(u) = crate::usermsg::parse_update_user_info(payload) {
+                            self.game.apply_user_info(&u);
                         }
                     }
                     _ => {}

@@ -152,25 +152,52 @@ impl Team {
     /// Anything else — a mod with its own team names — is
     /// [`Team::Unassigned`] rather than an error, because a strange team
     /// string is no reason to throw away the client index that came with it.
+    ///
+    /// Callers about to *store* the answer want [`Team::from_name_exact`]:
+    /// this one cannot tell `"UNASSIGNED"` (the server saying a slot emptied)
+    /// from bytes that are not a team name at all.
     pub fn from_name(name: &str) -> Team {
+        Self::from_name_exact(name).unwrap_or(Team::Unassigned)
+    }
+
+    /// From the literal, but `None` when it is not one the game can have
+    /// written.
+    ///
+    /// `GetTeamName` has exactly four possible return values, so a fifth
+    /// string is not "a team we do not model" — it is a payload that is not a
+    /// `TeamInfo` at all. Folding it to `Unassigned` and storing it erases a
+    /// team the server *did* state, using bytes the server never sent.
+    pub fn from_name_exact(name: &str) -> Option<Team> {
         if name.eq_ignore_ascii_case("CT") {
-            Team::CounterTerrorist
+            Some(Team::CounterTerrorist)
         } else if name.eq_ignore_ascii_case("TERRORIST") {
-            Team::Terrorist
+            Some(Team::Terrorist)
         } else if name.eq_ignore_ascii_case("SPECTATOR") {
-            Team::Spectator
+            Some(Team::Spectator)
+        } else if name.eq_ignore_ascii_case("UNASSIGNED") {
+            Some(Team::Unassigned)
         } else {
-            Team::Unassigned
+            None
         }
     }
 
     /// From the numeric `TeamName` the `ScoreInfo` team short carries.
     pub fn from_id(id: i16) -> Team {
+        Self::from_id_exact(id).unwrap_or(Team::Unassigned)
+    }
+
+    /// From the numeric `TeamName`, but `None` for a value outside the enum.
+    ///
+    /// The short is written straight from `m_iTeam`, which is a `TeamName`
+    /// (`dlls/player.h:202-208`), so anything outside `0..=3` came from bytes
+    /// that are not a `ScoreInfo`.
+    pub fn from_id_exact(id: i16) -> Option<Team> {
         match id {
-            1 => Team::Terrorist,
-            2 => Team::CounterTerrorist,
-            3 => Team::Spectator,
-            _ => Team::Unassigned,
+            0 => Some(Team::Unassigned),
+            1 => Some(Team::Terrorist),
+            2 => Some(Team::CounterTerrorist),
+            3 => Some(Team::Spectator),
+            _ => None,
         }
     }
 
@@ -374,6 +401,74 @@ pub struct TeamInfo {
     /// The literal the server sent, kept because a mod's team name is
     /// information even when [`Team::from_name`] flattens it to `Unassigned`.
     pub team_name: String,
+}
+
+/// `svc_updateuserinfo` — who is sitting in a client slot.
+///
+/// Not a user message: it is an engine message, written only by
+/// `SV_WriteFullClientUpdate_internal` (`rehlds/engine/sv_main.cpp:4068-4077`)
+/// as `byte slot`, `long userid`, `string userinfo`, `16 bytes hashedcdkey`.
+/// It is decoded here because what it identifies — the *occupant* of a slot —
+/// is game state, and nothing else on the wire carries it.
+///
+/// Two properties make it the right invalidation trigger for everything else
+/// this module keys by slot:
+///
+/// * **`userid` is unique per connection.** `SV_ConnectClient` assigns
+///   `client->userid = g_userid++` (`sv_main.cpp:2421`) on every connect,
+///   including a reconnect that lands on an occupied slot — which ReHLDS
+///   allows after ten seconds of quiet from the previous occupant, matching on
+///   the base address alone (`sv_main.cpp:2378-2385`). A changed `userid` on a
+///   slot therefore means a *different person*, with certainty, where a timer
+///   would only mean "probably".
+/// * **A vacated slot is announced.** `SV_DropClient_internal` zeroes
+///   `cl->userinfo` and then broadcasts this message
+///   (`rehlds/engine/host.cpp:519-526`), so an empty `userinfo` is the server
+///   saying the slot is now empty.
+///
+/// Every client is told about every slot: on `new`, for each connected client
+/// (`sv_main.cpp:1586-1591`), and thereafter on any userinfo change via
+/// `SV_UpdateUserInfo` → `SV_SendFullClientUpdateForAll` (`sv_main.cpp:5065`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateUserInfo {
+    /// **Zero-based** — `cl - g_psvs.clients`. Every *other* message in this
+    /// module is keyed by `entindex()`, which is this plus one.
+    pub slot: u8,
+    pub userid: i32,
+    /// Empty means the slot was vacated.
+    pub userinfo: String,
+}
+
+impl UpdateUserInfo {
+    /// The `entindex()` this slot's player has, which is how the rest of the
+    /// game state is keyed.
+    pub fn entity(&self) -> u8 {
+        self.slot.saturating_add(1)
+    }
+
+    pub fn is_vacant(&self) -> bool {
+        self.userinfo.is_empty()
+    }
+}
+
+/// Decode an `svc_updateuserinfo` payload (everything after the opcode).
+///
+/// The trailing 16-byte hash is not returned — it is a hashed CD key and
+/// nothing here has a use for it — but it *is* required to be present, so a
+/// truncated or misframed message is rejected rather than half-believed.
+pub fn parse_update_user_info(payload: &[u8]) -> Option<UpdateUserInfo> {
+    let mut c = Cur::new(payload);
+    let slot = c.u8()?;
+    let userid = c.i32()?;
+    let userinfo = c.cstr()?;
+    if c.remaining() < 16 {
+        return None;
+    }
+    Some(UpdateUserInfo {
+        slot,
+        userid,
+        userinfo,
+    })
 }
 
 /// `ScoreAttrib` — the scoreboard's per-player status bits
@@ -972,6 +1067,10 @@ pub struct PlayerInfo {
     pub radar_position: Option<[f32; 3]>,
     /// Has the server said anything at all about this slot?
     pub seen: bool,
+    /// Which connection currently owns this slot, from `svc_updateuserinfo`
+    /// (see [`UpdateUserInfo`]). `None` means we have not been told, which is
+    /// not the same as "empty".
+    pub userid: Option<i32>,
 }
 
 /// Everything the user-message stream tells us, folded into one struct.
@@ -988,6 +1087,23 @@ pub struct GameState {
     /// Our own slot, if the caller has told us (it comes from
     /// `svc_serverinfo`'s `player_index`, not from any user message).
     pub self_index: Option<u8>,
+    /// Highest slot this server can fill, from `svc_serverinfo`'s
+    /// `max_players`. Slots above it cannot exist, so a message addressed to
+    /// one did not come from the server — see [`GameState::plausible_slot`].
+    /// Defaults to the engine ceiling until the caller knows better.
+    pub max_clients: u8,
+    /// Team writes dropped for being impossible — a `TeamInfo` whose literal
+    /// is not one of the four the game can write, a `ScoreInfo` whose team
+    /// short is outside `enum TeamName`, or either addressed to a slot the
+    /// server does not have. Non-zero means the message walk desynchronised
+    /// somewhere and this state was being written from noise.
+    pub implausible_team_updates: u32,
+    /// The most recent rejection, kept because the count alone cannot be
+    /// acted on: "two per session" is a different problem from "two hundred",
+    /// and only the payload says which.
+    pub last_implausible_team_update: Option<String>,
+    /// Slots whose occupant we saw change, each of which cleared that slot.
+    pub occupant_changes: u32,
     /// Set once the server has offered the team-selection menu.
     ///
     /// `ShowVGUIMenu(VGUI_Menu_Team)` goes out in the same breath as the
@@ -1048,6 +1164,10 @@ impl Default for GameState {
         Self {
             players: std::array::from_fn(|_| PlayerInfo::default()),
             self_index: None,
+            max_clients: MAX_CLIENTS as u8,
+            implausible_team_updates: 0,
+            last_implausible_team_update: None,
+            occupant_changes: 0,
             saw_team_menu: false,
             money: 0,
             health: 0,
@@ -1114,18 +1234,44 @@ impl GameState {
 
             UserMessage::Money(m) => self.money = m.amount,
 
+            // Both team-bearing messages are validated before they are stored,
+            // because a wrong team is worse than no team: `Unassigned` is
+            // never shot at, a wrong side is. See
+            // [`GameState::plausible_slot`].
             UserMessage::ScoreInfo(s) => {
-                if let Some(p) = self.player_mut(s.client) {
-                    p.seen = true;
-                    p.frags = s.frags;
-                    p.deaths = s.deaths;
-                    p.team = s.team;
+                match (
+                    self.plausible_slot(s.client),
+                    Team::from_id_exact(s.team_id),
+                ) {
+                    (true, Some(team)) => {
+                        if let Some(p) = self.player_mut(s.client) {
+                            p.seen = true;
+                            p.frags = s.frags;
+                            p.deaths = s.deaths;
+                            p.team = team;
+                        }
+                    }
+                    _ => self.reject_team_update(format_args!(
+                        "ScoreInfo slot {} team_id {}",
+                        s.client, s.team_id
+                    )),
                 }
             }
             UserMessage::TeamInfo(t) => {
-                if let Some(p) = self.player_mut(t.client) {
-                    p.seen = true;
-                    p.team = t.team;
+                match (
+                    self.plausible_slot(t.client),
+                    Team::from_name_exact(&t.team_name),
+                ) {
+                    (true, Some(team)) => {
+                        if let Some(p) = self.player_mut(t.client) {
+                            p.seen = true;
+                            p.team = team;
+                        }
+                    }
+                    _ => self.reject_team_update(format_args!(
+                        "TeamInfo slot {} name {:?}",
+                        t.client, t.team_name
+                    )),
                 }
             }
             UserMessage::ScoreAttrib(a) => {
@@ -1267,6 +1413,84 @@ impl GameState {
         self.bar_time2 = None;
     }
 
+    fn reject_team_update(&mut self, what: std::fmt::Arguments<'_>) {
+        self.implausible_team_updates = self.implausible_team_updates.saturating_add(1);
+        self.last_implausible_team_update = Some(what.to_string());
+    }
+
+    /// Could the server have addressed a message to this `entindex()`?
+    ///
+    /// Player entity indices run `1..=maxclients` (`SV_IsPlayerIndex`), so a
+    /// slot outside that is not a slot the server can talk about — the bytes
+    /// came from somewhere else in the stream.
+    fn plausible_slot(&self, slot: u8) -> bool {
+        slot >= 1 && slot <= self.max_clients
+    }
+
+    /// Fold in an `svc_updateuserinfo`: who now occupies a slot.
+    ///
+    /// This is the only invalidation the rest of this struct gets for
+    /// per-slot state, and it is deliberately *not* a timer and *not* the
+    /// round boundary:
+    ///
+    /// * A **round restart cannot be used**. It does re-state every team —
+    ///   `RestartRound` calls `RoundRespawn` (`multiplay_gamerules.cpp:2047`)
+    ///   → `respawn` → `CBasePlayer::Spawn`, which broadcasts `TeamInfo`
+    ///   (`player.cpp:6072`) — but our own `ResetHUD` is not part of that
+    ///   burst. It goes out of `UpdateClientData` on a later frame, *after*
+    ///   the whole restart, so clearing teams when it arrives would throw away
+    ///   the restart's `TeamInfo`s and leave everyone `Unassigned` for the
+    ///   round.
+    /// * A **timer cannot be used** either: it can only ever say "probably
+    ///   the same person".
+    ///
+    /// The occupant is knowable exactly, so it is asked exactly. A slot whose
+    /// `userid` changed is a different connection and everything we believed
+    /// about it — team above all — belonged to somebody else.
+    ///
+    /// The first `userid` we see for a slot is *recorded*, not treated as a
+    /// change: the decoder is built after the signon, so the `new`-time burst
+    /// (`sv_main.cpp:1586-1591`) has already gone past and the first update we
+    /// see mid-game is about a slot we may already have learned the team of.
+    pub fn apply_user_info(&mut self, u: &UpdateUserInfo) {
+        let slot = u.entity();
+        if !self.plausible_slot(slot) {
+            return;
+        }
+        // Never on our own slot: we cannot be replaced without our session
+        // ending, so an update naming us is a name/model change at most, and
+        // wiping our own team would make `my_team()` answer Unassigned — which
+        // reads as "everyone is a non-enemy".
+        if self.self_index == Some(slot) {
+            if let Some(p) = self.player_mut(slot) {
+                p.userid = Some(u.userid);
+            }
+            return;
+        }
+        let changed = match self.player(slot).and_then(|p| p.userid) {
+            Some(old) => old != u.userid,
+            None => false,
+        };
+        if changed || u.is_vacant() {
+            self.occupant_changes = self.occupant_changes.saturating_add(1);
+        }
+        let Some(p) = self.players.get_mut(usize::from(slot)) else {
+            return;
+        };
+        if u.is_vacant() {
+            // `SV_DropClient_internal` zeroed the userinfo before broadcasting
+            // this (`host.cpp:519-526`): nobody is there. Forget the userid
+            // too, so the next occupant's first update is a first sighting
+            // rather than a change.
+            *p = PlayerInfo::default();
+            return;
+        }
+        if changed {
+            *p = PlayerInfo::default();
+        }
+        p.userid = Some(u.userid);
+    }
+
     /// One client slot, `1..=32`.
     pub fn player(&self, slot: u8) -> Option<&PlayerInfo> {
         if slot == 0 {
@@ -1406,6 +1630,174 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // --- occupancy ---------------------------------------------------------
+
+    /// `svc_updateuserinfo`, as `SV_WriteFullClientUpdate_internal` writes it
+    /// (`rehlds/engine/sv_main.cpp:4068-4077`): byte slot, long userid,
+    /// string userinfo, 16-byte CD-key hash.
+    fn user_info(slot: u8, userid: i32, info: &str) -> Vec<u8> {
+        let mut p = Msg::new().byte(slot).long(userid).string(info).done();
+        p.extend_from_slice(&[0xAB; 16]);
+        p
+    }
+
+    fn state_with_teams() -> GameState {
+        let mut gs = GameState::default();
+        gs.max_clients = 12;
+        gs.self_index = Some(1);
+        gs.apply("TeamInfo", &Msg::new().byte(1).string("TERRORIST").done());
+        gs.apply("TeamInfo", &Msg::new().byte(5).string("CT").done());
+        gs
+    }
+
+    #[test]
+    fn update_user_info_decodes_the_engine_layout() {
+        let u = parse_update_user_info(&user_info(4, 117, "\\name\\Bot10\\model\\urban"))
+            .expect("decodes");
+        assert_eq!(u.slot, 4, "the wire index is zero-based");
+        assert_eq!(u.entity(), 5, "everything else is keyed by entindex()");
+        assert_eq!(u.userid, 117);
+        assert!(!u.is_vacant());
+
+        // Truncated in the hash is still truncated.
+        let mut short = user_info(4, 117, "\\name\\x");
+        short.truncate(short.len() - 1);
+        assert_eq!(parse_update_user_info(&short), None);
+        assert_eq!(parse_update_user_info(&[]), None);
+    }
+
+    /// The point of the whole exercise: a slot whose occupant changed must not
+    /// keep the previous occupant's team, because a wrong team is a target and
+    /// an unknown team is not.
+    #[test]
+    fn a_new_occupant_does_not_inherit_the_old_ones_team() {
+        let mut gs = state_with_teams();
+        // Slot 5 (entindex) is wire slot 4. Learn who is there.
+        gs.apply_user_info(&parse_update_user_info(&user_info(4, 100, "\\name\\A")).unwrap());
+        assert_eq!(
+            gs.player(5).unwrap().team,
+            Team::CounterTerrorist,
+            "recording an occupant must not disturb a team we already knew"
+        );
+
+        // Same person renames: same userid, so nothing is invalidated.
+        gs.apply_user_info(&parse_update_user_info(&user_info(4, 100, "\\name\\A2")).unwrap());
+        assert_eq!(gs.player(5).unwrap().team, Team::CounterTerrorist);
+        assert_eq!(gs.occupant_changes, 0);
+
+        // A different connection lands on the same slot.
+        gs.apply_user_info(&parse_update_user_info(&user_info(4, 131, "\\name\\B")).unwrap());
+        assert_eq!(
+            gs.player(5).unwrap().team,
+            Team::Unassigned,
+            "slot 5's team belonged to userid 100, not to userid 131"
+        );
+        assert!(!gs.player(5).unwrap().seen);
+        assert_eq!(gs.player(5).unwrap().userid, Some(131));
+        assert_eq!(gs.occupant_changes, 1);
+
+        // Nobody else was touched.
+        assert_eq!(gs.player(1).unwrap().team, Team::Terrorist);
+    }
+
+    #[test]
+    fn an_empty_userinfo_empties_the_slot() {
+        let mut gs = state_with_teams();
+        gs.apply_user_info(&parse_update_user_info(&user_info(4, 100, "\\name\\A")).unwrap());
+        // `SV_DropClient_internal` zeroes cl->userinfo, then broadcasts
+        // (`rehlds/engine/host.cpp:519-526`).
+        gs.apply_user_info(&parse_update_user_info(&user_info(4, 100, "")).unwrap());
+        let p = gs.player(5).unwrap();
+        assert_eq!(p.team, Team::Unassigned);
+        assert_eq!(p.userid, None, "the next occupant must read as a first sighting");
+        assert!(!p.seen);
+    }
+
+    /// Our own slot cannot be taken from us while we are still connected, and
+    /// clearing it would make `my_team()` answer Unassigned — which reads as
+    /// "nobody is an enemy" and stops the bot fighting at all.
+    #[test]
+    fn our_own_slot_is_never_invalidated() {
+        let mut gs = state_with_teams();
+        gs.apply_user_info(&parse_update_user_info(&user_info(0, 70, "\\name\\Me")).unwrap());
+        gs.apply_user_info(&parse_update_user_info(&user_info(0, 71, "\\name\\Me")).unwrap());
+        assert_eq!(gs.my_team(), Team::Terrorist);
+        assert_eq!(gs.occupant_changes, 0);
+    }
+
+    #[test]
+    fn an_occupancy_update_for_a_slot_the_server_does_not_have_is_ignored() {
+        let mut gs = state_with_teams();
+        // max_clients is 12, so entindex 30 cannot exist.
+        gs.apply_user_info(&parse_update_user_info(&user_info(29, 5, "\\name\\X")).unwrap());
+        assert_eq!(gs.player(30).unwrap().userid, None);
+    }
+
+    // --- team plausibility -------------------------------------------------
+
+    /// A `TeamInfo` whose literal is not one `GetTeamName` can return did not
+    /// come from a `TeamInfo`. Believing it costs a team we already knew.
+    #[test]
+    fn a_team_literal_the_game_cannot_write_is_not_stored() {
+        let mut gs = state_with_teams();
+        // Verbatim from a live capture's mis-framed stream.
+        gs.apply("TeamInfo", &Msg::new().byte(5).string("\u{1}\u{f6})").done());
+        assert_eq!(
+            gs.player(5).unwrap().team,
+            Team::CounterTerrorist,
+            "noise must not erase a team the server did state"
+        );
+        assert_eq!(gs.implausible_team_updates, 1);
+
+        // "UNASSIGNED" is a real thing the server says, and must still land:
+        // `ClientDisconnected` broadcasts it (`multiplay_gamerules.cpp:3630`).
+        gs.apply("TeamInfo", &Msg::new().byte(5).string("UNASSIGNED").done());
+        assert_eq!(gs.player(5).unwrap().team, Team::Unassigned);
+        assert_eq!(gs.implausible_team_updates, 1);
+    }
+
+    #[test]
+    fn a_scoreinfo_team_short_outside_the_enum_is_not_stored() {
+        let mut gs = state_with_teams();
+        for bogus in [-12853i16, 4100, 1908, 99] {
+            gs.apply(
+                "ScoreInfo",
+                &Msg::new()
+                    .byte(5)
+                    .short(3)
+                    .short(1)
+                    .short(0)
+                    .short(bogus)
+                    .done(),
+            );
+            assert_eq!(
+                gs.player(5).unwrap().team,
+                Team::CounterTerrorist,
+                "team short {bogus} is not a TeamName"
+            );
+            assert_eq!(gs.player(5).unwrap().frags, 0, "nor are its frags real");
+        }
+        assert_eq!(gs.implausible_team_updates, 4);
+    }
+
+    #[test]
+    fn a_team_update_for_a_slot_the_server_does_not_have_is_not_stored() {
+        let mut gs = state_with_teams();
+        for slot in [0u8, 13, 30, 152, 200] {
+            gs.apply("TeamInfo", &Msg::new().byte(slot).string("CT").done());
+            gs.apply(
+                "ScoreInfo",
+                &Msg::new().byte(slot).short(0).short(0).short(0).short(1).done(),
+            );
+        }
+        for slot in [13u8, 30, 152.min(32), 200.min(32)] {
+            if let Some(p) = gs.player(slot) {
+                assert_eq!(p.team, Team::Unassigned, "slot {slot} is past max_clients");
+            }
+        }
+        assert_eq!(gs.implausible_team_updates, 10);
     }
 
     #[test]

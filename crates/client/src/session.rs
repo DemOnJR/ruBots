@@ -53,6 +53,19 @@ pub struct Decision {
     pub to_goal: f32,
     /// Which rung of the brain's ladder decided this tick.
     pub rung: &'static str,
+    /// Escort phase, as a word. None of the escort's state is on the wire in a
+    /// form the bot can read back -- `HostagePos` is a 1 Hz radar blip and
+    /// nothing at all says who a hostage is following -- so a hostage round is
+    /// opaque without this: "no rescue" has a dozen explanations and no way to
+    /// tell them apart from outside the process.
+    pub escort: &'static str,
+    /// Hostages the bot can see, and how many it believes it recruited.
+    pub hostages: usize,
+    pub hostages_led: usize,
+    /// Distance to the hostage the escort machine is working on.
+    pub to_hostage: f32,
+    /// Rising `+use` edges the escort has emitted this life.
+    pub use_edges: u32,
 }
 
 /// Where a session is in its lifecycle.
@@ -1334,10 +1347,17 @@ impl Session {
         // One tick stale by construction: the brain has not run yet this frame.
         // At 50 Hz that is 20 ms of lag on a destination that moves when
         // somebody dies, which is not worth restructuring the frame for.
+        //
+        // `nav_goal` outranks the bomb objective because it is the rung that
+        // actually answered last tick saying where it wants to go. On a hostage
+        // map `objective.target` is permanently `None` -- `ObjectiveState` is
+        // the bomb machine and a CT with no planted bomb has nothing to say --
+        // so without this the route is pinned to the map's declared objective,
+        // a hostage spawn, for the entire walk back to the rescue zone.
         let goal = self
             .brain
             .as_ref()
-            .and_then(|b| b.objective.target)
+            .and_then(|b| b.nav_goal.or(b.objective.target))
             .or(self.site);
         let site = match (self.map.take(), goal) {
             (Some(m), Some(goal)) => {
@@ -1407,6 +1427,23 @@ impl Session {
             arming: self.brain.as_ref().is_some_and(|b| b.plant.is_arming()),
             to_goal,
             rung: self.brain.as_ref().map_or("none", |b| b.rung),
+            escort: self
+                .brain
+                .as_ref()
+                .map_or("none", |b| b.escort.phase.as_str()),
+            hostages: world.hostages.len(),
+            hostages_led: self.brain.as_ref().map_or(0, |b| b.escort.led_count()),
+            to_hostage: self
+                .brain
+                .as_ref()
+                .and_then(|b| b.escort.target)
+                .and_then(|e| world.hostages.iter().find(|h| h.entity == e))
+                .map(|h| {
+                    let (dx, dy) = (h.origin[0] - world.me.origin[0], h.origin[1] - world.me.origin[1]);
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .unwrap_or(f32::NAN),
+            use_edges: self.brain.as_ref().map_or(0, |b| b.escort.edges),
         });
 
         for cmd in &intent.commands {

@@ -61,6 +61,7 @@ pub const FORWARD_SPEED: f32 = 250.0;
 /// **Conventional**, chosen to be under one player width.
 pub const ARRIVE_RADIUS: f32 = 24.0;
 
+
 /// Speed at which the bot makes no footstep noise.
 ///
 /// `PM_UpdateStepSound` returns without a sound at `speed <= 150.0`
@@ -174,6 +175,15 @@ pub struct Controller {
     last_weapon: WeaponId,
     /// Which way the bot is currently circling, and how long is left on it.
     strafe: (f32, f32),
+    /// Where the brain wants to be routed, when that is not the bomb
+    /// objective's target.
+    ///
+    /// The caller's navigation layer picks a destination for the route; left to
+    /// itself it uses the map's declared objective, which on a hostage map is a
+    /// hostage spawn and stays that way for the whole escort home. This is the
+    /// brain telling it otherwise, one tick behind by construction — the same
+    /// staleness the caller already accepts for `objective.target`.
+    pub nav_goal: Option<Vec3>,
     /// Which rung of the ladder produced the last [`Intent`].
     ///
     /// Purely diagnostic, and worth the field. The ladder is exclusive by
@@ -201,6 +211,7 @@ impl Controller {
             aim_offset: (Angles::default(), f32::INFINITY),
             last_weapon: WeaponId::None,
             strafe: (1.0, 0.0),
+            nav_goal: None,
             rung: "init",
         }
     }
@@ -291,6 +302,7 @@ impl Controller {
         self.escort.reset();
         self.fire.reset();
         self.tracking = None;
+        self.nav_goal = None;
     }
 
     /// How long the current target has been visible, advancing the counter.
@@ -318,6 +330,11 @@ impl Controller {
     pub fn think(&mut self, world: &WorldView, nav: impl Into<Nav>, dt: f32) -> Intent {
         let nav = nav.into();
         self.idle.advance(dt);
+        // Re-decided every tick, by whichever rung answers. Anything else
+        // leaves a rung's destination in place after the ladder has moved on --
+        // a bot that escorted a hostage last round and is defusing this one
+        // would still be routed at a rescue zone.
+        self.nav_goal = None;
 
         // A weapon switch invalidates the trigger latches: the burst counter
         // and the pistol release rule both describe one specific gun.
@@ -509,13 +526,39 @@ impl Controller {
         // Hostages.
         let escort = self.escort.tick(world, self.view, dt);
         if self.escort.is_busy() {
+            // Publish where the escort wants to be, so the caller's navigation
+            // layer routes THERE. Without this the route is computed to
+            // whatever the map named as the objective -- on a hostage map, a
+            // hostage spawn -- and stays pointed at it for the whole walk home,
+            // which is the opposite direction. The bomb rungs never needed it
+            // because `ObjectiveState::target` already said where they were
+            // going; `ObjectiveState` is about the bomb and has no entry for an
+            // escort at all.
+            self.nav_goal = escort.goal;
+
+            // Aim is the escort's business -- it looks at the point `PlayerUse`
+            // measures its cone against, which is not what it is walking to.
             if let Some(look) = escort.look_at {
                 self.view = turn_toward(self.view, aim_angles(world.me.origin, look), max_turn);
             }
+
+            // Steering is the navigation layer's, and it is the route ALL the
+            // way in -- unlike the plant rung, which switches to the site once
+            // it has arrived. A bomb site is a floor you stand on; a hostage is
+            // a thing that can be 90 units away and a storey up. Measured on
+            // cs_italy with a 200-unit "close enough to walk straight at it"
+            // shortcut in place: the bot reached `[900 2248 36]`, saw a hostage
+            // 90 units off at z 160, walked at it, and spent the rest of the
+            // round grinding into the underside of the staircase with 16
+            // waypoints of a perfectly good route left unused. The route is
+            // only abandoned when there is none -- the last few units into use
+            // range are the follower's `None`, not a guess.
+            let steer = escort.move_to.map(|to| nav.steer().unwrap_or(to));
+
             let speed = if escort.walk { WALK_SPEED } else { FORWARD_SPEED };
             self.rung = "hostage";
             let view = self.wire_view(world);
-            let (forwardmove, sidemove) = match escort.move_to {
+            let (forwardmove, sidemove) = match steer {
                 Some(to) => self.travel(view, world.me.origin, to, speed),
                 None => (0.0, 0.0),
             };
@@ -525,7 +568,7 @@ impl Controller {
                 sidemove,
                 use_action: escort.use_action,
                 walk: escort.walk,
-                move_target: escort.move_to,
+                move_target: steer,
                 ..Intent::default()
             };
         }
