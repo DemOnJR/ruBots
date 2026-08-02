@@ -348,52 +348,65 @@ impl Session {
     /// request id that must be echoed back, and the reply also repeats the cvar
     /// name (`SV_ParseCvarValue2`, `sv_user.cpp:1804-1815`).
     fn answer_cvar_queries(&mut self, msg: &[u8]) {
-        for reply in self.cvar_replies(msg) {
+        let trace = self.trace_message(msg);
+        for reply in self.cvar_replies(&trace) {
             self.chan.queue_reliable(&reply);
         }
     }
 
-    /// The `clc_cvarvalue` / `clc_cvarvalue2` replies `msg` calls for.
+    /// The `clc_cvarvalue` / `clc_cvarvalue2` replies a walked message calls for.
     ///
-    /// Pure, so a test can assert on the exact bytes rather than on a queue
-    /// depth. `svc_sendcvarvalue` (57) is `string cvar`, answered with
+    /// Takes a [`StreamTrace`] and not raw bytes, deliberately. The version
+    /// this replaced scanned every byte of every datagram for the values 57 and
+    /// 58, so any binary payload containing one manufactured a cvar query --
+    /// and each phantom query queued a RELIABLE reply. At 50 packets a second
+    /// that is a flood: measured live, the netchannel's reliable queue grew
+    /// past 7900 entries and climbed by ~113 every two seconds, `in_flight`
+    /// never cleared, and from that moment the client could not send another
+    /// console command as long as it lived. The bot stood on the bomb site
+    /// holding an AK with `weapon_c4` stuck in a queue that would never drain.
+    ///
+    /// That is the third time in this codebase that locating a message by
+    /// searching for its opcode byte has caused a serious bug -- see
+    /// `absorb_baselines` and the stufftext handler. Walk the stream.
+    ///
+    /// Pure, so a test can assert on the exact bytes rather than a queue depth.
+    /// `svc_sendcvarvalue` (57) is `string cvar`, answered with
     /// `clc_cvarvalue` (10) `string value`. `svc_sendcvarvalue2` (58) adds a
     /// request id that must come back verbatim, and its reply repeats the cvar
     /// name too (`SV_ParseCvarValue2`, `sv_user.cpp:1804-1815`).
-    fn cvar_replies(&self, msg: &[u8]) -> Vec<Vec<u8>> {
+    fn cvar_replies(&self, trace: &StreamTrace) -> Vec<Vec<u8>> {
+        let cstr = |b: &[u8]| {
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        };
         let mut out = Vec::new();
-        let mut i = 0usize;
-        while i < msg.len() {
-            match msg[i] {
+        for item in &trace.items {
+            let crate::stream::Item::Engine { id, payload } = item else {
+                continue;
+            };
+            match *id {
                 crate::svc::SVC_SENDCVARVALUE => {
-                    let Some(end) = msg[i + 1..].iter().position(|&b| b == 0) else {
-                        break;
-                    };
-                    let name = String::from_utf8_lossy(&msg[i + 1..i + 1 + end]).into_owned();
+                    let name = cstr(payload);
                     let mut reply = vec![netchan::clc::CVARVALUE];
                     reply.extend_from_slice(self.cvar_value(&name).as_bytes());
                     reply.push(0);
                     out.push(reply);
-                    i += 1 + end + 1;
                 }
                 crate::svc::SVC_SENDCVARVALUE2 => {
-                    if msg.len() < i + 5 {
-                        break;
+                    if payload.len() < 4 {
+                        continue;
                     }
-                    let Some(end) = msg[i + 5..].iter().position(|&b| b == 0) else {
-                        break;
-                    };
-                    let name = String::from_utf8_lossy(&msg[i + 5..i + 5 + end]).into_owned();
+                    let name = cstr(&payload[4..]);
                     let mut reply = vec![netchan::clc::CVARVALUE2];
-                    reply.extend_from_slice(&msg[i + 1..i + 5]);
+                    reply.extend_from_slice(&payload[..4]);
                     reply.extend_from_slice(name.as_bytes());
                     reply.push(0);
                     reply.extend_from_slice(self.cvar_value(&name).as_bytes());
                     reply.push(0);
                     out.push(reply);
-                    i += 5 + end + 1;
                 }
-                _ => i += 1,
+                _ => {}
             }
         }
         out
@@ -2143,16 +2156,50 @@ mod tests {
         assert_eq!(s.chan.queued_count(), 1, "no reply queued");
     }
 
+    /// A 57 or 58 inside a payload must not manufacture a cvar query.
+    ///
+    /// This is what actually happened, and it was fatal without ever looking
+    /// like an error. Every phantom query queued a RELIABLE reply, so at 50
+    /// packets a second the netchannel queue ran away -- measured live at 7900
+    /// entries and climbing by ~113 every two seconds, `in_flight` stuck true
+    /// forever. From that point the client could never send another console
+    /// command: the bot stood on the bomb site holding an AK with `weapon_c4`
+    /// at the head of a queue that would never drain again.
+    #[test]
+    fn a_payload_byte_is_not_mistaken_for_a_cvar_query() {
+        let mut s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+
+        // svc_print, whose text happens to contain both opcode values.
+        let mut msg = vec![crate::svc::SVC_PRINT];
+        msg.extend_from_slice(&[
+            b'x', crate::svc::SVC_SENDCVARVALUE, crate::svc::SVC_SENDCVARVALUE2, b'y', 0,
+        ]);
+
+        let trace = s.trace_message(&msg);
+        assert!(trace.complete(), "the walk must consume the whole message");
+        assert!(
+            s.cvar_replies(&trace).is_empty(),
+            "a byte inside a payload was read as a cvar query"
+        );
+
+        // ...and the real thing, in the same message, is still answered.
+        msg.push(crate::svc::SVC_SENDCVARVALUE);
+        msg.extend_from_slice(b"name ");
+        let trace = s.trace_message(&msg);
+        assert_eq!(s.cvar_replies(&trace).len(), 1, "the real query was missed");
+    }
+
     /// The v2 form carries a request id that must come back verbatim, and the
     /// reply repeats the cvar name (SV_ParseCvarValue2, sv_user.cpp:1804-1815).
     #[test]
     fn a_v2_cvar_query_echoes_the_request_id_and_the_name() {
-        let s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+        let mut s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
         let mut msg = vec![crate::svc::SVC_SENDCVARVALUE2];
         msg.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         msg.extend_from_slice(b"name ");
 
-        let replies = s.cvar_replies(&msg);
+        let trace = s.trace_message(&msg);
+        let replies = s.cvar_replies(&trace);
         assert_eq!(replies.len(), 1);
         let out = &replies[0];
         assert_eq!(out[0], netchan::clc::CVARVALUE2);

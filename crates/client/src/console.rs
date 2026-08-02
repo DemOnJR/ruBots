@@ -102,6 +102,15 @@ impl ConsoleQueue {
         self.queue.len()
     }
 
+    /// The command at the head of the queue, for tracing.
+    ///
+    /// A queue that is not draining looks identical from the outside to one
+    /// that is draining and being refilled -- the count is the same. The only
+    /// way to tell is to see what is actually stuck at the front.
+    pub fn peek(&self) -> Option<&str> {
+        self.queue.front().map(|p| p.text.as_str())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }

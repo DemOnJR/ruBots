@@ -329,6 +329,14 @@ fn main() {
                     session.console.say(format!("probe{}", (secs as u32) / 4));
                 }
                 let queued = session.console.len();
+                eprintln!(
+                    "      console: {queued} queued, {} sent, settled {} (in_flight {} netq {}), head {:?}",
+                    session.console.sent,
+                    session.reliables_settled(),
+                    session.chan.reliable_in_flight(),
+                    session.chan.queued_count(),
+                    session.console.peek(),
+                );
                 if let Some(dec) = session.last_decision {
                     eprintln!(
                         "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} reroutes {} stuck {}",
