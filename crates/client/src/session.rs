@@ -869,8 +869,11 @@ impl Session {
     /// How long to wait for a spawn before re-sending the join pair. The
     /// server only advances the join state inside its own `PlayerThink`, so
     /// this has to cover several server frames, not just a round trip.
-    /// Gap between `sendents` and `jointeam`, from a real client: 0.7 s.
-    pub const JOIN_SETTLE: Duration = Duration::from_millis(700);
+    /// Gap between the team menu arriving and `jointeam`.
+    pub const JOIN_SETTLE: Duration = Duration::from_millis(400);
+
+    /// How long to wait for the server to offer the team menu.
+    pub const JOIN_MENU_WAIT: Duration = Duration::from_millis(6000);
 
     pub const JOIN_RETRY: Duration = Duration::from_millis(600);
 
@@ -1162,17 +1165,67 @@ impl Session {
         //     TeamInfo TERRORIST / #Game_join_terrorist   <- worked
         //     #Only_1_Team_Change                          <- the retry
         //     #Command_Not_Available                       <- joinclass now dead
+        // WAIT FOR THE TEAM MENU before answering it. This is the whole ball
+        // game, and answering early deadlocks the join permanently:
+        //
+        //  1. `jointeam` is accepted and sets m_iMenu = Menu_ChooseAppearance.
+        //  2. If m_iJoiningState is still SHOWTEAMSELECT, PlayerThink then
+        //     CLOBBERS m_iMenu back to Menu_ChooseTeam
+        //     (`multiplay_gamerules.cpp:3756-3785`).
+        //  3. So `joinclass` is refused with #Command_Not_Available.
+        //  4. And a second `jointeam` is refused too -- #Only_1_Team_Change
+        //     needs `m_bTeamChanged && deadflag != DEAD_NO`, and a
+        //     not-yet-spawned client IS DEAD_DEAD (`client.cpp:656`).
+        //  5. m_iMenu therefore stays at Menu_ChooseAppearance forever, and
+        //     `RoundRespawn` skips `respawn()` for exactly that value
+        //     (`player.cpp:4106`) -- so the bot is never spawned again, ever.
+        //
+        // The observable end state is a noclipping spectator that flies the
+        // route at full speed with no weapon and no buy zone, while maxspeed
+        // and ResetHUD both insist it spawned.
+        //
+        // `ShowVGUIMenu(VGUI_Menu_Team)` goes out in the same breath as the
+        // SHOWTEAMSELECT -> PICKINGTEAM transition, so its arrival is proof
+        // the server is ready to be answered.
+        let menu_by = Instant::now() + Self::JOIN_MENU_WAIT;
+        while Instant::now() < menu_by && !self.saw_team_menu() {
+            self.pump(t, &[netchan::clc::NOP])?;
+        }
         self.settle(t, Self::JOIN_SETTLE)?;
         self.send_command(&format!("jointeam {team}"));
         self.settle(t, Self::JOIN_STEP)?;
         self.send_command(&format!("joinclass {}", Self::CLASS_ANY));
 
-        // Then simply wait. `ResetHUD` is the server confirming the join
-        // (`GetIntoGame` -> `Spawn` -> `m_fInitHUD` -> `player.cpp:7577`).
+        // Then keep offering the CLASS until the server has really taken it.
+        //
+        // This retry is not belt-and-braces, it is the difference between a
+        // playing bot and a permanent spectator. `jointeam` sets
+        // `m_iMenu = Menu_ChooseAppearance`, and the ONLY thing that clears it
+        // is an accepted `joinclass` (via `HandleMenu_ChooseAppearance` ->
+        // `ResetMenu`). And `RoundRespawn` reads:
+        //
+        //     if (m_iMenu != Menu_ChooseAppearance) { respawn(pev); ... }
+        //
+        // (`player.cpp:4106-4112`.) So a player whose `joinclass` never landed
+        // is SKIPPED BY EVERY ROUND RESPAWN, silently, forever. It keeps the
+        // state `ClientPutInServer` gave it -- DEAD_DEAD, FL_SPECTATOR,
+        // MOVETYPE_NOCLIP (`client.cpp:650-660`) -- which is why such a bot
+        // appears to fly around the map at full speed with no collision, no
+        // velocity, no weapon and no buy zone, while `maxspeed` and `ResetHUD`
+        // both cheerfully report that it spawned.
+        //
+        // Re-sending `joinclass` is safe; re-sending `jointeam` is NOT (it
+        // trips `#Only_1_Team_Change` and puts the menu back). So only the
+        // class is repeated.
+        let mut next_try = Instant::now() + Self::JOIN_RETRY;
         while Instant::now() < deadline {
             self.pump(t, &[netchan::clc::NOP])?;
-            if self.joined() {
+            if self.spawned() {
                 return Ok(true);
+            }
+            if Instant::now() >= next_try {
+                self.send_command(&format!("joinclass {}", Self::CLASS_ANY));
+                next_try = Instant::now() + Self::JOIN_RETRY;
             }
         }
         Ok(self.joined())
@@ -1196,6 +1249,25 @@ impl Session {
         self.decoder
             .as_ref()
             .is_some_and(|d| d.game.saw_team_menu || d.game.hud_resets > 0)
+    }
+
+    /// Are we actually in the world -- not merely "in the game"?
+    ///
+    /// Holding a weapon is the only signal that does not lie. Every spawn
+    /// grants a knife and `CurWeapon` is emitted when one is deployed
+    /// (`weapons.cpp:1380`), whereas:
+    ///
+    /// * `maxspeed > 1.5` is set by `ResetMaxSpeed` in `GetIntoGame`
+    ///   (`player.cpp:10718`) BEFORE the `FPlayerCanRespawn` gate at `:10730`,
+    ///   so it reports 240 for a client that merely entered; and
+    /// * `ResetHUD` fires from `m_fInitHUD`, which `Spawn()` sets (`:5997`)
+    ///   but so do `Precache()` (`:6146`) and `ForceClientDllUpdate()`
+    ///   (`:6694`).
+    ///
+    /// Both of those agreed with each other for hours while the bot was a
+    /// noclipping corpse.
+    pub fn spawned(&self) -> bool {
+        self.decoder.as_ref().is_some_and(|d| d.game.weapon_id != 0)
     }
 
     /// Has the server accepted our team choice?

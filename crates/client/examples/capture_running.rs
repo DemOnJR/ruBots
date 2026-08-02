@@ -269,6 +269,13 @@ fn main() {
                     cd.alive(),
                     cd.weapons.len(),
                 );
+                // The server tags a dead player's chat "(dead)" in the log
+                // (`util.cpp` Host_Say). That is a direct, one-bit answer to
+                // "is this bot actually alive?" -- unlike maxspeed or
+                // ResetHUD, both of which lie.
+                if std::env::var("AIPLAYERS_ALIVE_PROBE").is_ok() {
+                    session.console.say(format!("probe{}", (secs as u32) / 4));
+                }
                 let queued = session.console.len();
                 if let Some(dec) = session.last_decision {
                     eprintln!(
