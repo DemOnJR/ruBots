@@ -1034,7 +1034,12 @@ impl Session {
         if !d.game.in_buy_zone || self.bought_at_reset == Some(d.game.hud_resets) {
             return;
         }
-        if !self.clientdata.as_ref().is_some_and(|c| c.in_game()) {
+        // Alive is the only requirement beyond being in the zone. NOT
+        // `in_game()`: that is `maxspeed > 1.5`, and ResetMaxSpeed pins
+        // maxspeed to exactly 1.0 for the whole freeze period
+        // (`player.cpp:8083-8087`) -- which is precisely when players buy.
+        // Gating on it meant the bot could never buy anything at all.
+        if !self.clientdata.as_ref().is_some_and(|c| c.alive()) {
             return;
         }
         let is_ct = d.game.my_team() == crate::usermsg::Team::CounterTerrorist;

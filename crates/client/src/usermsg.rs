@@ -1254,6 +1254,12 @@ impl GameState {
         self.hostages.clear();
         self.in_buy_zone = false;
         self.in_rescue_zone = false;
+        // Cleared deliberately, matching the real client: ResetHUD wipes the
+        // status icons and the server re-sends StatusIcon within half a second
+        // once HandleSignals republishes the SIGNAL_BUY latch
+        // (`player.cpp:7875-7879`). Callers must therefore treat "not in a buy
+        // zone" as provisional for the first moments after a spawn, rather
+        // than concluding there is no zone.
         self.c4_icon = false;
         self.defuser_icon = false;
         self.scenario_sprite = None;

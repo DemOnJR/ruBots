@@ -269,6 +269,7 @@ fn main() {
                     cd.alive(),
                     cd.weapons.len(),
                 );
+                let queued = session.console.len();
                 if let Some(dec) = session.last_decision {
                     eprintln!(
                         "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} reroutes {}",
@@ -279,10 +280,10 @@ fn main() {
                 }
                 if let Some(d) = session.decoder.as_ref() {
                     eprintln!(
-                        "      game: team {:?} money ${} hp {} weapon {} buyzone {} round {}s resets {}",
+                        "      game: team {:?} money ${} hp {} weapon {} clip {} buyzone {} round {}s resets {} queued {}",
                         d.game.my_team(), d.game.money, d.game.health,
-                        d.game.weapon_id, d.game.in_buy_zone, d.game.round_time,
-                        d.game.hud_resets,
+                        d.game.weapon_id, d.game.weapon_clip, d.game.in_buy_zone,
+                        d.game.round_time, d.game.hud_resets, queued,
                     );
                     let players = d.players();
                     eprintln!(

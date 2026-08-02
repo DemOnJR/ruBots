@@ -107,6 +107,57 @@ pub enum FireClass {
     NotAWeapon,
 }
 
+impl WeaponId {
+    /// Map a wire weapon id onto the enum.
+    ///
+    /// `CurWeapon` and `weapon_data_t` both carry the raw `WeaponIdType`
+    /// (`dlls/weapons.h`), and this is the only way to know what the bot is
+    /// actually holding: `usercmd_t.weaponselect` is never read by ReGameDLL,
+    /// and `clientdata_t.weapons` is not transmitted at all -- dumping every
+    /// field that arrives while playing shows eleven, and `weapons` is not
+    /// among them.
+    ///
+    /// An unknown id becomes [`WeaponId::None`] rather than a panic: a server
+    /// running a mod weapon must make the bot hold fire, not crash it.
+    pub fn from_id(id: u8) -> Self {
+        match id {
+            0 => Self::None,
+            1 => Self::P228,
+            2 => Self::Glock,
+            3 => Self::Scout,
+            4 => Self::HeGrenade,
+            5 => Self::Xm1014,
+            6 => Self::C4,
+            7 => Self::Mac10,
+            8 => Self::Aug,
+            9 => Self::SmokeGrenade,
+            10 => Self::Elite,
+            11 => Self::FiveSeven,
+            12 => Self::Ump45,
+            13 => Self::Sg550,
+            14 => Self::Galil,
+            15 => Self::Famas,
+            16 => Self::Usp,
+            17 => Self::Glock18,
+            18 => Self::Awp,
+            19 => Self::Mp5n,
+            20 => Self::M249,
+            21 => Self::M3,
+            22 => Self::M4a1,
+            23 => Self::Tmp,
+            24 => Self::G3sg1,
+            25 => Self::Flashbang,
+            26 => Self::Deagle,
+            27 => Self::Sg552,
+            28 => Self::Ak47,
+            29 => Self::Knife,
+            30 => Self::P90,
+            99 => Self::ShieldGun,
+            _ => Self::None,
+        }
+    }
+}
+
 impl FireClass {
     /// True when the bot may leave `IN_ATTACK` held down across ticks.
     ///

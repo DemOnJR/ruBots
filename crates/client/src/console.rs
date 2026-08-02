@@ -58,9 +58,25 @@ impl ConsoleQueue {
         Self::default()
     }
 
+    /// Queue a command, unless the same one is already waiting.
+    ///
+    /// De-duplication is not a nicety here, it is load-bearing. The bot's
+    /// think() runs every frame and re-emits its whole buy plan for as long as
+    /// the freeze period lasts, so a plain FIFO accumulates hundreds of
+    /// identical aliases: measured, 153 queued commands draining at the 150 ms
+    /// spacing, i.e. about 25 seconds of backlog. The purchases then arrive
+    /// long after the bot has left the buy zone and every one of them fails.
+    ///
+    /// Only the PENDING set is deduplicated. A command that has already gone
+    /// out can be sent again -- switching back to a weapon, or re-buying next
+    /// round -- which is why this is not a "sent once ever" set.
     pub fn push(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if self.queue.iter().any(|p| p.text == text) {
+            return;
+        }
         self.queue.push_back(Pending {
-            text: text.into(),
+            text,
             is_say: false,
         });
     }
@@ -171,6 +187,30 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The bot re-emits its buy plan every frame while frozen. Without
+    /// de-duplication that is a self-inflicted denial of service: the queue
+    /// grows faster than the 150 ms spacing drains it, and by the time an
+    /// alias reaches the server the bot is nowhere near a buy zone.
+    #[test]
+    fn re_emitting_the_same_plan_every_frame_does_not_pile_up() {
+        let mut q = ConsoleQueue::new();
+        for _ in 0..200 {
+            q.extend(["vesthelm", "ak47", "primammo", "hegren"]);
+        }
+        assert_eq!(q.len(), 4, "queued {} copies of a 4-item plan", q.len());
+    }
+
+    /// ...but a command that has already been sent may be sent again.
+    #[test]
+    fn a_command_can_be_requeued_once_it_has_gone_out() {
+        let start = Instant::now();
+        let mut q = ConsoleQueue::new();
+        q.push("weapon_knife");
+        assert_eq!(q.next(start, true).as_deref(), Some("weapon_knife"));
+        q.push("weapon_knife");
+        assert_eq!(q.len(), 1, "a sent command must be re-sendable");
     }
 
     #[test]

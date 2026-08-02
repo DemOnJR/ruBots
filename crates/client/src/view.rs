@@ -54,6 +54,65 @@ impl Sight for nav::bsp::Bsp {
     }
 }
 
+/// What the bot is currently holding, joined from two sources.
+///
+/// Neither alone is enough:
+///
+/// * **`CurWeapon`** (a user message) names the active weapon and its clip.
+///   It is the ONLY thing that says which gun is in our hands --
+///   `usercmd_t.weaponselect` is never read by ReGameDLL, and
+///   `clientdata_t.weapons` is not transmitted at all.
+/// * **`weapon_data_t`**, inside `svc_clientdata`, carries the per-weapon
+///   timers and counters the fire control actually closes the loop on. It is
+///   keyed by weapon id and only present because our userinfo sets `cl_lw 1`
+///   (`sv_main.cpp:1362`).
+///
+/// The timers are **countdowns**, not absolute times: ReGameDLL is built with
+/// CLIENT_WEAPONS so `UTIL_WeaponTimeBase()` is 0 and `PostThink` decrements
+/// them each frame (`player.cpp:5440-5479`). `<= 0` means ready now, which is
+/// why no cycle-time modelling is needed anywhere.
+fn weapon_state(d: &Decoder) -> Option<bot::fire::WeaponState> {
+    let id = bot::WeaponId::from_id(d.game.weapon_id);
+    if id == bot::WeaponId::None {
+        return None;
+    }
+    let mut w = bot::fire::WeaponState {
+        id,
+        clip: i32::from(d.game.weapon_clip),
+        reserve: 0,
+        ..Default::default()
+    };
+    if let Some(fields) = d
+        .clientdata
+        .as_ref()
+        .and_then(|c| c.weapons.get(&d.game.weapon_id))
+    {
+        let f = |k: &str| {
+            fields
+                .get(k)
+                .and_then(proto::delta::Value::as_f32)
+                .unwrap_or(0.0)
+        };
+        let i = |k: &str| {
+            fields
+                .get(k)
+                .and_then(proto::delta::Value::as_i64)
+                .unwrap_or(0)
+        };
+        w.next_primary_attack = f("m_flNextPrimaryAttack");
+        w.next_secondary_attack = f("m_flNextSecondaryAttack");
+        w.in_reload = i("m_fInReload") != 0;
+        // m_iShotsFired rides in m_fInZoom (`dlls/client.cpp:4990`), which is
+        // what lets fire discipline be closed-loop instead of modelled.
+        w.shots_fired = i("m_fInZoom") as i32;
+        let clip = i("m_iClip") as i32;
+        if clip != 0 {
+            w.clip = clip;
+        }
+    }
+    Some(w)
+}
+
 /// Build the bot's view of the world from the decoded stream.
 ///
 /// `rescue_zones` and `sight` come from the map, which the network stream does
@@ -93,7 +152,7 @@ pub fn project(
                 Angles { pitch: p[0], yaw: p[1] }
             })
             .unwrap_or_default(),
-        weapon: None,
+        weapon: weapon_state(d),
     };
 
     let players = d
