@@ -27,6 +27,20 @@ use crate::control::MoveSender;
 use crate::signon::{walk as walk_signon, Signon};
 use crate::{Client, Disconnect, Identity, State, Transport};
 
+/// A snapshot of one `think()`, so a stalled bot can be attributed to the
+/// layer that stalled it rather than guessed at.
+#[derive(Debug, Clone, Copy)]
+pub struct Decision {
+    pub alive: bool,
+    pub in_game: bool,
+    pub site: Option<[f32; 3]>,
+    pub forwardmove: f32,
+    pub sidemove: f32,
+    pub yaw: f32,
+    pub waypoints_left: usize,
+    pub reroutes: u32,
+}
+
 /// Where a session is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -79,6 +93,11 @@ pub struct Session {
     pub brain: Option<bot::Controller>,
     /// Objective the bot is heading for, supplied by the nav layer.
     pub site: Option<[f32; 3]>,
+    /// The loaded map: collision, entities and the navigation graph.
+    pub map: Option<crate::map::Map>,
+    follower: crate::navigate::PathFollower,
+    /// What the brain decided last frame, for diagnostics.
+    pub last_decision: Option<Decision>,
     last_think: Option<Instant>,
     /// Which round we last bought in, so a buy happens once per spawn rather
     /// than every frame we happen to be standing in the zone.
@@ -131,6 +150,9 @@ impl Session {
             console: crate::console::ConsoleQueue::new(),
             brain: None,
             site: None,
+            map: None,
+            follower: crate::navigate::PathFollower::new(),
+            last_decision: None,
             last_think: None,
             bought_at_reset: None,
             decoder: None,
@@ -887,9 +909,38 @@ impl Session {
         // Round-trip latency: everything in the world view is this stale, and
         // the aim layer needs to know in order to lead a moving target.
         let latency = 0.0;
-        let world = crate::view::project(d, Vec::new(), None, latency);
-        let site = self.site;
+        let rescue = self
+            .map
+            .as_ref()
+            .map(|m| m.info.rescue_zones.iter().map(|z| z.centre()).collect())
+            .unwrap_or_default();
+        let sight = self.map.as_ref().map(|m| &m.bsp as &dyn crate::view::Sight);
+        let world = crate::view::project(d, rescue, sight, latency);
+
+        // Turn the objective into the NEXT waypoint. Steering straight at a
+        // distant goal walks into walls -- on de_dust2 the straight line from
+        // a T spawn to bombsite B crosses most of the map.
+        let site = match (self.map.as_ref(), self.site) {
+            (Some(m), Some(goal)) => self.follower.next_waypoint(
+                &m.grid,
+                world.me.origin,
+                goal,
+                world.me.velocity[0].hypot(world.me.velocity[1]),
+                dt,
+            ),
+            _ => self.site,
+        };
         let intent = self.brain.as_mut()?.think(&world, site, dt);
+        self.last_decision = Some(Decision {
+            alive: world.me.alive,
+            in_game: world.me.freeze_period,
+            site,
+            forwardmove: intent.forwardmove,
+            sidemove: intent.sidemove,
+            yaw: intent.view.yaw,
+            waypoints_left: self.follower.remaining(),
+            reroutes: self.follower.reroutes,
+        });
 
         for cmd in &intent.commands {
             if let Some(text) = cmd.to_console() {
@@ -897,6 +948,32 @@ impl Session {
             }
         }
         Some(intent)
+    }
+
+    /// Load the map named in `svc_serverinfo` and pick an objective.
+    ///
+    /// Non-fatal: with no map the bot still plays, it just does not path.
+    pub fn load_map(&mut self, seed: usize) {
+        let Some(name) = self
+            .signon
+            .as_ref()
+            .and_then(|s| s.server_info.as_ref())
+            .map(|si| si.map_name().to_string())
+        else {
+            return;
+        };
+        self.map = crate::map::Map::load(&name);
+        self.refresh_objective(seed);
+    }
+
+    /// Re-pick where to go, e.g. after switching team or a new round.
+    pub fn refresh_objective(&mut self, seed: usize) {
+        let is_ct = self
+            .decoder
+            .as_ref()
+            .is_some_and(|d| d.game.my_team() == crate::usermsg::Team::CounterTerrorist);
+        self.site = self.map.as_ref().and_then(|m| m.objective(is_ct, seed));
+        self.follower.reset();
     }
 
     /// Queue a loadout when we are alive, in a buy zone, and have not already

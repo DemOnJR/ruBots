@@ -156,6 +156,14 @@ fn main() {
         session.brain = Some(bot::Controller::new(0xA1F0, bot::Difficulty::Normal));
         eprintln!("  bot brain enabled");
     }
+    session.load_map(0);
+    match session.map.as_ref() {
+        Some(m) => eprintln!(
+            "  map {} loaded: {} nav nodes, {} bomb sites, {} rescue zones",
+            m.name, m.grid.len(), m.info.bomb_sites.len(), m.info.rescue_zones.len()
+        ),
+        None => eprintln!("  no map loaded -- the bot will not path"),
+    }
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
         Ok(true) => eprintln!("  *** SERVER IS STREAMING - we are fully connected ***"),
@@ -188,7 +196,13 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(Session::TEAM_TERRORIST);
         match session.join_and_spawn(&mut t, team, Duration::from_secs(15)) {
-            Ok(true) => eprintln!("  *** TEAM ACCEPTED -- joined ***"),
+            Ok(true) => {
+                eprintln!("  *** TEAM ACCEPTED -- joined ***");
+                session.refresh_objective(0);
+                if let Some(site) = session.site {
+                    eprintln!("  objective: [{:.0} {:.0} {:.0}]", site[0], site[1], site[2]);
+                }
+            }
             Ok(false) => eprintln!("  !!! team was never accepted"),
             Err(e) => eprintln!("  join error: {e}"),
         }
@@ -255,6 +269,14 @@ fn main() {
                     cd.alive(),
                     cd.weapons.len(),
                 );
+                if let Some(dec) = session.last_decision {
+                    eprintln!(
+                        "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} reroutes {}",
+                        dec.alive, dec.in_game, dec.forwardmove, dec.sidemove, dec.yaw,
+                        dec.site.map(|s| [s[0] as i32, s[1] as i32]),
+                        dec.waypoints_left, dec.reroutes,
+                    );
+                }
                 if let Some(d) = session.decoder.as_ref() {
                     eprintln!(
                         "      game: team {:?} money ${} hp {} weapon {} buyzone {} round {}s resets {}",

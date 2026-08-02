@@ -42,6 +42,18 @@ pub trait Sight {
     fn visible(&self, from: [f32; 3], to: [f32; 3]) -> bool;
 }
 
+/// The map's own collision answers this exactly.
+///
+/// `Hull::Point` is the right hull for a sightline: a bullet and an eye are
+/// points, not player-sized boxes. Using a player hull here would report an
+/// enemy as hidden whenever a 32-unit-wide box could not fit through the gap
+/// they are visible through, which is most doorways seen at an angle.
+impl Sight for nav::bsp::Bsp {
+    fn visible(&self, from: [f32; 3], to: [f32; 3]) -> bool {
+        nav::bsp::Bsp::visible(self, from, to)
+    }
+}
+
 /// Build the bot's view of the world from the decoded stream.
 ///
 /// `rescue_zones` and `sight` come from the map, which the network stream does
