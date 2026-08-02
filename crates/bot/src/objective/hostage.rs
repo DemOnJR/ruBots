@@ -122,17 +122,34 @@ pub const HOSTAGE_STUCK_DISTANCE: f32 = 200.0;
 pub const HOSTAGE_HULL_MIN: Vec3 = [-10.0, -10.0, 0.0];
 pub const HOSTAGE_HULL_MAX: Vec3 = [10.0, 10.0, 62.0];
 
-/// How far the bot lets a hostage trail before slowing down.
+/// How far a hostage may trail before the bot waits for it.
 ///
-/// **Chosen**, comfortably inside the 200-unit stuck threshold — waiting until
-/// the hostage is *already* stuck is waiting too long.
+/// **A trailing hostage is not a slow hostage.** `CHostage::DoFollow` sets its
+/// speed from how far behind it is (`dlls/hostage/hostage.cpp:1153-1172`):
+///
+/// ```text
+/// flSpeed = distance to the player being followed
+/// if (flSpeed >= 110) { if (flSpeed >= 250) flSpeed = 400; else flSpeed = 300; }
+/// ```
+///
+/// So one that has fallen 250 units behind closes at **400 units per second**,
+/// against a player's 250 — it gains on a *running* escort. And there is no
+/// leash to break: `m_hTargetEnt` is cleared only by a `+use` toggle
+/// (`:941`), by death, or by `cv_hostage_stop` (`:1038`), never by distance.
+///
+/// Walking the whole way "to keep them in step" therefore costs about half the
+/// escort speed for nothing, and an escort that takes 100 seconds does not fit
+/// inside a 60-second round. The bot runs, and this is only the distance past
+/// which it checks whether a hostage is stuck rather than merely behind.
 pub const ESCORT_LEASH: f32 = 150.0;
 
-/// Full running speed, and the walk speed that keeps a hostage in step.
+/// The speed to move at when a hostage genuinely cannot keep up.
 ///
-/// The walk value is under `PM_UpdateStepSound`'s 150-unit silence threshold
-/// (`pm_shared/pm_shared.cpp:395`), so slowing for the hostage is quiet as well
-/// as considerate.
+/// Under `PM_UpdateStepSound`'s 150-unit silence threshold
+/// (`pm_shared/pm_shared.cpp:395`), so it is quiet as well as considerate.
+///
+/// **Rarely the right speed.** A trailing hostage is not a slow one -- see
+/// [`ESCORT_LEASH`].
 pub const ESCORT_WALK_SPEED: f32 = 130.0;
 
 /// How long a believed recruit gets to prove it is following before the belief
@@ -420,6 +437,17 @@ impl HostageEscort {
         self.lost += lost;
     }
 
+    /// Is at least one led hostage still making its own way to us?
+    ///
+    /// [`Self::audit`] clears `unconfirmed` whenever a recruit moved or is
+    /// already close, and `DoFollow` is the only thing that moves one, so this
+    /// is the server's own answer to "is it coming" rather than a guess. A
+    /// hostage that is coming does not need to be waited for -- it closes at up
+    /// to 400 u/s, faster than the bot can run.
+    fn recruits_are_moving(&self) -> bool {
+        self.led.iter().flatten().any(|r| r.unconfirmed == 0.0)
+    }
+
     /// The nearest rescue zone, if the caller supplied any.
     fn nearest_zone(world: &WorldView, from: Vec3) -> Option<Vec3> {
         world
@@ -613,9 +641,11 @@ impl HostageEscort {
             let trailing = self.trailing_distance(world).unwrap_or(0.0);
             let zone = Self::nearest_zone(world, me.origin);
 
-            // A hostage past the leash has to be waited for — past 200 units
-            // the server gives up on it entirely.
-            let slow = trailing > ESCORT_LEASH;
+            // Only wait for one that is behind AND not closing. A hostage
+            // that is simply behind is already sprinting at up to 400 u/s to
+            // catch up (see ESCORT_LEASH), so slowing for it wastes half the
+            // escort's speed and buys nothing.
+            let slow = trailing > ESCORT_LEASH && !self.recruits_are_moving();
             let stalled = trailing > HOSTAGE_STUCK_DISTANCE;
 
             self.phase = EscortPhase::Leading;
@@ -939,6 +969,42 @@ mod tests {
         assert_eq!(out.move_to, Some(ZONE));
         assert!(!out.use_action, "never re-press a hostage that is already following");
         assert!(!out.walk, "20 units behind is well inside the leash");
+    }
+
+    /// A hostage that is behind but CLOSING must not slow the escort.
+    ///
+    /// `DoFollow` sets a hostage's speed from how far behind it is
+    /// (`hostage.cpp:1153-1172`): past 250 units it moves at 400 u/s, which
+    /// gains on a bot running at 250. Waiting for it halves the escort speed
+    /// and buys nothing -- and an escort that takes 100 seconds does not fit in
+    /// a 60-second round, which is the whole reason rescues were not landing.
+    #[test]
+    fn a_hostage_that_is_catching_up_does_not_slow_the_escort() {
+        let at: Vec3 = [0.0, 0.0, 0.0];
+        // Past ESCORT_LEASH so the slow branch is reached at all, but inside
+        // RECRUIT_LOST_DISTANCE so the audit keeps believing we lead it.
+        let far: Vec3 = [300.0, 0.0, 0.0];
+        let mut w = ct_world(at, vec![hostage(1, far, true)]);
+        w.rescue_zones = vec![[-3000.0, 0.0, 0.0]];
+
+        let mut m = HostageEscort::default();
+        // Recruit it, then let the audit see it move -- which is the only
+        // evidence available that somebody is leading it.
+        m.tick(&w, Angles::default(), 0.05);
+        m.led[0] = Some(Recruit { entity: 1, last_origin: far, unconfirmed: 0.0 });
+        m.phase = EscortPhase::Leading;
+
+        let mut moving = far;
+        let mut walked = 0;
+        for _ in 0..8 {
+            moving[0] -= 12.0; // closing on us, well over the 1-unit threshold
+            w.hostages = vec![hostage(1, moving, true)];
+            let out = m.tick(&w, Angles::default(), 0.05);
+            if out.walk {
+                walked += 1;
+            }
+        }
+        assert_eq!(walked, 0, "slowed for a hostage that was already catching up");
     }
 
     #[test]
