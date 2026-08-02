@@ -961,7 +961,12 @@ impl Session {
                 self.site
             }
         };
-        let mut intent = self.brain.as_mut()?.think(&world, site, dt);
+        // The goal and the next waypoint are different questions: arrival is
+        // about the bomb site, steering is about the route to it. Passing the
+        // waypoint as the goal made the bot declare itself on the plant spot at
+        // every waypoint it reached.
+        let nav = bot::controller::Nav { goal: self.site, waypoint: site };
+        let mut intent = self.brain.as_mut()?.think(&world, nav, dt);
 
         // Blocked by geometry the route does not model: strafe, jump, and
         // swing the view off the wall. Without this a solid player walks

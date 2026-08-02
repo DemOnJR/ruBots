@@ -76,6 +76,54 @@ pub const WALK_SPEED: f32 = ESCORT_WALK_SPEED;
 /// that is not quite steady.
 pub const AIM_ERROR_REFRESH: f32 = 0.35;
 
+/// Where the bot is going, at the two scales that matter.
+///
+/// Keeping them apart is not tidiness. "Have I arrived?" is a question about
+/// the **objective**; "which way do I walk?" is a question about the **next
+/// waypoint**. Collapsing the two into one `Option<Vec3>` is what let a bot
+/// carrying the C4 reach a waypoint 2800 units from the bomb site, decide it
+/// was standing on the plant spot, and stop dead -- every waypoint, all the way
+/// across the map. Measured before the fix, on de_dust2:
+///
+/// ```text
+/// rung plant       bomb true  to_goal 2868
+/// rung plant-walk             to_goal 2848   (20 units in 8 seconds)
+/// ```
+///
+/// An `Option<Vec3>` still converts into this as a goal with no waypoint, which
+/// is the right reading for a caller that has no navigation layer.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Nav {
+    /// The objective itself: the bomb site, the rescue zone.
+    pub goal: Option<Vec3>,
+    /// The next point to steer at on the way there. `None` means steer
+    /// straight at the goal, which is only correct in an open room.
+    pub waypoint: Option<Vec3>,
+}
+
+impl Nav {
+    /// Head for `goal` with no route -- straight-line steering.
+    pub fn to(goal: Vec3) -> Self {
+        Self { goal: Some(goal), waypoint: None }
+    }
+
+    /// No objective at all.
+    pub fn nowhere() -> Self {
+        Self::default()
+    }
+
+    /// The point to actually turn toward this tick.
+    pub fn steer(&self) -> Option<Vec3> {
+        self.waypoint.or(self.goal)
+    }
+}
+
+impl From<Option<Vec3>> for Nav {
+    fn from(goal: Option<Vec3>) -> Self {
+        Self { goal, waypoint: None }
+    }
+}
+
 /// Holds the bot's cross-tick state: where it is currently looking (aim is
 /// smoothed, not teleported), how far along the objectives it is, and the
 /// trigger latches.
@@ -207,7 +255,8 @@ impl Controller {
     ///
     /// A pure function of `(WorldView, site, dt)` and the controller's own
     /// state — no clock, no network, no globals.
-    pub fn think(&mut self, world: &WorldView, site: Option<Vec3>, dt: f32) -> Intent {
+    pub fn think(&mut self, world: &WorldView, nav: impl Into<Nav>, dt: f32) -> Intent {
+        let nav = nav.into();
         self.idle.advance(dt);
 
         // A weapon switch invalidates the trigger latches: the burst counter
@@ -242,7 +291,7 @@ impl Controller {
 
         // Keep the navigation-level objective in step regardless of what the
         // ladder below decides — it tracks arrival and mode, not buttons.
-        self.objective.tick(world, site, dt);
+        self.objective.tick(world, nav.goal, dt);
 
         // --- 3) A visible enemy -------------------------------------------
         if let Some(target) = select_target(world, &self.params).copied() {
@@ -311,10 +360,27 @@ impl Controller {
             if let Some(target) = self.objective.target {
                 let arrived = distance2d(world.me.origin, target) < ARRIVE_RADIUS
                     || self.objective.objective == Objective::Planting;
+                // Arrival is measured against the bomb site; steering follows
+                // the route to it. Once arrived the route is irrelevant and the
+                // site itself is what to face.
+                let steer = if arrived { target } else { nav.steer().unwrap_or(target) };
                 self.view =
-                    turn_toward(self.view, aim_angles(world.me.origin, target), max_turn);
+                    turn_toward(self.view, aim_angles(world.me.origin, steer), max_turn);
 
-                let out = self.plant.tick(world, dt);
+                // Only start the plant once actually there. `in_bomb_zone` is
+                // the server's own permission bit, so it is tempting to let the
+                // machine act on it alone -- but arming pins `maxspeed` to 1.0
+                // (`CC4::GetMaxSpeed`, `wpn_c4.cpp:383-391`), so a bot that
+                // begins the plant while still walking freezes itself in place
+                // and never reaches the site. On a server with
+                // `mp_plant_c4_anywhere` that is instant; on a normal one it
+                // happens on the lip of the trigger.
+                let out = if arrived {
+                    self.plant.tick(world, dt)
+                } else {
+                    self.plant.reset();
+                    crate::objective::bomb::PlantOutput::default()
+                };
                 let mut intent = Intent {
                     view: self.wire_view(world),
                     // Standing still to plant is not optional: the server
@@ -322,7 +388,7 @@ impl Controller {
                     // cancels the whole thing.
                     forwardmove: if arrived { 0.0 } else { FORWARD_SPEED },
                     attack: out.attack,
-                    move_target: Some(target),
+                    move_target: Some(steer),
                     ..Intent::default()
                 };
                 if let Some(w) = out.select {
@@ -365,14 +431,15 @@ impl Controller {
         //
         // Going to the site is right whether or not there is an objective to
         // perform there -- it is where the round happens.
-        if let Some(t) = self.objective.target.or(site) {
-            self.view = turn_toward(self.view, aim_angles(world.me.origin, t), max_turn);
+        if let Some(t) = self.objective.target.or(nav.goal) {
             let arrived = distance2d(world.me.origin, t) < ARRIVE_RADIUS;
+            let steer = if arrived { t } else { nav.steer().unwrap_or(t) };
+            self.view = turn_toward(self.view, aim_angles(world.me.origin, steer), max_turn);
             self.rung = if arrived { "arrived" } else { "goto" };
             return Intent {
                 view: self.wire_view(world),
                 forwardmove: if arrived { 0.0 } else { FORWARD_SPEED },
-                move_target: Some(t),
+                move_target: Some(steer),
                 ..Intent::default()
             };
         }
@@ -616,6 +683,49 @@ mod tests {
         let planting = c.think(&onsite, Some(site), 0.1);
         assert!(planting.attack, "holds +attack to plant");
         assert_eq!(planting.forwardmove, 0.0, "stands still to plant");
+    }
+
+    /// The bug this whole `Nav` split exists for.
+    ///
+    /// A bomb carrier crossing de_dust2 is always standing next to its next
+    /// waypoint -- that is what a waypoint is. When the objective machine was
+    /// fed the waypoint instead of the site, it kept answering "you are at the
+    /// plant spot", so the bot stopped at every single one. It still made
+    /// progress, at roughly 20 units per eight seconds, which is exactly slow
+    /// enough to look like a navigation problem rather than an arrival one.
+    #[test]
+    fn standing_on_a_waypoint_is_not_standing_on_the_bomb_site() {
+        let mut c = Controller::new(5, Difficulty::Normal);
+        let site: Vec3 = [3000.0, 0.0, 0.0];
+        let world = WorldView {
+            me: SelfState {
+                in_bomb_zone: true, // plant_c4_anywhere, or a generous trigger
+                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
+            },
+            bomb: BombState { carried_by_me: true, ..Default::default() },
+            ..Default::default()
+        };
+
+        // Right on top of the next waypoint, and 3000 units from the site.
+        let waypoint: Vec3 = [40.0, 0.0, 0.0];
+        let nav = Nav { goal: Some(site), waypoint: Some(waypoint) };
+        let intent = c.think(&world, nav, 0.1);
+
+        assert!(intent.forwardmove > 0.0, "stopped 3000 units from the site");
+        assert!(!intent.attack, "tried to plant 3000 units from the bomb site");
+        assert_eq!(c.objective.objective, Objective::MoveToPlant);
+        assert_eq!(intent.move_target, Some(waypoint), "steers at the waypoint");
+    }
+
+    /// ...and the reverse: an `Option` with no route still means "go there".
+    #[test]
+    fn a_bare_option_still_reads_as_a_goal_with_no_route() {
+        let n: Nav = Some([1.0, 2.0, 3.0]).into();
+        assert_eq!(n.goal, Some([1.0, 2.0, 3.0]));
+        assert_eq!(n.waypoint, None);
+        assert_eq!(n.steer(), Some([1.0, 2.0, 3.0]));
+        assert_eq!(Nav::nowhere().steer(), None);
     }
 
     #[test]
