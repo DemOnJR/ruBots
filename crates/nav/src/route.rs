@@ -87,6 +87,29 @@ impl PartialOrd for Candidate {
 /// `None` when either endpoint is out of range or no route exists. The
 /// heuristic is straight-line distance to the goal.
 pub fn find_path<S: NavSource + ?Sized>(src: &S, start: usize, goal: usize) -> Option<Vec<usize>> {
+    find_path_avoiding(src, start, goal, &|_| 0.0)
+}
+
+/// A* with an extra per-node cost, for routing around what the graph got wrong.
+///
+/// The graph is generated from the BSP, so it believes every edge it can trace.
+/// Real geometry disagrees in places -- a lip that needs a jump the hull trace
+/// thought was a step, a doorway a player does not quite fit through at that
+/// angle -- and a bot that walks into one is stuck on a route that stays
+/// perfectly valid. Re-planning from the same spot then returns the same path,
+/// which is an infinite loop: measured live, a CT heading for a planted bomb
+/// burned 76 re-routes without moving, and the bomb went off.
+///
+/// `penalty` is added to the cost of entering a node, so a place that has
+/// already defeated us becomes expensive rather than forbidden. Expensive is
+/// the right shape: a detour is preferred when one exists, and the only route
+/// there is still taken rather than reporting no path at all.
+pub fn find_path_avoiding<S: NavSource + ?Sized>(
+    src: &S,
+    start: usize,
+    goal: usize,
+    penalty: &dyn Fn(usize) -> f32,
+) -> Option<Vec<usize>> {
     let n = src.len();
     if start >= n || goal >= n {
         return None;
@@ -129,7 +152,7 @@ pub fn find_path<S: NavSource + ?Sized>(src: &S, start: usize, goal: usize) -> O
             if next >= n || closed[next] {
                 continue;
             }
-            let tentative = g[node] + src.cost(node, next);
+            let tentative = g[node] + src.cost(node, next) + penalty(next);
             if tentative < g[next] {
                 g[next] = tentative;
                 came[next] = node;
@@ -475,5 +498,59 @@ mod tests {
         assert_eq!(out, vec![1]);
         // nearest() through the trait matches Graph::nearest.
         assert_eq!(nearest(&g, [9.0, 0.0, 0.0]), g.nearest([9.0, 0.0, 0.0]));
+    }
+
+    /// A penalised node is avoided when a detour exists, and still used when
+    /// it is the only way through.
+    ///
+    /// "Expensive" rather than "forbidden" is the load-bearing choice: a graph
+    /// generated from geometry is often right and the bot merely unlucky, so
+    /// refusing a node outright can report no path at all where a slow one
+    /// exists.
+    #[test]
+    fn a_penalised_node_is_detoured_around_but_not_forbidden() {
+        // 0 -> 1 -> 4  (short, through the penalised node 1)
+        // 0 -> 2 -> 3 -> 4  (longer detour)
+        struct Diamond;
+        impl NavSource for Diamond {
+            fn len(&self) -> usize {
+                5
+            }
+            fn origin(&self, i: usize) -> [f32; 3] {
+                [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [5.0, 20.0, 0.0],
+                 [15.0, 20.0, 0.0], [20.0, 0.0, 0.0]][i]
+            }
+            fn neighbours(&self, i: usize, out: &mut Vec<usize>) {
+                out.extend_from_slice(match i {
+                    0 => &[1usize, 2][..],
+                    1 => &[0, 4][..],
+                    2 => &[0, 3][..],
+                    3 => &[2, 4][..],
+                    4 => &[1, 3][..],
+                    _ => &[][..],
+                });
+            }
+            fn cost(&self, a: usize, b: usize) -> f32 {
+                dist(self.origin(a), self.origin(b))
+            }
+            fn flags(&self, _: usize) -> u32 {
+                0
+            }
+        }
+
+        let plain = find_path(&Diamond, 0, 4).expect("a path");
+        assert_eq!(plain, vec![0, 1, 4], "the short way when nothing is penalised");
+
+        let avoided = find_path_avoiding(&Diamond, 0, 4, &|n| if n == 1 { 400.0 } else { 0.0 })
+            .expect("a path");
+        assert_eq!(avoided, vec![0, 2, 3, 4], "should have taken the detour");
+
+        // With the detour also blocked there is no alternative, so the
+        // penalised node must still be used rather than reporting failure.
+        let forced = find_path_avoiding(&Diamond, 0, 4, &|n| {
+            if n == 2 || n == 3 { 10_000.0 } else { 0.0 }
+        })
+        .expect("a penalty must never make a reachable goal unreachable");
+        assert_eq!(forced, vec![0, 1, 4]);
     }
 }

@@ -1020,6 +1020,17 @@ impl NavGrid {
         route::find_path(self, start, goal)
     }
 
+    /// [`Self::find_path`], charging extra to enter nodes that have already
+    /// defeated us. See [`route::find_path_avoiding`].
+    pub fn find_path_avoiding(
+        &self,
+        start: usize,
+        goal: usize,
+        penalty: &dyn Fn(usize) -> f32,
+    ) -> Option<Vec<usize>> {
+        route::find_path_avoiding(self, start, goal, penalty)
+    }
+
     /// The move recorded for the edge `from -> to`, if there is one.
     pub fn move_between(&self, from: usize, to: usize) -> Option<Move> {
         self.nodes

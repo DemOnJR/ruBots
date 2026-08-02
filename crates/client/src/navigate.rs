@@ -35,6 +35,16 @@ pub const PROGRESS_EPSILON: f32 = 4.0;
 /// How long to make no progress before giving up on the waypoint.
 pub const STUCK_SECONDS: f32 = 1.2;
 
+/// What one failure to reach a node adds to the cost of routing through it.
+///
+/// Roughly ten lattice steps, so a single strike is shrugged off if there is no
+/// alternative and a repeat offender is routed around as soon as one exists.
+pub const BLOCKED_PENALTY: f32 = 400.0;
+
+/// How many strikes a node keeps. Cleared on a new destination, because the
+/// approach angle changes and with it whether the place is actually passable.
+pub const MAX_BLOCKED: usize = 24;
+
 /// Grace before the first nudge.
 ///
 /// A single tick without measurable progress is not being stuck -- the bot is
@@ -54,6 +64,13 @@ pub struct PathFollower {
     best_dist: f32,
     /// How long we have failed to get closer to `tracked`.
     no_progress_for: f32,
+    /// Nodes that have defeated us on the way to the current goal, and how
+    /// often. Re-planning without this returns the same path from the same
+    /// spot, which is why a stuck bot stays stuck no matter how many times it
+    /// gives up.
+    blocked: std::collections::HashMap<usize, u32>,
+    /// Waypoints given up on back to back, without progress in between.
+    consecutive_failures: u32,
     /// Waypoints skipped because we could not reach them. Diagnostic: a bot
     /// that constantly re-routes is a graph problem, not a steering one.
     pub reroutes: u32,
@@ -172,8 +189,12 @@ impl PathFollower {
         goal: [f32; 3],
         dt: f32,
     ) -> Option<[f32; 3]> {
-        // A new destination invalidates the route.
+        // A new destination invalidates the route, and with it everything we
+        // learned about what was in the way: the approach angle changes, and a
+        // place that could not be entered from one side often can be from
+        // another.
         if self.goal.map(|g| dist2d(g, goal) > ARRIVE_RADIUS).unwrap_or(true) {
+            self.blocked.clear();
             self.replan(grid, from, goal);
         }
 
@@ -187,6 +208,7 @@ impl PathFollower {
                     self.best_dist = d;
                     self.no_progress_for = 0.0;
                     self.unstick_for = 0.0;
+                    self.consecutive_failures = 0;
                 } else {
                     self.no_progress_for += dt;
                     // Start evading well before giving up on the waypoint: the
@@ -258,10 +280,16 @@ impl PathFollower {
         self.tracked = None;
         self.best_dist = f32::INFINITY;
         self.no_progress_for = 0.0;
+        let blocked = std::mem::take(&mut self.blocked);
         self.path = match (grid.nearest(from), grid.nearest(goal)) {
-            (Some(a), Some(b)) => grid.find_path(a, b).unwrap_or_default(),
+            (Some(a), Some(b)) => grid
+                .find_path_avoiding(a, b, &|n| {
+                    blocked.get(&n).map_or(0.0, |&hits| BLOCKED_PENALTY * hits as f32)
+                })
+                .unwrap_or_default(),
             _ => Vec::new(),
         };
+        self.blocked = blocked;
     }
 
     /// Give up on the current waypoint.
@@ -269,11 +297,35 @@ impl PathFollower {
     /// Skipping one is usually enough — a blocked door or a player standing in
     /// a corridor. If we have run out, plan again from scratch.
     fn advance_past_blocked(&mut self, grid: &NavGrid, from: [f32; 3], goal: [f32; 3]) {
-        if self.at + 1 < self.path.len() {
-            self.at += 1;
-        } else {
-            self.replan(grid, from, goal);
+        // Remember which node beat us before doing anything else, so the
+        // re-plan below cannot hand back the route we have just failed.
+        if let Some(&node) = self.path.get(self.at) {
+            if self.blocked.len() < MAX_BLOCKED || self.blocked.contains_key(&node) {
+                *self.blocked.entry(node).or_insert(0) += 1;
+            }
         }
+        self.consecutive_failures += 1;
+        // One skip is the cheap answer to a teammate standing in a doorway.
+        // Two in a row means the ROUTE is wrong, and skipping further along a
+        // path we cannot walk just selects a waypoint deeper inside the same
+        // wall -- which is why the old behaviour could give up 76 times without
+        // ever re-planning: it had waypoints left, so it kept spending them.
+        if self.consecutive_failures >= 2 || self.at + 1 >= self.path.len() {
+            self.consecutive_failures = 0;
+            self.replan(grid, from, goal);
+        } else {
+            self.at += 1;
+        }
+    }
+
+    /// Nodes currently being routed around, for tracing.
+    pub fn blocked_nodes(&self) -> usize {
+        self.blocked.len()
+    }
+
+    /// The current route as world positions, for tests and tracing.
+    pub fn path_nodes(&self, grid: &NavGrid) -> Vec<[f32; 3]> {
+        self.path.iter().map(|&n| grid.origin(n)).collect()
     }
 }
 
@@ -446,6 +498,43 @@ mod tests {
 
         assert!(f.reroutes > 1, "gave up {} times in 4 seconds", f.reroutes);
         assert!(f.is_stuck() || f.reroutes > 1);
+    }
+
+    /// Giving up must actually change the route.
+    ///
+    /// Re-planning from the same position with the same graph returns the same
+    /// path, so a bot wedged on geometry the graph believes is passable loops
+    /// forever. Measured live: a counter-terrorist heading for a planted bomb
+    /// sat at one spot for the whole round burning 76 re-routes, `to_goal`
+    /// frozen at 1641, and the bomb went off. The route was valid the entire
+    /// time -- which is what made it look like a defuse bug rather than a
+    /// pathing one.
+    #[test]
+    fn giving_up_repeatedly_forces_a_different_route() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+
+        let mut f = PathFollower::new();
+        f.next_waypoint(&map.grid, start, goal, 0.02);
+        let first: Vec<[f32; 3]> = f.path_nodes(&map.grid);
+        assert!(first.len() > 5, "route is implausibly short");
+
+        // Pinned in place: every waypoint in turn defeats us.
+        for _ in 0..2000 {
+            f.next_waypoint(&map.grid, start, goal, 0.02);
+        }
+        assert!(f.blocked_nodes() > 0, "gave up without remembering where");
+
+        let after: Vec<[f32; 3]> = f.path_nodes(&map.grid);
+        assert_ne!(
+            first, after,
+            "re-planned {} times and produced the identical route",
+            f.reroutes
+        );
     }
 
     /// Repeating a failed direction is how a bot spends a round grinding
