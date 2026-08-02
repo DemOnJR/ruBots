@@ -269,6 +269,11 @@ fn main() {
                     cd.alive(),
                     cd.weapons.len(),
                 );
+                eprintln!(
+                    "      phys: on_ground {} can_shoot {} frozen {} bombzone {} iuser3 {:#04x} flags {:#x}",
+                    cd.on_ground(), cd.can_shoot(), cd.freeze_period(),
+                    cd.in_bomb_zone(), cd.iuser3(), cd.flags(),
+                );
                 // The server tags a dead player's chat "(dead)" in the log
                 // (`util.cpp` Host_Say). That is a direct, one-bit answer to
                 // "is this bot actually alive?" -- unlike maxspeed or
