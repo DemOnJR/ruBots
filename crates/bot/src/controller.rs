@@ -39,7 +39,7 @@ use crate::aim::{aim_error, compensate, predict_punch, turn_toward};
 use crate::combat::{engage, select_target, EngageParams};
 use crate::fire::FireControl;
 use crate::idle::AntiIdle;
-use crate::math::{aim_angles, distance2d, norm_angle, Angles, Vec3};
+use crate::math::{aim_angles, distance2d, move_axes, norm_angle, Angles, Vec3};
 
 // Re-exported so `bot::controller::Intent` keeps resolving for callers that
 // imported it from here before the type moved to its own module.
@@ -67,6 +67,28 @@ pub const ARRIVE_RADIUS: f32 = 24.0;
 /// (`pm_shared/pm_shared.cpp:395`). 130 leaves margin for the fact that the
 /// speed compared there is the resulting *velocity*, not the requested move.
 pub const WALK_SPEED: f32 = ESCORT_WALK_SPEED;
+
+/// Speed below which a rifle is accurate.
+///
+/// Every rifle picks its spread with `if (velocity.Length() > 140)` and the
+/// moving branch is two to three times worse than the standing one
+/// (`wpn_ak47.cpp:75-86`, `wpn_m4a1.cpp:103-128`, and the same shape in
+/// aug/sg552/galil/famas/m249). The AWP's threshold is **10**, and pistols
+/// penalise any velocity at all. 140 is the useful general number.
+pub const ACCURATE_SPEED: f32 = 140.0;
+
+/// Sideways speed while circling an opponent.
+///
+/// Below [`ACCURATE_SPEED`] on its own, so a bot that strafes and closes at the
+/// same time is not automatically firing from the inaccurate branch.
+pub const STRAFE_SPEED: f32 = 120.0;
+
+/// How long one strafe direction is held, in seconds.
+///
+/// **Chosen.** Long enough to cover ground, short enough that the bot is not
+/// predictable, and re-drawn per switch so two bots never sway in unison.
+pub const STRAFE_MIN: f64 = 0.45;
+pub const STRAFE_MAX: f64 = 1.15;
 
 /// How often the per-target aim error is re-drawn, in seconds.
 ///
@@ -150,6 +172,8 @@ pub struct Controller {
     /// The weapon we last saw ourselves holding, so the fire latches can be
     /// cleared on a switch.
     last_weapon: WeaponId,
+    /// Which way the bot is currently circling, and how long is left on it.
+    strafe: (f32, f32),
     /// Which rung of the ladder produced the last [`Intent`].
     ///
     /// Purely diagnostic, and worth the field. The ladder is exclusive by
@@ -176,6 +200,7 @@ impl Controller {
             tracking: None,
             aim_offset: (Angles::default(), f32::INFINITY),
             last_weapon: WeaponId::None,
+            strafe: (1.0, 0.0),
             rung: "init",
         }
     }
@@ -232,6 +257,30 @@ impl Controller {
             world.punch_prediction_frames(),
         );
         self.idle.apply(compensate(self.view, punch))
+    }
+
+    /// Head for `to`, expressed in the axes a `usercmd_t` actually carries.
+    ///
+    /// `view` must be the angle being **sent**, not the internal aim: the
+    /// server builds the movement basis from the `viewangles` in the command it
+    /// is executing, so decomposing against anything else walks the bot
+    /// somewhere it did not ask to go.
+    fn travel(&self, view: Angles, from: Vec3, to: Vec3, speed: f32) -> (f32, f32) {
+        move_axes(view.yaw, aim_angles(from, to).yaw, speed)
+    }
+
+    /// Advance the circling timer and return the current side.
+    ///
+    /// Re-drawn on every switch rather than fixed, so a row of bots does not
+    /// sway in step -- which is the sort of thing nobody notices until they see
+    /// ten of them do it at once.
+    fn strafe_side(&mut self, dt: f32) -> f32 {
+        self.strafe.1 -= dt;
+        if self.strafe.1 <= 0.0 {
+            self.strafe.0 = -self.strafe.0;
+            self.strafe.1 = self.rng.range(STRAFE_MIN, STRAFE_MAX) as f32;
+        }
+        self.strafe.0
     }
 
     /// Reset everything that describes a life or a specific weapon.
@@ -336,11 +385,28 @@ impl Controller {
             }
 
             self.rung = "combat";
+            let view = self.wire_view(world);
+
+            // Nobody walks in a straight line at someone who is shooting at
+            // them, and here the human-looking answer and the effective one are
+            // the same. Above ACCURATE_SPEED a rifle's spread jumps to the
+            // moving branch, so the bot plants itself for the shot and circles
+            // the rest of the time -- which is what a player does without
+            // thinking about it.
+            let side = self.strafe_side(dt);
+            let (forwardmove, sidemove) = if action.attack {
+                (0.0, 0.0)
+            } else {
+                let closing = if eng.advance { FORWARD_SPEED } else { 0.0 };
+                let (f, s) =
+                    self.travel(view, world.me.origin, target.origin, closing);
+                (f, s + STRAFE_SPEED * side)
+            };
+
             return Intent {
-                view: self.wire_view(world),
-                // Close only when we still need to; hold ground in a knife-fight
-                // range so the aim can settle.
-                forwardmove: if eng.advance { FORWARD_SPEED } else { 0.0 },
+                view,
+                forwardmove,
+                sidemove,
                 attack: action.attack,
                 reload: action.reload,
                 move_target: Some(target.origin),
@@ -357,9 +423,15 @@ impl Controller {
                 self.view = turn_toward(self.view, aim_angles(world.me.origin, look), max_turn);
             }
             self.rung = "defuse";
+            let view = self.wire_view(world);
+            let (forwardmove, sidemove) = match defuse.move_to {
+                Some(to) => self.travel(view, world.me.origin, to, FORWARD_SPEED),
+                None => (0.0, 0.0),
+            };
             return Intent {
-                view: self.wire_view(world),
-                forwardmove: if defuse.move_to.is_some() { FORWARD_SPEED } else { 0.0 },
+                view,
+                forwardmove,
+                sidemove,
                 use_action: defuse.use_action,
                 move_target: defuse.move_to,
                 ..Intent::default()
@@ -392,12 +464,19 @@ impl Controller {
                     self.plant.reset();
                     crate::objective::bomb::PlantOutput::default()
                 };
+                let view = self.wire_view(world);
+                // Standing still to plant is not optional: the server freezes
+                // the planter anyway, and drifting out of the zone cancels the
+                // whole thing.
+                let (forwardmove, sidemove) = if arrived {
+                    (0.0, 0.0)
+                } else {
+                    self.travel(view, world.me.origin, steer, FORWARD_SPEED)
+                };
                 let mut intent = Intent {
-                    view: self.wire_view(world),
-                    // Standing still to plant is not optional: the server
-                    // freezes the planter anyway, and drifting out of the zone
-                    // cancels the whole thing.
-                    forwardmove: if arrived { 0.0 } else { FORWARD_SPEED },
+                    view,
+                    forwardmove,
+                    sidemove,
                     attack: out.attack,
                     move_target: Some(steer),
                     ..Intent::default()
@@ -418,9 +497,15 @@ impl Controller {
             }
             let speed = if escort.walk { WALK_SPEED } else { FORWARD_SPEED };
             self.rung = "hostage";
+            let view = self.wire_view(world);
+            let (forwardmove, sidemove) = match escort.move_to {
+                Some(to) => self.travel(view, world.me.origin, to, speed),
+                None => (0.0, 0.0),
+            };
             return Intent {
-                view: self.wire_view(world),
-                forwardmove: if escort.move_to.is_some() { speed } else { 0.0 },
+                view,
+                forwardmove,
+                sidemove,
                 use_action: escort.use_action,
                 walk: escort.walk,
                 move_target: escort.move_to,
@@ -447,9 +532,16 @@ impl Controller {
             let steer = if arrived { t } else { nav.steer().unwrap_or(t) };
             self.view = turn_toward(self.view, aim_angles(world.me.origin, steer), max_turn);
             self.rung = if arrived { "arrived" } else { "goto" };
+            let view = self.wire_view(world);
+            let (forwardmove, sidemove) = if arrived {
+                (0.0, 0.0)
+            } else {
+                self.travel(view, world.me.origin, steer, FORWARD_SPEED)
+            };
             return Intent {
-                view: self.wire_view(world),
-                forwardmove: if arrived { 0.0 } else { FORWARD_SPEED },
+                view,
+                forwardmove,
+                sidemove,
                 move_target: Some(steer),
                 ..Intent::default()
             };
@@ -1165,6 +1257,105 @@ mod tests {
         }
     }
 
+    /// Where a usercmd will ACTUALLY move the player, in world space.
+    ///
+    /// `forwardmove`/`sidemove` are meaningless without the view they are
+    /// relative to, so any test that asserts on them alone is asserting on half
+    /// a vector. This reassembles the engine's basis and reports the bearing
+    /// and the speed, which are the two things the bot actually intends.
+    fn travel_bearing(intent: &Intent) -> f32 {
+        let y = f64::from(intent.view.yaw).to_radians();
+        let (sy, cy) = y.sin_cos();
+        let vx = cy * f64::from(intent.forwardmove) + sy * f64::from(intent.sidemove);
+        let vy = sy * f64::from(intent.forwardmove) - cy * f64::from(intent.sidemove);
+        vy.atan2(vx).to_degrees() as f32
+    }
+
+    fn travel_speed(intent: &Intent) -> f32 {
+        intent.forwardmove.hypot(intent.sidemove)
+    }
+
+    fn bearing_to(from: Vec3, to: Vec3) -> f32 {
+        aim_angles(from, to).yaw
+    }
+
+    /// The body goes where the route says, whatever the head is doing.
+    ///
+    /// Before the decomposition the bot pinned `forwardmove` to full speed and
+    /// steered by turning, so it could only ever walk along its own crosshair.
+    /// Since the view is turn-rate limited, that meant walking in a direction
+    /// it had already decided against for the whole of every turn -- and it
+    /// could never strafe, which is most of what makes movement look human.
+    /// Nobody rounds a corner by rotating on the spot first.
+    #[test]
+    fn the_walk_goes_to_the_waypoint_even_while_the_view_is_catching_up() {
+        let mut c = Controller::new(3, Difficulty::Normal);
+        let world = WorldView {
+            me: me_at([0.0, 0.0, 0.0], Team::CounterTerrorist),
+            ..Default::default()
+        };
+        // Hard left of a bot looking down +X, so the turn cannot complete in
+        // one tick at any sane turn rate.
+        let waypoint: Vec3 = [0.0, 800.0, 0.0];
+
+        let intent = c.think(&world, Some(waypoint), 0.05);
+        assert_eq!(c.rung, "goto");
+        assert!(
+            intent.sidemove.abs() > 1.0,
+            "a 90-degree turn produced no strafe at all: fwd {} side {}",
+            intent.forwardmove,
+            intent.sidemove
+        );
+
+        let want = bearing_to([0.0; 3], waypoint);
+        let err = norm_angle(f64::from(travel_bearing(&intent) - want)).abs();
+        assert!(err < 1.0, "walking {err:.1} degrees off the waypoint");
+
+        let speed = travel_speed(&intent);
+        assert!((speed - FORWARD_SPEED).abs() < 1.0, "speed {speed}");
+    }
+
+    /// Circling an opponent, but planting to shoot.
+    ///
+    /// Above ACCURATE_SPEED a rifle's spread jumps to the moving branch
+    /// (`wpn_ak47.cpp:75-86`), so standing still for the shot is both what a
+    /// player does and what actually hits.
+    #[test]
+    fn a_bot_in_a_firefight_circles_but_stops_to_shoot() {
+        let mut c = Controller::new(11, Difficulty::Easy);
+        let w = WorldView {
+            me: SelfState {
+                can_shoot: true,
+                weapon: Some(WeaponState { id: WeaponId::Ak47, clip: 30, ..Default::default() }),
+                ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
+            },
+            players: vec![PlayerView {
+                entity: 1,
+                origin: [600.0, 0.0, 0.0],
+                team: Team::CounterTerrorist,
+                visible: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut circled = false;
+        let mut planted_to_shoot = false;
+        for _ in 0..400 {
+            let i = c.think(&w, None, 0.05);
+            if c.rung != "combat" {
+                continue;
+            }
+            if i.attack {
+                planted_to_shoot |= travel_speed(&i) == 0.0;
+            } else if i.sidemove.abs() > 1.0 {
+                circled = true;
+            }
+        }
+        assert!(circled, "walked at the enemy in a straight line");
+        assert!(planted_to_shoot, "never stopped moving to take a shot");
+    }
+
     #[test]
     fn a_ct_escorts_a_hostage_and_slows_when_it_trails() {
         let mut c = Controller::new(47, Difficulty::Normal);
@@ -1181,8 +1372,16 @@ mod tests {
         };
         let intent = c.think(&w, None, 0.05);
         assert!(intent.walk, "should slow for a trailing hostage");
-        assert!(intent.forwardmove > 0.0 && intent.forwardmove <= WALK_SPEED);
+        // The zone is directly BEHIND the bot, and the view is turn-rate
+        // limited, so on this tick it moves there sideways/backwards while the
+        // head comes round. That is the point of the decomposition: the body
+        // goes where it was told regardless of where the crosshair has got to.
+        let speed = travel_speed(&intent);
+        assert!(speed > 0.0 && speed <= WALK_SPEED, "speed {speed}");
         assert!(WALK_SPEED < 150.0, "and stay under the footstep threshold");
+        let want = bearing_to([0.0; 3], [-2000.0, 0.0, 0.0]);
+        let err = norm_angle(f64::from(travel_bearing(&intent) - want)).abs();
+        assert!(err < 1.0, "walking {err:.1} degrees off the rescue zone");
         assert_eq!(intent.move_target, Some([-2000.0, 0.0, 0.0]));
     }
 

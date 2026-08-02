@@ -111,7 +111,7 @@ CMD ["./hlds_linux", \
      "-insecure", \
      "+ip", "0.0.0.0", \
      "+sv_lan", "1", \
-     "+maxplayers", "12", \
+     "+maxplayers", "24", \
      "+mp_timelimit", "0", \
      "+sv_voiceenable", "0", \
      "+mp_autoteambalance", "0", \

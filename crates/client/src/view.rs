@@ -23,6 +23,38 @@ use crate::world::Decoder;
 use bot::world::{HostageView, PlayerView, SelfState, Team, WorldView};
 use bot::Angles;
 
+/// Are we alive?
+///
+/// **Not** from `clientdata_t.deadflag`. That field is declared in `delta.lst`
+/// and is never populated: `UpdateClientData` (`dlls/client.cpp:5020-5100`)
+/// assigns flags, health, weapons, origin, velocity, punchangle and the rest,
+/// and never touches `cd->deadflag`. It is therefore always zero in the struct
+/// the engine deltas against, so it is never transmitted, so a reader that
+/// treats "absent" as alive has written a function that cannot return false.
+///
+/// Measured on a real capture: `deadflag` present in **0** of 18354 decoded
+/// clientdata frames, while 14562 of them read `health 0, maxspeed 900,
+/// weapons 0` -- a corpse in observer mode. Live, the bot reported `alive true`
+/// in 214 of 214 samples and kept running the combat ladder after it died.
+///
+/// `health` is the signal that does arrive, and ReGameDLL clamps it for us:
+/// `cd->health = max(pev->health, 0.0f)` (`dlls/client.cpp:5038`). Nothing
+/// alive has zero health. The scoreboard's `SCORE_STATUS_DEAD` bit corroborates
+/// it -- `SetScoreboardAttributes` sets it from `pev->deadflag != DEAD_NO`
+/// (`dlls/player.cpp:5705-5744`) -- and covers the moment between the two.
+fn alive(d: &Decoder) -> bool {
+    let Some(cd) = d.clientdata.as_ref() else {
+        return false;
+    };
+    if cd.health() <= 0.0 {
+        return false;
+    }
+    !d.game
+        .self_index
+        .and_then(|i| d.game.player(i))
+        .is_some_and(|p| p.dead)
+}
+
 /// Translate the user-message team enum into the bot's.
 fn team(t: MsgTeam) -> Team {
     match t {
@@ -136,7 +168,7 @@ pub fn project(
         // user message. clientdata is per-frame and authoritative.
         health: cd.map(|c| c.health()).unwrap_or(0.0),
         team: team(g.my_team()),
-        alive: cd.is_some_and(|c| c.alive()),
+        alive: alive(d),
         money: g.money,
         weapons: cd.map(|c| c.weapons()).unwrap_or(0),
         // ITEM_STATUS_DEFUSER, cdll_dll.h:61.
@@ -235,6 +267,38 @@ mod tests {
         assert!(!sight.is_some_and(|s: &dyn Sight| s.visible([0.0; 3], [0.0; 3])));
         let sight: Option<&dyn Sight> = Some(&AllVisible);
         assert!(sight.is_some_and(|s: &dyn Sight| s.visible([0.0; 3], [0.0; 3])));
+    }
+
+    /// A corpse must not read as alive.
+    ///
+    /// The old implementation asked `clientdata_t.deadflag`, which the game DLL
+    /// never fills, so it answered "alive" for every frame of every death --
+    /// 214 of 214 live samples, 68 of which were plainly an observer at
+    /// maxspeed 900. The bot kept running the combat ladder on a corpse.
+    #[test]
+    fn zero_health_is_dead_however_confident_the_delta_stream_is() {
+        const SIGNON: &[u8] = include_bytes!("../tests/fixtures/signon.bin");
+        let s = crate::signon::walk(SIGNON);
+        let table = crate::stream::UserMsgTable::default();
+        let mut d = Decoder::new(&s, table);
+        assert!(!alive(&d), "no clientdata at all cannot be alive");
+
+        let mut cd = crate::world::ClientData::default();
+        // Exactly what a live capture shows for a corpse: no deadflag field
+        // anywhere, health clamped to zero by `cd->health = max(health, 0)`.
+        assert!(
+            !cd.fields.contains_key("deadflag"),
+            "the fixture must not smuggle in the field the server never sends"
+        );
+        d.clientdata = Some(cd.clone());
+        assert!(!alive(&d), "health 0 is a corpse");
+
+        cd.fields.insert(
+            "health".into(),
+            proto::delta::Value::Float(100.0),
+        );
+        d.clientdata = Some(cd);
+        assert!(alive(&d), "full health with no deadflag is alive");
     }
 
     #[test]
