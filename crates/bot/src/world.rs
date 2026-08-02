@@ -185,6 +185,14 @@ pub struct SelfState {
     pub punchangle: Angles,
     /// The active weapon as `weapon_data_t` last described it.
     pub weapon: Option<WeaponState>,
+    /// Horizontal speed, **measured** rather than reported.
+    ///
+    /// `clientdata_t` has a velocity field and this server does not send it: a
+    /// client with prediction on computes its own, so the bits are saved.
+    /// Trusting the absent field reads zero, which would tell a bot sprinting
+    /// across the map that it is standing still -- and standing still is
+    /// exactly the precondition every weapon's accuracy depends on.
+    pub speed: f32,
 }
 
 impl Default for SelfState {
@@ -204,6 +212,10 @@ impl Default for SelfState {
             freeze_period: false,
             punchangle: Angles::default(),
             weapon: None,
+            // Standing still by default, so a test that does not care about
+            // movement gets the accurate branch of every weapon rather than a
+            // silent "too fast to shoot".
+            speed: 0.0,
         }
     }
 }

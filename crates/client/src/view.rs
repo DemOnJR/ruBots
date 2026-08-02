@@ -154,6 +154,7 @@ pub fn project(
     rescue_zones: Vec<[f32; 3]>,
     sight: Option<&dyn Sight>,
     latency: f32,
+    speed: f32,
 ) -> WorldView {
     let cd = d.clientdata.as_ref();
     let g = &d.game;
@@ -185,6 +186,7 @@ pub fn project(
             })
             .unwrap_or_default(),
         weapon: weapon_state(d),
+        speed,
     };
 
     let players = d

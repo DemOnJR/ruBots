@@ -376,7 +376,21 @@ impl Controller {
             let on_target = aim_error(self.view, intended) <= self.params.fire_cone_degrees;
             let want = reacted && on_target && eng.fire && world.me.can_shoot;
 
-            let action = self.fire.decide(&world.me.weapon_or_unknown(), want);
+            // Wanting the shot and being able to take it are different things.
+            // Spread is chosen at the instant of PrimaryAttack from
+            // `pev->velocity` and `FL_ONGROUND`, so a bot that fires while
+            // still carrying its running speed throws the shot away -- and
+            // zeroing the movement request does NOT zero the velocity, which
+            // takes a few hundred milliseconds of friction to fall.
+            //
+            // Measured on a live four-bot run, sampled at every `rung combat`
+            // tick: velocity above 140 in 60 of 119, above zero in 118 of 119,
+            // airborne in 39 of 119. The accurate branch of the weapon in hand
+            // was being taken essentially never.
+            let weapon = world.me.weapon_or_unknown();
+            let steady =
+                world.me.on_ground && world.me.speed <= crate::fire::accurate_speed(weapon.id);
+            let action = self.fire.decide(&weapon, want && steady);
 
             // A plant interrupted by a firefight is a plant that was released,
             // which the server has already cancelled. Record it honestly.
@@ -394,7 +408,10 @@ impl Controller {
             // the rest of the time -- which is what a player does without
             // thinking about it.
             let side = self.strafe_side(dt);
-            let (forwardmove, sidemove) = if action.attack {
+            // Stop on `want`, not on `action.attack`. Gating the stop on the
+            // shot that the stop is a precondition for is a deadlock: too fast
+            // to fire, so never firing, so never stopping.
+            let (forwardmove, sidemove) = if want {
                 (0.0, 0.0)
             } else {
                 let closing = if eng.advance { FORWARD_SPEED } else { 0.0 };
@@ -1313,6 +1330,89 @@ mod tests {
 
         let speed = travel_speed(&intent);
         assert!((speed - FORWARD_SPEED).abs() < 1.0, "speed {speed}");
+    }
+
+    /// Running at 250 u/s is not a firing position, and the bot must not
+    /// deadlock waiting to be told otherwise.
+    ///
+    /// Spread is read from `pev->velocity` at the instant of PrimaryAttack, so
+    /// firing mid-sprint throws the shot away. But the stop cannot be gated on
+    /// the shot -- that is a deadlock: too fast to fire, so never firing, so
+    /// never stopping. It is gated on WANTING the shot.
+    #[test]
+    fn a_sprinting_bot_holds_its_fire_but_plants_itself_to_take_the_shot() {
+        let enemy = PlayerView {
+            entity: 1,
+            origin: [500.0, 0.0, 0.0],
+            team: Team::CounterTerrorist,
+            visible: true,
+            ..Default::default()
+        };
+        let world = |speed: f32, on_ground: bool| WorldView {
+            me: SelfState {
+                can_shoot: true,
+                speed,
+                on_ground,
+                weapon: Some(WeaponState {
+                    id: WeaponId::Ak47,
+                    clip: 30,
+                    ..Default::default()
+                }),
+                ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
+            },
+            players: vec![enemy],
+            ..Default::default()
+        };
+
+        // Sprinting: never pulls the trigger, but does stop moving.
+        let mut c = Controller::new(2, Difficulty::Unfair);
+        let mut fired_while_fast = 0;
+        let mut stopped = false;
+        for _ in 0..200 {
+            let i = c.think(&world(250.0, true), None, 0.05);
+            if c.rung != "combat" {
+                continue;
+            }
+            if i.attack {
+                fired_while_fast += 1;
+            }
+            if i.forwardmove == 0.0 && i.sidemove == 0.0 {
+                stopped = true;
+            }
+        }
+        assert_eq!(fired_while_fast, 0, "fired {fired_while_fast} shots at a sprint");
+        assert!(stopped, "never planted itself -- the stop is deadlocked on the shot");
+
+        // Airborne is worse than moving, and is refused at any speed.
+        let mut c = Controller::new(2, Difficulty::Unfair);
+        let mut fired_airborne = 0;
+        for _ in 0..200 {
+            if c.think(&world(0.0, false), None, 0.05).attack {
+                fired_airborne += 1;
+            }
+        }
+        assert_eq!(fired_airborne, 0, "fired {fired_airborne} shots in mid-air");
+
+        // Standing still on the ground: the shot is available.
+        let mut c = Controller::new(2, Difficulty::Unfair);
+        let mut fired = 0;
+        for _ in 0..200 {
+            if c.think(&world(0.0, true), None, 0.05).attack {
+                fired += 1;
+            }
+        }
+        assert!(fired > 0, "never fired even standing still on the ground");
+    }
+
+    /// The AWP's threshold is not the rifle's: 10 u/s against 140, a
+    /// hundredfold spread penalty rather than a doubling
+    /// (`wpn_awp.cpp:96-116`).
+    #[test]
+    fn the_awp_demands_a_dead_stop_where_a_rifle_tolerates_a_jog() {
+        assert!(crate::fire::accurate_speed(WeaponId::Awp) < 20.0);
+        assert!(crate::fire::accurate_speed(WeaponId::Ak47) > 100.0);
+        assert!(crate::fire::accurate_speed(WeaponId::Deagle) < 50.0);
+        assert!(crate::fire::accurate_speed(WeaponId::Scout) > 150.0);
     }
 
     /// Circling an opponent, but planting to shoot.

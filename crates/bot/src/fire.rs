@@ -156,6 +156,41 @@ pub enum HoldFire {
     BurstCooling,
 }
 
+/// The speed above which this weapon's spread jumps to its moving branch.
+///
+/// Every weapon picks its cone at the instant of `PrimaryAttack`, from
+/// `pev->velocity` and `FL_ONGROUND` -- never from the movement the client
+/// asked for. The numbers are the weapons' own:
+///
+/// * rifles and SMGs test `> 140`, and the moving branch is two to three times
+///   the standing one (`wpn_ak47.cpp:75-86`, `wpn_m4a1.cpp:103-128`, same shape
+///   in aug/sg552/galil/famas/m249);
+/// * the P90 and the Scout test `> 170` (`wpn_p90.cpp:73-79`,
+///   `wpn_scout.cpp:95-111`);
+/// * the **AWP tests `> 10`** -- 0.1 against 0.001 standing, a hundredfold
+///   penalty (`wpn_awp.cpp:96-116`);
+/// * pistols and the SG550 test `> 0`, i.e. any motion at all
+///   (`wpn_deagle.cpp:80`, `wpn_usp.cpp:123`, `wpn_sg550.cpp:98-104`).
+///
+/// A literal zero is not reachable -- friction never quite lands on it -- so
+/// the "any motion" weapons get a small practical floor instead.
+pub fn accurate_speed(id: WeaponId) -> f32 {
+    match id {
+        WeaponId::Awp => 15.0,
+        WeaponId::Scout | WeaponId::P90 => 170.0,
+        WeaponId::Deagle
+        | WeaponId::Usp
+        | WeaponId::Glock18
+        | WeaponId::Glock
+        | WeaponId::P228
+        | WeaponId::FiveSeven
+        | WeaponId::Elite
+        | WeaponId::Sg550
+        | WeaponId::G3sg1 => 30.0,
+        _ => 140.0,
+    }
+}
+
 /// Cross-tick trigger state.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FireControl {

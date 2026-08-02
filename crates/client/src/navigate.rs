@@ -110,6 +110,23 @@ impl PathFollower {
         self.unstick_for = 0.0;
     }
 
+    /// Stop judging progress: the bot is deliberately not going there.
+    ///
+    /// Being stuck is measured as "not getting closer to the waypoint", which
+    /// is exactly what a bot looks like when it has broken off to fight. Left
+    /// running, a firefight manufactures a stuck verdict, and the escape
+    /// behaviour then jumps the bot and swings its view off the target -- so
+    /// the navigation layer would be sabotaging every gunfight.
+    ///
+    /// Re-bases on resume rather than freezing, so the first tick back counts
+    /// as progress and the bot is not immediately declared stuck for ground it
+    /// lost while fighting.
+    pub fn hold(&mut self) {
+        self.no_progress_for = 0.0;
+        self.unstick_for = 0.0;
+        self.best_dist = f32::INFINITY;
+    }
+
     /// Are we currently blocked?
     pub fn is_stuck(&self) -> bool {
         self.unstick_for > UNSTICK_AFTER

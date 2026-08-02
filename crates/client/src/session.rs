@@ -1311,16 +1311,19 @@ impl Session {
             .as_ref()
             .map(|m| m.info.rescue_zones.iter().map(|z| z.centre()).collect())
             .unwrap_or_default();
+        // Measured, not reported: this server does not transmit our velocity,
+        // and every weapon's accuracy is decided by it. Taken before the
+        // borrow of `map`, because `measured_speed` needs `&mut self`.
+        let origin = d.clientdata.as_ref().map(|c| c.origin()).unwrap_or([0.0; 3]);
+        let speed = self.measured_speed(origin, now);
+
+        let d = self.decoder.as_ref()?;
         let sight = self.map.as_ref().map(|m| &m.bsp as &dyn crate::view::Sight);
-        let world = crate::view::project(d, rescue, sight, latency);
+        let world = crate::view::project(d, rescue, sight, latency, speed);
 
         // Turn the objective into the NEXT waypoint. Steering straight at a
         // distant goal walks into walls -- on de_dust2 the straight line from
         // a T spawn to bombsite B crosses most of the map.
-        // Still measured, because the fire-control layer needs to know whether
-        // the bot is moving fast enough to spoil a rifle shot (>140 u/s).
-        // Navigation no longer uses it: see `PathFollower::next_waypoint`.
-        let _speed = self.measured_speed(world.me.origin, now);
 
         // Route to whatever the brain last decided it wanted, falling back to
         // the map objective. Without this the navigation always heads for the
@@ -1361,11 +1364,25 @@ impl Session {
         // straight into a door frame and stays there for the rest of the
         // round -- the route stays perfectly valid the whole time, which is
         // what makes it so confusing to watch.
-        if let Some(u) = self.follower.unstick() {
+        //
+        // ...but NOT while fighting. The follower measures being stuck as "not
+        // getting closer to the waypoint", and the combat rung abandons that
+        // waypoint on purpose to chase an enemy -- so entering a firefight
+        // guarantees "no progress", which fires the nudge, which JUMPS the bot,
+        // which is the worst accuracy state in the game (airborne AK spread is
+        // `0.04 + 0.4*acc` against `0.0275*acc` standing, `wpn_ak47.cpp:75-86`).
+        // It also swings the view up to 60 degrees off the target. Entirely
+        // self-inflicted, and invisible until the bots started shooting at each
+        // other.
+        let fighting = self.brain.as_ref().is_some_and(|b| b.rung == "combat");
+        if fighting {
+            self.follower.hold();
+        } else if let Some(u) = self.follower.unstick() {
             if intent.forwardmove != 0.0 || intent.sidemove != 0.0 {
                 intent.sidemove = u.sidemove;
                 intent.jump |= u.jump;
-                intent.view.yaw = bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
+                intent.view.yaw =
+                    bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
             }
         }
         let to_goal = goal
