@@ -68,6 +68,17 @@ pub struct Session {
     /// Local game files, for the exact-file consistency demands that cannot be
     /// answered from the wire alone. `None` when we have no content.
     pub content: Option<crate::content::GameContent>,
+    /// Paces the outgoing command stream against the wall clock.
+    pub clock: crate::clock::MoveClock,
+    /// Our own player state as of the last server datagram: position,
+    /// velocity, health, weapons. This is the objective test of whether our
+    /// movement commands are being applied.
+    pub clientdata: Option<crate::world::ClientData>,
+    /// Newest server frame we have fully decoded, and may therefore advertise
+    /// in `clc_delta`. `None` until the entity decoder exists — advertising a
+    /// frame we never parsed makes the server delta against a world we do not
+    /// have.
+    pub last_valid_frame: Option<u32>,
 }
 
 /// Counters for the receive pipeline, so a stall can be attributed to the
@@ -100,6 +111,9 @@ impl Session {
             recorded: Vec::new(),
             resource_message: None,
             content: crate::content::GameContent::discover(),
+            clock: crate::clock::MoveClock::new(Instant::now()),
+            clientdata: None,
+            last_valid_frame: None,
         }
     }
 
@@ -121,9 +135,35 @@ impl Session {
                 self.resource_message = Some(rm);
             }
         }
+        // `SV_WriteSpawn` sets `connecttime = realtime` and `cmdtime = 0`
+        // together and then emits `svc_signonnum 1` as the last thing in the
+        // same burst (`sv_main.cpp:1471-1479`). That is the exact moment the
+        // server's move-time accounting restarts, so ours must too -- otherwise
+        // every millisecond we claimed during the signon counts against us.
+        if Self::has_spawn_tail(msg) {
+            self.clock.reset(Instant::now());
+        }
+        // Our own authoritative position/health, straight from the server.
+        if let Some(reg) = self.signon.as_ref().map(|s| &s.registry) {
+            if let Some(cd) = crate::world::parse_datagram(msg, reg) {
+                self.clientdata = Some(cd);
+            }
+        }
         if self.record_all {
             self.recorded.push(msg.to_vec());
         }
+    }
+
+    /// The five bytes `SV_WriteSpawn` + `SV_WriteVoiceCodec` always end on.
+    ///
+    /// `svc_signonnum 1`, then `svc_voiceinit` with an empty codec string and a
+    /// zero quality byte (`sv_main.cpp:5817-5822`) -- three fixed bytes, so the
+    /// reassembled spawn response ends on this exact sequence.
+    pub const SPAWN_TAIL: [u8; 5] = [crate::svc::SVC_SIGNONNUM, 1, crate::svc::SVC_VOICEINIT, 0, 0];
+
+    fn has_spawn_tail(msg: &[u8]) -> bool {
+        let from = msg.len().saturating_sub(16);
+        msg[from..].windows(5).any(|w| w == Self::SPAWN_TAIL)
     }
 
     /// Feed one raw datagram through the whole receive pipeline, returning any
@@ -677,6 +717,11 @@ impl Session {
     /// `specmode` 3.43 s, `VModEnable` 3.58 s — roughly 150 ms apart.
     pub const JOIN_STEP: Duration = Duration::from_millis(200);
 
+    /// How long to wait for a spawn before re-sending the join pair. The
+    /// server only advances the join state inside its own `PlayerThink`, so
+    /// this has to cover several server frames, not just a round trip.
+    pub const JOIN_RETRY: Duration = Duration::from_millis(1200);
+
     /// Walk the join sequence with a real client's spacing, pumping between
     /// each step so the server can drain what the previous one produced.
     ///
@@ -701,6 +746,88 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Team slots for `jointeam` (`regamedll/dlls/client.h:32-42`).
+    pub const TEAM_TERRORIST: u8 = 1;
+    pub const TEAM_CT: u8 = 2;
+    pub const TEAM_RANDOM: u8 = 5;
+
+    /// Any class slot outside `1..CS_NUM_SKIN` is silently randomised
+    /// (`client.cpp:1672-1675`), so this can never be refused for being wrong.
+    pub const CLASS_ANY: u8 = 6;
+
+    /// Join a team and keep at it until the server actually spawns us.
+    ///
+    /// **Why this retries rather than firing once on a timer.** The join is a
+    /// three-way handshake against a state machine we cannot observe directly:
+    ///
+    /// * `jointeam` succeeds and sets `m_iMenu = Menu_ChooseAppearance`
+    ///   (`client.cpp:3422`);
+    /// * `joinclass` is refused outright unless `m_iMenu` is exactly that
+    ///   (`client.cpp:3436-3441`);
+    /// * and `HandleMenu_ChooseAppearance` only advances the join state when
+    ///   `m_iJoiningState == PICKINGTEAM` (`client.cpp:1775-1793`) — for any
+    ///   other value it falls through the `switch` doing nothing but resetting
+    ///   the menu.
+    ///
+    /// That last one is the trap. `SHOWTEAMSELECT -> PICKINGTEAM` happens on
+    /// the server's own schedule, inside `PlayerThink`. Fire `joinclass` on a
+    /// fixed delay and it can land while the state is still `SHOWTEAMSELECT`:
+    /// both commands are *accepted*, the team is really assigned — `TeamInfo`
+    /// comes back saying TERRORIST — and yet the player never enters the game.
+    /// The symptom is a bot that looks connected and healthy while its origin
+    /// teleports between spawn points every 6 seconds with zero velocity and
+    /// `maxspeed 1`: that is `JoiningThink`'s intro camera, not a player.
+    ///
+    /// So: send the pair, watch for a real spawn, and if it does not come,
+    /// send it again. Repeating is safe — after `HandleMenu_ChooseAppearance`
+    /// runs, `ResetMenu()` leaves `m_iMenu` at `Menu_OFF`, so the next
+    /// `jointeam` is accepted rather than refused with `#Command_Not_Available`.
+    ///
+    /// Returns whether we are in the game.
+    pub fn join_and_spawn<T: Transport>(
+        &mut self,
+        t: &mut T,
+        team: u8,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut attempt = 0u32;
+
+        while Instant::now() < deadline {
+            if self.in_game() {
+                return Ok(true);
+            }
+            attempt += 1;
+            self.send_command(&format!("jointeam {team}"));
+
+            // Let `jointeam` be processed before `joinclass`, which is refused
+            // unless the first one has already moved `m_iMenu`.
+            let step = Instant::now() + Self::JOIN_STEP;
+            while Instant::now() < step {
+                self.pump(t, &[netchan::clc::NOP])?;
+            }
+            self.send_command(&format!("joinclass {}", Self::CLASS_ANY));
+
+            // Give the server a couple of think ticks to actually spawn us
+            // before deciding this attempt failed.
+            let settle = Instant::now() + Self::JOIN_RETRY;
+            while Instant::now() < settle && Instant::now() < deadline {
+                self.pump(t, &[netchan::clc::NOP])?;
+                if self.in_game() {
+                    return Ok(true);
+                }
+            }
+            let _ = attempt;
+        }
+        Ok(self.in_game())
+    }
+
+    /// Has the server spawned us as a live player, rather than parked us in the
+    /// joining camera?
+    pub fn in_game(&self) -> bool {
+        self.clientdata.as_ref().is_some_and(|c| c.in_game())
     }
 
     /// Queue a `clc_stringcmd` (e.g. `sendents`, `jointeam`).
@@ -797,12 +924,75 @@ impl Session {
     /// be assembled here, where that sequence is known.
     ///
     /// `msec` is the tick length in milliseconds.
+    ///
+    /// Prefer [`frame`](Self::frame): passing a fixed `msec` from a loop that
+    /// runs faster than real time is what got every movement command silently
+    /// discarded (see [`crate::clock`]).
     pub fn tick<T: Transport>(
         &mut self,
         t: &mut T,
         intent: &bot::Intent,
         msec: u8,
     ) -> io::Result<Vec<Vec<u8>>> {
+        let body = self.build_move_body(&[msec], intent);
+        self.pump(t, &body)
+    }
+
+    /// One real-time in-game frame: block until something arrives or the next
+    /// command is due, drain everything, then send at most one packet.
+    ///
+    /// This is the loop a playing client actually runs. Three properties
+    /// matter, and all three were previously wrong:
+    ///
+    /// * **The `msec` we claim tracks the wall clock**, via [`MoveClock`], so
+    ///   ReHLDS's speedhack accounting stays at a ratio of ~1.0.
+    /// * **We block rather than spin.** The old loop polled a 5 ms socket
+    ///   timeout and emitted ~200 packets/s.
+    /// * **We drain fully before sending.** The server only releases its
+    ///   reliable buffer once our echoed acknowledgement catches up, so one
+    ///   packet carrying the freshest ack beats many carrying stale ones.
+    pub fn frame<T: Transport>(
+        &mut self,
+        t: &mut T,
+        intent: &bot::Intent,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut drained = 0usize;
+        while let Some(d) = t.recv()? {
+            out.extend(self.ingest(&d));
+            drained += 1;
+            if drained >= Self::MAX_DRAIN {
+                break;
+            }
+        }
+
+        // Wait out the rest of the tick, waking early if the server speaks.
+        let now = Instant::now();
+        if self.clock.debt_ms(now) < 1 {
+            if let Some(d) = t.recv_timeout(self.clock.next_due(now))? {
+                out.extend(self.ingest(&d));
+            }
+        }
+        for msg in &out {
+            self.echo_stufftexts(msg);
+        }
+
+        let msecs = self.clock.due(Instant::now());
+        let body = if msecs.is_empty() {
+            vec![netchan::clc::NOP]
+        } else {
+            self.build_move_body(&msecs, intent)
+        };
+        let pkt = self.chan.transmit(&body);
+        t.send(&pkt)?;
+        Ok(out)
+    }
+
+    /// The `clc_move` (+ `clc_delta`) body for a batch of commands.
+    ///
+    /// `msecs` is oldest-first, matching both `build_move_payload`'s write order
+    /// and the server's reversed read (`sv_user.cpp:1638-1641`).
+    fn build_move_body(&mut self, msecs: &[u8], intent: &bot::Intent) -> Vec<u8> {
         let Some(table) = self
             .signon
             .as_ref()
@@ -810,25 +1000,40 @@ impl Session {
             .cloned()
         else {
             // No table yet: nothing to move with.
-            return self.pump(t, &[netchan::clc::NOP]);
+            return vec![netchan::clc::NOP];
         };
 
-        let cmd = crate::control::intent_to_usercmd(intent, msec);
-        let payload = proto::usercmd::build_move_payload(0, &[cmd], &table);
+        let cmds: Vec<_> = msecs
+            .iter()
+            .map(|&m| crate::control::intent_to_usercmd(intent, m))
+            .collect();
+        let payload = proto::usercmd::build_move_payload(self.packet_loss(), &cmds, &table);
         // The move payload is keyed on the sequence this packet will carry.
         let seq = self.chan.outgoing_sequence as i32;
         let mut msg = proto::usercmd::build_clc_move(&payload, seq);
 
-        // A real client follows every `clc_move` with `clc_delta <frame>` in
-        // the *same* packet (verified in the captured client stream: opcode 4
-        // plus one byte). That byte tells the server which frame we have
-        // acknowledged, which is what lets it retire old frames and delta
-        // against ours. Without it the server can never discard anything it
-        // has sent us.
-        msg.push(netchan::clc::DELTA);
-        msg.push((self.chan.incoming_sequence & 0xFF) as u8);
+        // `clc_delta <frame>` tells the server which frame we have successfully
+        // decoded, so it can delta against it instead of sending a full update.
+        //
+        // We may only claim a frame we really parsed. Until the entity decoder
+        // lands there is no such frame, so we say nothing -- `delta_sequence`
+        // is reset to -1 at the top of every `SV_ExecuteClientMessage`
+        // (`sv_user.cpp:1866`) and `SV_EmitPacketEntities` then sends a FULL
+        // `svc_packetentities` (`sv_main.cpp:4727`), which is the only thing we
+        // can currently read. Claiming a frame we never decoded made the server
+        // delta against a world we did not have.
+        if let Some(seq) = self.last_valid_frame {
+            msg.push(netchan::clc::DELTA);
+            msg.push((seq & 0xFF) as u8);
+        }
+        msg
+    }
 
-        self.pump(t, &msg)
+    /// Outgoing packet-loss percentage, bits 0-6 of the `clc_move` loss byte.
+    fn packet_loss(&self) -> u8 {
+        let lost = self.chan.lost_packets;
+        let total = self.chan.incoming_sequence.max(1);
+        ((lost.saturating_mul(100) / total).min(100)) as u8
     }
 }
 

@@ -168,11 +168,12 @@ fn main() {
         while Instant::now() < settle {
             let _ = session.pump(&mut t, &[netchan::clc::NOP]);
         }
-        eprintln!("  joining team (paced like a real client)");
-        if let Err(e) = session.join_team(&mut t, 1, 1) {
-            eprintln!("  join error: {e}");
+        eprintln!("  joining team, retrying until the server actually spawns us");
+        match session.join_and_spawn(&mut t, Session::TEAM_TERRORIST, Duration::from_secs(15)) {
+            Ok(true) => eprintln!("  *** SPAWNED AS A LIVE PLAYER ***"),
+            Ok(false) => eprintln!("  !!! never spawned -- still in the joining state"),
+            Err(e) => eprintln!("  join error: {e}"),
         }
-        session.send_command("say BOTPROBE123");
     }
 
     let mut f = File::create(&out_path).expect("create output");
@@ -183,17 +184,67 @@ fn main() {
 
     let mut settled_logged = false;
     let start = Instant::now();
-    let intent = bot::Intent::default();
+    // Walk a square, turning every 3 s. Movement has to be *observable* to be
+    // verifiable, and `svc_clientdata` gives us the server's own opinion of
+    // where we ended up -- which is the only opinion that counts.
+    let mut first_origin: Option<[f32; 3]> = None;
+    let mut max_travel = 0.0f32;
+    let mut max_speed = 0.0f32;
+    let mut last_state = Instant::now();
     while Instant::now() < deadline {
         // Pump continuously: every pump both consumes what arrived and sends
         // our acknowledgement, which is what keeps the server's reliable
         // buffer draining.
         // Send a real clc_move every tick, exactly as a playing client does.
+        let secs = start.elapsed().as_secs_f32();
+        let intent = bot::Intent {
+            view: bot::Angles {
+                pitch: 0.0,
+                // A slow constant yaw sweep also satisfies ReGameDLL's
+                // anti-idle check, which needs BOTH yaw and pitch to move by
+                // >= 0.1 degrees across a 5 s sample (CSPlayer.cpp:530-540).
+                yaw: (secs * 24.0) % 360.0,
+                },
+            forwardmove: 250.0,
+            ..Default::default()
+        };
         let step = if env::var("AIPLAYERS_NO_MOVES").is_ok() {
             session.pump(&mut t, &[netchan::clc::NOP])
         } else {
-            session.tick(&mut t, &intent, 20)
+            // Real-time paced: `frame` blocks until the next command is due, so
+            // the msec we claim tracks the wall clock. Sending a fixed msec from
+            // a tight loop is what got every movement command discarded by
+            // ReHLDS's speedhack accounting.
+            session.frame(&mut t, &intent)
         };
+        if let Some(cd) = session.clientdata.as_ref() {
+            let o = cd.origin();
+            let base = *first_origin.get_or_insert(o);
+            let d = ((o[0] - base[0]).powi(2) + (o[1] - base[1]).powi(2)).sqrt();
+            max_travel = max_travel.max(d);
+            max_speed = max_speed.max(cd.speed());
+            if last_state.elapsed() >= Duration::from_secs(2) {
+                eprintln!(
+                    "  t+{:>4.0}s origin [{:>6.0} {:>6.0} {:>5.0}] vel {:>5.0} hp {:>3.0} \
+                     maxspeed {:>4.0} alive {} weapons {}",
+                    secs,
+                    o[0],
+                    o[1],
+                    o[2],
+                    cd.speed(),
+                    cd.health(),
+                    cd.maxspeed(),
+                    cd.alive(),
+                    cd.weapons.len(),
+                );
+                if std::env::var("AIPLAYERS_FIELDS").is_ok() {
+                    let mut k: Vec<&str> = cd.fields.keys().map(|s| s.as_str()).collect();
+                    k.sort_unstable();
+                    eprintln!("      fields({}): {}", k.len(), k.join(" "));
+                }
+                last_state = Instant::now();
+            }
+        }
         match step {
             Ok(msgs) => {
                 for msg in msgs {
@@ -310,6 +361,24 @@ fn main() {
         eprintln!("   STUFFTEXT {t:?}");
     }
 
+    // The verdict. `svc_clientdata` is the server's own account of where we
+    // are, so this is not our client marking its own homework.
+    match session.clientdata.as_ref() {
+        Some(cd) => {
+            let o = cd.origin();
+            eprintln!(
+                "  SERVER-SIDE STATE: origin [{:.0} {:.0} {:.0}] health {:.0} maxspeed {:.0} alive {}",
+                o[0], o[1], o[2], cd.health(), cd.maxspeed(), cd.alive()
+            );
+            eprintln!(
+                "  MOVEMENT: travelled {max_travel:.0} units, peak speed {max_speed:.0} u/s"
+            );
+            if max_travel < 32.0 {
+                eprintln!("  !!! the bot did not move -- commands are being discarded or it is dead");
+            }
+        }
+        None => eprintln!("  !!! no svc_clientdata decoded -- not receiving datagrams"),
+    }
     eprintln!(
         "wrote {records} message records, {bytes} bytes to {out_path} \
          (reliables settled: {})",

@@ -8,6 +8,8 @@
 //! (`internal/client/client.go:30`): `disconnected`, `challenging`,
 //! `connecting`, `connected`, `running`.
 
+pub mod world;
+pub mod clock;
 pub mod content;
 pub mod control;
 pub mod messages;
@@ -72,6 +74,16 @@ pub trait Transport {
     fn send(&mut self, data: &[u8]) -> io::Result<()>;
     /// Non-blocking receive; `Ok(None)` means nothing was waiting.
     fn recv(&mut self) -> io::Result<Option<Vec<u8>>>;
+
+    /// Block for up to `d` waiting for a datagram.
+    ///
+    /// This is what lets the send loop be paced by the clock instead of by a
+    /// spin: wait until the next command is actually due, and wake early if the
+    /// server says something in the meantime. The default is the non-blocking
+    /// `recv` so in-memory test transports need not implement it.
+    fn recv_timeout(&mut self, _d: Duration) -> io::Result<Option<Vec<u8>>> {
+        self.recv()
+    }
 }
 
 /// A real UDP transport.
@@ -84,15 +96,18 @@ impl UdpTransport {
         let bind = bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
         let sock = UdpSocket::bind(bind)?;
         sock.connect(server)?;
-        // Short, so the send loop spins fast enough to match a real client.
-        // Measured on the wire: a real CS 1.6 client transmits ~51 packets/s,
-        // about two for every server packet; a 50 ms timeout capped us at ~20/s
-        // when idle, which starves the server's reliable drain (it clears one
-        // reliable per acknowledged round trip).
-        sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+        // A short default so callers that only ever use the non-blocking
+        // `recv()` still make progress. The in-game loop should use
+        // `recv_timeout` and let `MoveClock` decide how long to wait -- spinning
+        // on a tiny timeout is what produced ~200 packets/s and got every
+        // movement command discarded as a speedhack.
+        sock.set_read_timeout(Some(POLL_TIMEOUT))?;
         Ok(Self { sock })
     }
 }
+
+/// Default socket read timeout for the non-blocking `recv()` path.
+const POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
 impl Transport for UdpTransport {
     fn send(&mut self, data: &[u8]) -> io::Result<()> {
@@ -106,14 +121,39 @@ impl Transport for UdpTransport {
                 buf.truncate(n);
                 Ok(Some(buf))
             }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                Ok(None)
-            }
+            Err(e) if Self::is_empty_mailbox(&e) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    fn recv_timeout(&mut self, d: Duration) -> io::Result<Option<Vec<u8>>> {
+        // Windows treats a zero SO_RCVTIMEO as "block forever", and Rust
+        // rejects Duration::ZERO outright, so clamp. The upper bound keeps a
+        // wedged socket from parking the whole session.
+        let d = d.clamp(Duration::from_millis(1), Duration::from_millis(250));
+        self.sock.set_read_timeout(Some(d))?;
+        let out = self.recv();
+        self.sock.set_read_timeout(Some(POLL_TIMEOUT))?;
+        out
+    }
+}
+
+impl UdpTransport {
+    /// Distinguishes "nothing arrived" from a genuine socket failure.
+    ///
+    /// Windows adds two cases a plain WouldBlock/TimedOut check misses, and
+    /// both showed up in live runs as a spurious `pump error`:
+    ///
+    /// * **997, `ERROR_IO_PENDING`** — surfaced when the read timeout is very
+    ///   short, which the old 5 ms spin hit routinely.
+    /// * **10054, `WSAECONNRESET`** — on a *connected* UDP socket Windows
+    ///   reports an ICMP port-unreachable from a previous send as an error on
+    ///   the next receive. It says nothing about the current datagram.
+    fn is_empty_mailbox(e: &io::Error) -> bool {
+        matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset
+        ) || matches!(e.raw_os_error(), Some(997) | Some(10054) | Some(10035))
     }
 }
 
