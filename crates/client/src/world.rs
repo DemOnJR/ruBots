@@ -231,6 +231,451 @@ pub fn parse_datagram(msg: &[u8], registry: &DeltaRegistry) -> Option<ClientData
     Some(out)
 }
 
+/// `MSG_ReadBitCoord` — `common.cpp:820-869`.
+///
+/// `[int present][frac present]`, then a sign bit if either is, then a 12-bit
+/// integer part and a 3-bit eighths part as declared.
+fn read_bit_coord(r: &mut proto::bitbuf::BitReader<'_>) -> f32 {
+    let has_int = r.read_bits(1) != 0;
+    let has_frac = r.read_bits(1) != 0;
+    if !has_int && !has_frac {
+        return 0.0;
+    }
+    let sign = r.read_bits(1) != 0;
+    let int = if has_int { r.read_bits(12) } else { 0 };
+    let frac = if has_frac { r.read_bits(3) } else { 0 };
+    let v = int as f32 + frac as f32 / 8.0;
+    if sign {
+        -v
+    } else {
+        v
+    }
+}
+
+/// `MSG_ReadBitVec3Coord` — three presence bits, then the present coordinates.
+fn read_bit_vec3_coord(r: &mut proto::bitbuf::BitReader<'_>) -> [f32; 3] {
+    let flags = [r.read_bits(1) != 0, r.read_bits(1) != 0, r.read_bits(1) != 0];
+    let mut out = [0.0f32; 3];
+    for (i, present) in flags.iter().enumerate() {
+        if *present {
+            out[i] = read_bit_coord(r);
+        }
+    }
+    out
+}
+
+/// Bytes a bit block occupies, given the reader that consumed it.
+///
+/// GoldSrc bit blocks are byte-framed: `MSG_EndBitReading` advances the byte
+/// cursor by `ceil(bits/8)`, minimum one, and the caller resumes aligned
+/// (`common.cpp:628-656`). Getting this off by one byte silently reinterprets
+/// the rest of the datagram.
+fn block_bytes(r: &proto::bitbuf::BitReader<'_>) -> usize {
+    (r.byte_pos() + usize::from(r.bit_offset() > 0)).max(1)
+}
+
+/// Everything we know about the world, rebuilt from the server's stream.
+///
+/// This is the piece that turns a connected socket into a player: the entity
+/// block is the only place enemy positions exist, and `svc_clientdata` is the
+/// only authoritative account of our own.
+pub struct Decoder {
+    pub registry: proto::delta::DeltaRegistry,
+    pub maxclients: u8,
+    /// Our own player slot, from `svc_serverinfo`. Our entity number is
+    /// `my_slot + 1` (`SV_IsPlayerIndex` counts from 1).
+    pub my_slot: u8,
+    pub baselines: proto::entity::Baselines,
+    /// Last `svc_time`; the timebase for `DT_TIMEWINDOW_*` fields.
+    pub time: f32,
+    pub clientdata: Option<ClientData>,
+    /// The most recent entity frame, ascending by entity number.
+    pub entities: Vec<proto::entity::EntityState>,
+    pub game: crate::usermsg::GameState,
+    pub user_table: crate::stream::UserMsgTable,
+    pub stats: DecodeStats,
+}
+
+/// Why a datagram did or did not decode. Kept because "the bot cannot see
+/// anyone" has several very different causes and they must not be confused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeStats {
+    /// Datagrams that decoded end to end.
+    pub ok: u32,
+    /// Datagrams carrying an entity block.
+    pub with_entities: u32,
+    /// Datagrams beginning with `svc_time` whose clientdata block did not
+    /// parse, so nothing after it could be located either.
+    pub no_clientdata: u32,
+    /// Message tails we could not finish walking, and the opcode that stopped
+    /// us. Distinct from `no_clientdata`: this one means we decoded the frame
+    /// but may have missed trailing user messages.
+    pub partial: u32,
+    pub last_stop: Option<u8>,
+    /// Entity blocks that failed to parse. Non-zero here means the world model
+    /// is wrong, not merely incomplete.
+    pub entity_errors: u32,
+    /// `svc_deltapacketentities` seen. We never advertise a frame via
+    /// `clc_delta`, so the server should never send one; if it does, our
+    /// `last_valid_frame` bookkeeping is lying somewhere.
+    pub unexpected_delta_frames: u32,
+}
+
+impl Decoder {
+    pub fn new(signon: &crate::signon::Signon, user_table: crate::stream::UserMsgTable) -> Self {
+        let (maxclients, my_slot) = signon
+            .server_info
+            .as_ref()
+            .map(|si| (si.max_players, si.player_index))
+            .unwrap_or((32, 0));
+        Self {
+            registry: signon.registry.clone(),
+            maxclients,
+            my_slot,
+            baselines: proto::entity::Baselines::default(),
+            time: 0.0,
+            clientdata: None,
+            entities: Vec::new(),
+            game: crate::usermsg::GameState::default(),
+            user_table,
+            stats: DecodeStats::default(),
+        }
+    }
+
+    /// Our own entity number.
+    pub fn my_entity(&self) -> u16 {
+        u16::from(self.my_slot) + 1
+    }
+
+    /// Pull `svc_spawnbaseline` out of the post-`spawn` signon blob.
+    ///
+    /// Without this every new entity is deltaed against a zeroed state rather
+    /// than its baseline, so most fields read as zero and players appear at the
+    /// map origin. Returns whether a baseline block was found.
+    ///
+    /// The opcode is located by scan, so a stray byte 22 in some payload will
+    /// land here -- which is why the parse result is checked rather than
+    /// trusted, and why an empty result is treated as "not found".
+    fn absorb_baselines(&mut self, msg: &[u8]) -> bool {
+        let Some(pos) = msg.iter().position(|&b| b == svc::SVC_SPAWNBASELINE) else {
+            return false;
+        };
+        let mut r = proto::bitbuf::BitReader::new(&msg[pos + 1..]);
+        match proto::entity::parse_spawn_baseline(&mut r, &self.registry, self.maxclients) {
+            Ok(b) if !b.by_number.is_empty() => {
+                self.baselines = b;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take in one fully-assembled `svc_*` stream.
+    ///
+    /// Single pass, driven by the byte walker: it steps over everything it can
+    /// and hands us each message it cannot, which we then parse or skip, and
+    /// then it resumes. Nothing is assumed about where in the message anything
+    /// sits.
+    ///
+    /// That last point is the whole reason for this shape. A netchannel packet
+    /// is `[reliable messages][unreliable datagram]`, so on any packet carrying
+    /// reliable data the datagram does **not** start at byte 0 and
+    /// `msg[0] == svc_time` is false. Dispatching on the first byte silently
+    /// skipped the entity block of every such packet -- about 7% of them, and
+    /// exactly the ones carrying the most interesting reliable traffic.
+    pub fn feed(&mut self, msg: &[u8]) {
+        if self.absorb_baselines(msg) {
+            return;
+        }
+        let mut at = 0usize;
+        let mut saw_entities = false;
+        let mut decoded = false;
+
+        loop {
+            let w = crate::stream::walk(&msg[at..], &self.user_table);
+            for item in &w.items {
+                match item {
+                    crate::stream::Item::User { name, payload, .. } => {
+                        self.game.apply(name, payload);
+                    }
+                    crate::stream::Item::Engine { id, payload } if *id == svc::SVC_TIME => {
+                        if let Ok(b) = <[u8; 4]>::try_from(payload.as_slice()) {
+                            self.time = f32::from_le_bytes(b);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(op) = w.stopped_on else {
+                break;
+            };
+            let stop = at + w.stopped_at;
+
+            let next = match op {
+                svc::SVC_CLIENTDATA => {
+                    match self.read_clientdata(msg, stop) {
+                        Some(end) => {
+                            decoded = true;
+                            Some(end)
+                        }
+                        None => None,
+                    }
+                }
+                svc::SVC_PACKETENTITIES => match self.read_entities(msg, stop) {
+                    Some(end) => {
+                        saw_entities = true;
+                        Some(end)
+                    }
+                    None => None,
+                },
+                svc::SVC_DELTAPACKETENTITIES => {
+                    // We never advertise a frame via clc_delta, so the server
+                    // has no basis to delta against one. Refuse rather than
+                    // decode against a frame we do not have.
+                    self.stats.unexpected_delta_frames += 1;
+                    None
+                }
+                _ => self.skip_bit_packed(msg, stop),
+            };
+
+            match next {
+                Some(n) if n > stop => at = n,
+                _ => {
+                    self.stats.partial += 1;
+                    self.stats.last_stop = Some(op);
+                    break;
+                }
+            }
+            if at >= msg.len() {
+                break;
+            }
+        }
+
+        if decoded {
+            self.stats.ok += 1;
+        }
+        if saw_entities {
+            self.stats.with_entities += 1;
+        }
+    }
+
+    /// Parse the `svc_clientdata` bit block at `at`, returning the offset just
+    /// past it.
+    fn read_clientdata(&mut self, msg: &[u8], at: usize) -> Option<usize> {
+        let body = at + 1;
+        let cd = self.registry.get("clientdata_t")?;
+        let mut r = proto::bitbuf::BitReader::new(msg.get(body..)?);
+
+        // We advertise no frame, so the server cannot be delta-compressing
+        // this. If it ever is we cannot reconstruct the base, and returning
+        // plausible-looking numbers would be worse than returning none.
+        if r.read_bits(1) != 0 {
+            self.stats.no_clientdata += 1;
+            return None;
+        }
+        let mut out = ClientData {
+            time: self.time,
+            fields: proto::delta::parse_delta(&mut r, cd),
+            ..Default::default()
+        };
+        if let Some(wd) = self.registry.get("weapon_data_t") {
+            let mut guard = 0;
+            while r.read_bits(1) != 0 {
+                let slot = r.read_bits(6) as u8;
+                let f = proto::delta::parse_delta(&mut r, wd);
+                out.weapons.insert(slot, f);
+                guard += 1;
+                if guard > 64 || r.overflowed() {
+                    break;
+                }
+            }
+        }
+        if r.overflowed() {
+            self.stats.no_clientdata += 1;
+            return None;
+        }
+        self.clientdata = Some(out);
+        Some(body + block_bytes(&r))
+    }
+
+    /// Parse a full `svc_packetentities` at `at`, returning the offset just
+    /// past it.
+    fn read_entities(&mut self, msg: &[u8], at: usize) -> Option<usize> {
+        if msg.len() < at + 3 {
+            return None;
+        }
+        let count = u16::from_le_bytes([msg[at + 1], msg[at + 2]]);
+        let body = at + 3;
+        let mut r = proto::bitbuf::BitReader::new(&msg[body..]);
+        let ctx = proto::entity::PacketCtx {
+            registry: &self.registry,
+            baselines: &self.baselines.by_number,
+            instanced: &self.baselines.instanced,
+            maxclients: self.maxclients,
+        };
+        match proto::entity::parse_packet_entities_full_checked(&mut r, &ctx, usize::from(count)) {
+            Ok(ents) => {
+                self.entities = ents;
+                Some(body + block_bytes(&r))
+            }
+            Err(_) => {
+                self.stats.entity_errors += 1;
+                None
+            }
+        }
+    }
+
+    /// Step over one bit-packed engine message starting at `at`, returning the
+    /// offset just past it.
+    fn skip_bit_packed(&self, msg: &[u8], at: usize) -> Option<usize> {
+        let id = *msg.get(at)?;
+        let body = at + 1;
+        let mut r = proto::bitbuf::BitReader::new(msg.get(body..)?);
+        match id {
+            // `SV_EmitEvents_internal`, sv_main.cpp:4125-4265.
+            svc::SVC_EVENT => {
+                let count = r.read_bits(5);
+                for _ in 0..count {
+                    r.skip(10); // event index
+                    if r.read_bits(1) != 0 {
+                        r.skip(11); // packet (entity) index
+                        if r.read_bits(1) != 0 {
+                            let t = self.registry.get("event_t")?;
+                            proto::delta::parse_delta(&mut r, t);
+                        }
+                    }
+                    if r.read_bits(1) != 0 {
+                        r.skip(16); // fire time
+                    }
+                }
+            }
+            // A single event, no count prefix.
+            svc::SVC_EVENT_RELIABLE => {
+                r.skip(10);
+                let t = self.registry.get("event_t")?;
+                proto::delta::parse_delta(&mut r, t);
+                if r.read_bits(1) != 0 {
+                    r.skip(16);
+                }
+            }
+            // `SV_EmitPings_internal`, sv_main.cpp:4834-4856.
+            svc::SVC_PINGS => {
+                let mut guard = 0;
+                while r.read_bits(1) != 0 {
+                    r.skip(5 + 12 + 7); // slot, ping, loss
+                    guard += 1;
+                    if guard > 64 || r.overflowed() {
+                        return None;
+                    }
+                }
+            }
+            // `SV_BuildSoundMsg`, sv_main.cpp:786-799. Worth stepping over
+            // properly rather than abandoning the datagram: gunfire is a
+            // genuine perception cue we will want later.
+            svc::SVC_SOUND => {
+                let mask = r.read_bits(9);
+                if mask & 0x01 != 0 {
+                    r.skip(8); // volume
+                }
+                if mask & 0x02 != 0 {
+                    r.skip(8); // attenuation
+                }
+                r.skip(3); // channel
+                r.skip(11); // entity index
+                r.skip(if mask & 0x04 != 0 { 16 } else { 8 }); // sound number
+                read_bit_vec3_coord(&mut r);
+                if mask & 0x08 != 0 {
+                    r.skip(8); // pitch
+                }
+            }
+            _ => return None,
+        }
+        if r.overflowed() {
+            return None;
+        }
+        Some(body + block_bytes(&r))
+    }
+
+    /// Other players, as the bot sees them.
+    pub fn players(&self) -> Vec<PlayerView> {
+        let me = self.my_entity();
+        self.entities
+            .iter()
+            .filter(|e| {
+                e.number >= 1 && e.number <= u16::from(self.maxclients) && e.number != me
+            })
+            .map(|e| PlayerView {
+                entity: e.number,
+                origin: e.origin(),
+                angles: e.angles(),
+                team: self
+                    .game
+                    .player(e.number as u8)
+                    .map(|p| p.team)
+                    .unwrap_or_default(),
+                // `usehull` is 1 while ducking (`delta.lst:171`), which moves
+                // the head down by half a body -- it matters for aim.
+                ducking: e.i64("usehull") == 1,
+            })
+            .collect()
+    }
+}
+
+/// One other player, projected out of the entity frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerView {
+    pub entity: u16,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    pub team: crate::usermsg::Team,
+    pub ducking: bool,
+}
+
+/// Offset of whatever follows `svc_clientdata` in a running datagram.
+///
+/// Split out from [`parse_datagram`] so both agree on the framing by
+/// construction rather than by two people reading the same source twice.
+fn datagram_entity_offset(msg: &[u8], registry: &proto::delta::DeltaRegistry) -> Option<usize> {
+    if msg.first() != Some(&svc::SVC_TIME) || msg.len() < 5 {
+        return None;
+    }
+    let mut at = 5usize;
+    loop {
+        match msg.get(at) {
+            Some(&svc::SVC_CHOKE) => at += 1,
+            Some(&svc::SVC_SETANGLE) => at += 7,
+            Some(&svc::SVC_ADDANGLE) => at += 3,
+            _ => break,
+        }
+    }
+    if msg.get(at) != Some(&svc::SVC_CLIENTDATA) {
+        return None;
+    }
+    at += 1;
+
+    let cd = registry.get("clientdata_t")?;
+    let mut r = proto::bitbuf::BitReader::new(&msg[at..]);
+    if r.read_bits(1) != 0 {
+        return None;
+    }
+    proto::delta::parse_delta(&mut r, cd);
+    if let Some(wd) = registry.get("weapon_data_t") {
+        let mut guard = 0;
+        while r.read_bits(1) != 0 {
+            r.read_bits(6);
+            proto::delta::parse_delta(&mut r, wd);
+            guard += 1;
+            if guard > 64 || r.overflowed() {
+                break;
+            }
+        }
+    }
+    if r.overflowed() {
+        return None;
+    }
+    Some(at + block_bytes(&r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -57,7 +57,15 @@ fn main() {
     let mut t = Logged { inner, log: File::create(&sent_path).expect("sent log") };
     eprintln!("logging our outgoing packets to {sent_path}");
 
-    let mut session = Session::new(Identity { name: "AIPlayer".into(), ..Default::default() });
+    // Distinct name AND key per bot: Reunion's IDClientsLimit is 1, so two
+    // bots sharing a CD key are one identity and the second is refused.
+    let name = env::var("AIPLAYERS_NAME").unwrap_or_else(|_| "AIPlayer".into());
+    let key = env::var("AIPLAYERS_KEY").unwrap_or_else(|_| "AIPLAYER0000000".into());
+    let mut session = Session::new(Identity {
+        name: name.clone(),
+        key: key.into_bytes(),
+        ..Default::default()
+    });
     session.record_all = true;
     match session.connect_and_signon(&mut t, Duration::from_secs(15)) {
         Ok(signon) => eprintln!(
@@ -142,6 +150,7 @@ fn main() {
             session.spawn_crc(spawncount)
         );
     }
+    session.start_decoding();
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
         Ok(true) => eprintln!("  *** SERVER IS STREAMING - we are fully connected ***"),
@@ -237,6 +246,22 @@ fn main() {
                     cd.alive(),
                     cd.weapons.len(),
                 );
+                if let Some(d) = session.decoder.as_ref() {
+                    let players = d.players();
+                    eprintln!(
+                        "      world: {} entities, {} players | ok={} ents={} nocd={} tail={} errs={} stop={:?}",
+                        d.entities.len(), players.len(),
+                        d.stats.ok, d.stats.with_entities, d.stats.no_clientdata, d.stats.partial,
+                        d.stats.entity_errors, d.stats.last_stop,
+                    );
+                    for p in players.iter().take(4) {
+                        eprintln!(
+                            "        player #{} {:?} at [{:.0} {:.0} {:.0}] yaw {:.0}{}",
+                            p.entity, p.team, p.origin[0], p.origin[1], p.origin[2],
+                            p.angles[1], if p.ducking { " (ducking)" } else { "" },
+                        );
+                    }
+                }
                 if std::env::var("AIPLAYERS_FIELDS").is_ok() {
                     let mut k: Vec<&str> = cd.fields.keys().map(|s| s.as_str()).collect();
                     k.sort_unstable();

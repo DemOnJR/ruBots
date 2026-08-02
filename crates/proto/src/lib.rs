@@ -25,6 +25,7 @@ pub mod connectionless;
 pub mod consistency;
 pub mod crc;
 pub mod delta;
+pub mod entity;
 pub mod munge;
 pub mod resources;
 pub mod usercmd;

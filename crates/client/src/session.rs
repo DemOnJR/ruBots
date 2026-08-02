@@ -74,6 +74,10 @@ pub struct Session {
     /// velocity, health, weapons. This is the objective test of whether our
     /// movement commands are being applied.
     pub clientdata: Option<crate::world::ClientData>,
+    /// The world model: baselines, entities, and accumulated game state.
+    /// Built once the signon has taught us the delta tables and the user
+    /// message table.
+    pub decoder: Option<crate::world::Decoder>,
     /// The last few commands we sent, re-sent as `numbackup` so a lost packet
     /// costs no input. A real client always carries two.
     cmd_history: std::collections::VecDeque<proto::usercmd::UserCmd>,
@@ -116,6 +120,7 @@ impl Session {
             content: crate::content::GameContent::discover(),
             clock: crate::clock::MoveClock::new(Instant::now()),
             clientdata: None,
+            decoder: None,
             cmd_history: std::collections::VecDeque::new(),
             last_valid_frame: None,
         }
@@ -152,6 +157,9 @@ impl Session {
             if let Some(cd) = crate::world::parse_datagram(msg, reg) {
                 self.clientdata = Some(cd);
             }
+        }
+        if let Some(d) = self.decoder.as_mut() {
+            d.feed(msg);
         }
         self.answer_cvar_queries(msg);
         if self.record_all {
@@ -842,6 +850,19 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Start decoding the world.
+    ///
+    /// Deferred rather than done in `new()` because it needs two things only
+    /// the signon can teach us, both per-server: the delta tables, and the
+    /// id-to-name map for user messages. Call once the signon is in.
+    pub fn start_decoding(&mut self) {
+        let Some(signon) = self.signon.as_ref() else {
+            return;
+        };
+        let table = crate::stream::collect_user_messages(&self.recorded);
+        self.decoder = Some(crate::world::Decoder::new(signon, table));
     }
 
     /// How many previously-sent commands ride along in each `clc_move`.
