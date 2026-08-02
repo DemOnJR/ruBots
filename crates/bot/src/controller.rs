@@ -214,13 +214,24 @@ impl Controller {
     /// Punchangle lands on the shot direction twice, and the value we hold is a
     /// round trip stale, so it is decayed forward first. See
     /// [`crate::aim::compensate`].
+    ///
+    /// The anti-idle drift is added **here**, on every path, rather than on the
+    /// rungs that obviously stand still. `CheckActivityInGame` is an `&&` over
+    /// both axes, and a bot walking a route across flat ground sweeps its yaw
+    /// while holding its pitch exactly constant -- which scores as idle for as
+    /// long as the walk lasts. Two rungs used to apply it and four did not, so
+    /// a bot could be kicked, or made to drop the bomb by `afk_bomb_drop_time`
+    /// (`dlls/player.cpp:4787-4792`), in the middle of doing its job.
+    ///
+    /// The drift is a fraction of a degree and moves far slower than the aim
+    /// error already applied above it, so it costs nothing in a fight.
     fn wire_view(&self, world: &WorldView) -> Angles {
         let punch = predict_punch(
             world.me.punchangle,
             world.frametime,
             world.punch_prediction_frames(),
         );
-        compensate(self.view, punch)
+        self.idle.apply(compensate(self.view, punch))
     }
 
     /// Reset everything that describes a life or a specific weapon.
@@ -282,7 +293,7 @@ impl Controller {
         if world.me.freeze_period {
             self.fire.reset();
             self.tracking = None;
-            let view = self.idle.apply(self.wire_view(world));
+            let view = self.wire_view(world);
             let mut intent = Intent::hold(view);
             intent.commands = self.buy_plan(world);
             self.rung = "freeze";
@@ -451,7 +462,7 @@ impl Controller {
         let action = self.fire.decide(&world.me.weapon_or_unknown(), false);
         self.rung = "idle";
         Intent {
-            view: self.idle.apply(self.wire_view(world)),
+            view: self.wire_view(world),
             reload: action.reload,
             ..Intent::default()
         }
@@ -959,6 +970,47 @@ mod tests {
         }
     }
 
+    /// Every outgoing angle must carry the anti-idle drift, not just the ones
+    /// from the rungs that obviously stand still.
+    ///
+    /// `CheckActivityInGame` is an `&&` over both axes
+    /// (`dlls/API/CSPlayer.cpp:539`), and a bot walking a route across flat
+    /// ground sweeps its yaw while holding its pitch exactly constant -- which
+    /// scores as idle for the whole walk. Two rungs applied the drift and four
+    /// did not, so a bot could be dropped for idling, or made to let go of the
+    /// bomb by `afk_bomb_drop_time`, in the middle of doing its job.
+    #[test]
+    fn every_rung_sends_a_view_that_keeps_moving_on_both_axes() {
+        let site: Vec3 = [3000.0, 0.0, 0.0];
+        let world = WorldView {
+            me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+
+        // Sampled the way the server samples: 5 seconds apart.
+        for rung_world in [&world] {
+            let mut c = Controller::new(9, Difficulty::Normal);
+            let a = c.think(rung_world, Some(site), 0.05).view;
+            assert_eq!(c.rung, "goto", "expected the walking rung");
+            for _ in 0..100 {
+                c.think(rung_world, Some(site), 0.05);
+            }
+            let b = c.think(rung_world, Some(site), 0.05).view;
+
+            let dyaw = (a.yaw - b.yaw).abs();
+            let dpitch = (a.pitch - b.pitch).abs();
+            assert!(
+                dyaw >= crate::idle::IDLE_ANGLE_EPSILON,
+                "yaw moved {dyaw} in 5 s, needs {}",
+                crate::idle::IDLE_ANGLE_EPSILON
+            );
+            assert!(
+                dpitch >= crate::idle::IDLE_ANGLE_EPSILON,
+                "pitch moved {dpitch} in 5 s -- an idle-kick on a walking bot",
+            );
+        }
+    }
+
     #[test]
     fn the_sent_angles_are_punch_compensated_but_the_internal_aim_is_not() {
         let mut c = instant(31);
@@ -977,10 +1029,12 @@ mod tests {
             ..Default::default()
         };
         let intent = c.think(&w, None, 0.05);
-        // Sent pitch is the aim plus 2 * 3 degrees of down-correction.
+        // Sent pitch is the aim plus 2 * 3 degrees of down-correction, give or
+        // take the anti-idle drift, which rides on every outgoing angle.
+        let slack = c.idle.max_offset().pitch + 1e-3;
         assert!(
-            (intent.view.pitch - (c.view.pitch + 6.0)).abs() < 1e-3,
-            "sent {} vs internal {}",
+            (intent.view.pitch - (c.view.pitch + 6.0)).abs() <= slack,
+            "sent {} vs internal {} (slack {slack})",
             intent.view.pitch,
             c.view.pitch
         );

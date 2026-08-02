@@ -350,6 +350,9 @@ fn main() {
                         d.stats.ok, d.stats.with_entities, d.stats.no_clientdata, d.stats.partial,
                         d.stats.entity_errors, d.stats.last_stop,
                     );
+                    if let Some(e) = d.stats.last_entity_error {
+                        eprintln!("      entity decode: {e}");
+                    }
                     for p in players.iter().take(4) {
                         eprintln!(
                             "        player #{} {:?} at [{:.0} {:.0} {:.0}] yaw {:.0}{}",

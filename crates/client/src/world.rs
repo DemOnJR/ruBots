@@ -351,6 +351,10 @@ pub struct DecodeStats {
     /// Entity blocks that failed to parse. Non-zero here means the world model
     /// is wrong, not merely incomplete.
     pub entity_errors: u32,
+    /// The most recent entity-decode failure, kept because the count alone
+    /// cannot be acted on. Discarding it once cost a live run: 463 errors and
+    /// nothing to say which of the eight failure modes it was.
+    pub last_entity_error: Option<proto::entity::EntityError>,
     /// `svc_deltapacketentities` seen. We never advertise a frame via
     /// `clc_delta`, so the server should never send one; if it does, our
     /// `last_valid_frame` bookkeeping is lying somewhere.
@@ -561,8 +565,9 @@ impl Decoder {
                 self.entities = ents;
                 Some(body + block_bytes(&r))
             }
-            Err(_) => {
+            Err(e) => {
                 self.stats.entity_errors += 1;
+                self.stats.last_entity_error = Some(e);
                 None
             }
         }

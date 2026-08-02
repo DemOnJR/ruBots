@@ -134,6 +134,18 @@ impl AntiIdle {
     }
 
     /// Apply the drift to an angle.
+    /// The largest offset either ramp can reach, at any phase.
+    ///
+    /// The ramp is centred, so this is half its amplitude. Callers that need to
+    /// reason about the aim exactly -- tests, and anything checking a firing
+    /// cone -- need a bound on how far the drift can move it.
+    pub fn max_offset(&self) -> Angles {
+        Angles {
+            pitch: self.pitch.amplitude / 2.0,
+            yaw: self.yaw.amplitude / 2.0,
+        }
+    }
+
     pub fn apply(&self, base: Angles) -> Angles {
         let o = self.offset();
         Angles {

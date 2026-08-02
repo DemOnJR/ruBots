@@ -398,7 +398,7 @@ impl<'a> PacketCtx<'a> {
 /// Every one of these is a case where the C would have carried on with
 /// whatever bits it happened to find. A wrong entity stream is worse than no
 /// entity stream — the bot would aim at ghosts — so they are returned instead.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntityError {
     /// The reader ran past the end of the block.
     Overflow,
