@@ -48,6 +48,14 @@ pub const ACTION_RADIUS: f32 = 72.0;
 /// Drifting further than this abandons the action.
 pub const ABANDON_RADIUS: f32 = 160.0;
 
+/// How far a terrorist will go out of its way for a dropped bomb.
+///
+/// **Chosen.** It has to be a radius rather than "always", or a whole team
+/// abandons the site for one object the moment its carrier dies. Roughly a
+/// third of the long diagonal of de_dust2, so the two or three players nearest the
+/// body react and the rest keep pushing.
+pub const RETRIEVE_RADIUS: f32 = 1400.0;
+
 /// Seconds the plant animation takes — `C4_ARMING_ON_TIME`,
 /// `dlls/weapons.h:860`. Verified, unlike the radii above.
 pub const PLANT_DURATION: f32 = bomb::C4_ARMING_ON_TIME;
@@ -65,6 +73,8 @@ pub enum Objective {
     MoveToPlant,
     /// Standing on the site, planting.
     Planting,
+    /// Go and pick a dropped bomb up off the ground.
+    RetrieveBomb,
     /// Move to the planted bomb.
     MoveToDefuse,
     /// Standing on the bomb, defusing.
@@ -179,8 +189,35 @@ impl ObjectiveState {
             };
         }
 
-        // Not planted: only the carrier plants.
+        // Not planted, and not ours: it is lying on the ground where its
+        // carrier died. Somebody has to go and get it.
+        //
+        // Without this the round is decided the moment the bomb runner is
+        // killed. Measured over four rounds of a 10v10: four carriers spawned
+        // with the bomb, all four killed about twenty seconds in, zero plants,
+        // every round ending Target_Saved.
+        //
+        // Only terrorists are told about it -- `BombDrop` on a death goes
+        // MSG_ONE to each live terrorist (`dlls/player.cpp:8494-8499`) -- so
+        // this is exactly the team that can act on it, and a CT that somehow
+        // saw the message still has no use for it.
         if !world.bomb.carried_by_me || world.me.team != Team::Terrorist {
+            let retrieving = world.me.team == Team::Terrorist
+                && !world.bomb.carried_by_me
+                && world
+                    .bomb
+                    .origin
+                    .is_some_and(|b| distance2d(world.me.origin, b) <= RETRIEVE_RADIUS);
+            if retrieving {
+                // Picking it up is a touch, not an action: walking over a
+                // dropped C4 gives it to a terrorist, and the server then tells
+                // everyone with `BombPickup`. So there is nothing to press --
+                // the whole objective is to stand on it.
+                self.objective = Objective::RetrieveBomb;
+                self.target = world.bomb.origin;
+                self.elapsed += dt;
+                return None;
+            }
             if self.objective != Objective::Idle {
                 *self = Self::default();
             }
@@ -400,5 +437,67 @@ mod tests {
             "bomb planted successfully"
         );
         assert_eq!(ObjectiveEvent::DefusingTheBomb.as_str(), "defusing the bomb");
+    }
+
+    /// A dropped bomb is not somebody else's problem.
+    ///
+    /// Measured over four rounds of a live 10v10: four carriers spawned with
+    /// the bomb, all four were killed about twenty seconds in, the bomb lay
+    /// where each of them fell, and every round ended Target_Saved. Nothing in
+    /// the objective machine reacted to a bomb on the ground.
+    #[test]
+    fn a_terrorist_goes_and_picks_up_a_dropped_bomb() {
+        let bomb: Vec3 = [500.0, 0.0, 0.0];
+        let mut w = terrorist_with_bomb([0.0, 0.0, 0.0]);
+        w.bomb.carried_by_me = false;
+        w.bomb.planted = false;
+        w.bomb.origin = Some(bomb);
+
+        let mut o = ObjectiveState::default();
+        o.tick(&w, Some(SITE), 0.1);
+        assert_eq!(o.objective, Objective::RetrieveBomb);
+        assert_eq!(o.target, Some(bomb), "must head for the bomb, not the site");
+    }
+
+    /// ...but not from the other side of the map, or one dead carrier pulls
+    /// the whole team off the objective.
+    #[test]
+    fn a_bomb_too_far_away_is_left_for_somebody_closer() {
+        let mut w = terrorist_with_bomb([0.0, 0.0, 0.0]);
+        w.bomb.carried_by_me = false;
+        w.bomb.origin = Some([RETRIEVE_RADIUS + 200.0, 0.0, 0.0]);
+
+        let mut o = ObjectiveState::default();
+        o.tick(&w, Some(SITE), 0.1);
+        assert_ne!(o.objective, Objective::RetrieveBomb);
+    }
+
+    /// A counter-terrorist has no use for it.
+    #[test]
+    fn a_ct_does_not_chase_an_unplanted_bomb() {
+        let mut w = terrorist_with_bomb([0.0, 0.0, 0.0]);
+        w.me.team = Team::CounterTerrorist;
+        w.bomb.carried_by_me = false;
+        w.bomb.origin = Some([300.0, 0.0, 0.0]);
+
+        let mut o = ObjectiveState::default();
+        o.tick(&w, Some(SITE), 0.1);
+        assert_eq!(o.objective, Objective::Idle);
+    }
+
+    /// Carrying it again outranks going to get it.
+    #[test]
+    fn picking_it_up_switches_straight_back_to_planting() {
+        let mut w = terrorist_with_bomb([0.0, 0.0, 0.0]);
+        w.bomb.carried_by_me = false;
+        w.bomb.origin = Some([300.0, 0.0, 0.0]);
+        let mut o = ObjectiveState::default();
+        o.tick(&w, Some(SITE), 0.1);
+        assert_eq!(o.objective, Objective::RetrieveBomb);
+
+        w.bomb.carried_by_me = true;
+        o.tick(&w, Some(SITE), 0.1);
+        assert_eq!(o.objective, Objective::MoveToPlant);
+        assert_eq!(o.target, Some(SITE));
     }
 }

@@ -951,7 +951,22 @@ impl Session {
         // the bot is moving fast enough to spoil a rifle shot (>140 u/s).
         // Navigation no longer uses it: see `PathFollower::next_waypoint`.
         let _speed = self.measured_speed(world.me.origin, now);
-        let site = match (self.map.take(), self.site) {
+
+        // Route to whatever the brain last decided it wanted, falling back to
+        // the map objective. Without this the navigation always heads for the
+        // bomb site even while the brain is trying to reach something else --
+        // a dropped bomb, or a planted one to defuse -- so the bot arrives
+        // nowhere in particular and the objective machine looks broken.
+        //
+        // One tick stale by construction: the brain has not run yet this frame.
+        // At 50 Hz that is 20 ms of lag on a destination that moves when
+        // somebody dies, which is not worth restructuring the frame for.
+        let goal = self
+            .brain
+            .as_ref()
+            .and_then(|b| b.objective.target)
+            .or(self.site);
+        let site = match (self.map.take(), goal) {
             (Some(m), Some(goal)) => {
                 let w = self
                     .follower
@@ -961,14 +976,14 @@ impl Session {
             }
             (m, _) => {
                 self.map = m;
-                self.site
+                goal
             }
         };
         // The goal and the next waypoint are different questions: arrival is
         // about the bomb site, steering is about the route to it. Passing the
         // waypoint as the goal made the bot declare itself on the plant spot at
         // every waypoint it reached.
-        let nav = bot::controller::Nav { goal: self.site, waypoint: site };
+        let nav = bot::controller::Nav { goal, waypoint: site };
         let mut intent = self.brain.as_mut()?.think(&world, nav, dt);
 
         // Blocked by geometry the route does not model: strafe, jump, and
@@ -983,8 +998,7 @@ impl Session {
                 intent.view.yaw = bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
             }
         }
-        let to_goal = self
-            .site
+        let to_goal = goal
             .map(|g| {
                 let (dx, dy) = (g[0] - world.me.origin[0], g[1] - world.me.origin[1]);
                 (dx * dx + dy * dy).sqrt()
