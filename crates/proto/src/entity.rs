@@ -53,6 +53,13 @@
 //!    baselines, so on a stock CS server that bit is absent; this module still
 //!    gates on the count parsed from `svc_spawnbaseline`
 //!    ([`PacketCtx::instanced`]) rather than assuming either way.
+//!
+//!    That gate is only as good as the count feeding it, which is why
+//!    [`parse_spawn_baseline`] validates rather than trusts. A live 4-bot run
+//!    lost 7263 consecutive entity frames because a user-message burst was
+//!    mistaken for a `svc_spawnbaseline` and decoded as 63 instanced
+//!    baselines: no error anywhere, just one extra bit in every header from
+//!    then on. The story is in that function's docs.
 
 use crate::bitbuf::{BitReader, BitWriter};
 use crate::delta::{parse_delta, DeltaRegistry, DeltaTable, Value};
@@ -419,6 +426,17 @@ pub enum EntityError {
     BadBaselineOffset { index: usize, offset: u8 },
     /// An instanced-baseline index with no such baseline.
     BadInstancedBaseline { index: u8, count: usize },
+    /// A `svc_spawnbaseline` whose entity numbers are not strictly ascending.
+    /// `SV_CreateBaseline` emits them straight out of its `entnum` loop counter
+    /// (`sv_main.cpp:5891-5896`), so on a real one they always are.
+    BaselineOutOfOrder { previous: u16, got: u16 },
+    /// A baseline carrying an `entityType` the writer cannot produce.
+    /// `SV_CreateBaseline` assigns exactly `ENTITY_BEAM` or `ENTITY_NORMAL`
+    /// (`sv_main.cpp:5848-5851`) and sends the low two bits
+    /// (`sv_main.cpp:5897`), so only 1 and 2 ever reach the wire.
+    BadEntityType(u8),
+    /// More baselines than there are entity slots (`MAX_EDICTS`).
+    TooManyBaselines,
 }
 
 impl fmt::Display for EntityError {
@@ -439,6 +457,16 @@ impl fmt::Display for EntityError {
             }
             EntityError::BadInstancedBaseline { index, count } => {
                 write!(f, "instanced baseline {index} of {count}")
+            }
+            EntityError::BaselineOutOfOrder { previous, got } => write!(
+                f,
+                "baseline entity {got} follows {previous}; the writer only counts up"
+            ),
+            EntityError::BadEntityType(t) => {
+                write!(f, "baseline entityType {t} is neither NORMAL nor BEAM")
+            }
+            EntityError::TooManyBaselines => {
+                write!(f, "more than {MAX_EDICTS} baselines")
             }
         }
     }
@@ -772,16 +800,46 @@ pub struct Baselines {
 ///   could overwrite it, the game DLL's `pfnCreateBaseline`, does not —
 ///   ReGameDLL-CS touches `entityType` only in `AddToFullPack`
 ///   (`regamedll/dlls/client.cpp:4619-4622`), which is the per-frame path, not
-///   this one. Worth knowing that a mod which left the field at
-///   `ENTITY_UNINITIALIZED` (`1<<30`, `common/entity_state.h:28`) would put a
-///   plain `0` on the wire, since only the low 2 bits are sent — and that is
-///   exactly a value the two rules disagree about.
+///   this one. A mod that left the field at `ENTITY_UNINITIALIZED` (`1<<30`,
+///   `common/entity_state.h:28`) would put a plain `0` on the wire, since only
+///   the low 2 bits are sent — and that is exactly a value the two rules
+///   disagree about, so it is rejected as [`EntityError::BadEntityType`]
+///   rather than decoded one of the two possible ways.
+///
+/// # Why this validates rather than trusts
+///
+/// Everywhere else in this module the stream has already been identified by an
+/// opcode the caller dispatched on. This one has not: the only thing that
+/// carries baselines is `svc_spawnbaseline`, whose block is bit-packed, so a
+/// caller that cannot walk the byte stream to it has to *guess* — and the one
+/// in this workspace guesses by scanning for a bare byte 22
+/// (`client/src/world.rs`, `Decoder::absorb_baselines`).
+///
+/// A guess that lands in the middle of a user-message burst used to be
+/// **accepted**: an 894-byte round-restart record from `captures/swarm/Bot02.bin`
+/// decoded as nine baselines and *sixty-three instanced baselines*. Nothing
+/// then went wrong immediately — but [`PacketCtx::instanced`]'s length gates a
+/// header bit (trap 3), so from that moment every `svc_packetentities` header
+/// was shifted by one bit and every entity frame failed. In a live 4-bot run
+/// that was 7263 consecutive `entity_errors` out of 7602 datagrams, i.e. the
+/// bot never saw another player again.
+///
+/// So the invariants `SV_CreateBaseline` guarantees are checked here, and a
+/// stream that breaks one is refused. Each is cheap and each is load-bearing:
+///
+/// * **entity numbers strictly ascend** — they are the `entnum` loop counter
+///   (`sv_main.cpp:5891-5896`). The offending record went `768, 3, 528, 0, …`.
+/// * **`entityType` is 1 or 2** (`sv_main.cpp:5848-5851`, sent at `:5897`).
+///   The offending record's first entry was type 0.
+/// * **no more baselines than there are edicts** (`MAX_EDICTS`), which bounds
+///   the loop on a stream that never produces the sentinel.
 pub fn parse_spawn_baseline(
     r: &mut BitReader,
     registry: &DeltaRegistry,
     maxclients: u8,
 ) -> Result<Baselines, EntityError> {
     let mut out = Baselines::default();
+    let mut previous: Option<u16> = None;
 
     loop {
         if r.overflowed() {
@@ -790,9 +848,26 @@ pub fn parse_spawn_baseline(
         if r.peek_bits(16) == BASELINE_SENTINEL {
             break;
         }
+        if out.by_number.len() >= usize::from(MAX_EDICTS) {
+            return Err(EntityError::TooManyBaselines);
+        }
 
         let number = r.read_bits(MAX_EDICT_BITS) as u16;
         let entity_type = r.read_bits(2) as u8;
+
+        if let Some(prev) = previous {
+            if number <= prev {
+                return Err(EntityError::BaselineOutOfOrder {
+                    previous: prev,
+                    got: number,
+                });
+            }
+        }
+        previous = Some(number);
+
+        if entity_type != ENTITY_NORMAL && entity_type != ENTITY_BEAM {
+            return Err(EntityError::BadEntityType(entity_type));
+        }
         let custom = entity_type & ENTITY_NORMAL == 0;
 
         let which = table_for(number, custom, maxclients);
@@ -820,6 +895,9 @@ pub fn parse_spawn_baseline(
     if r.overflowed() {
         return Err(EntityError::Overflow);
     }
+    // `MAX_BASELINE_BITS` is 6 and `NUM_BASELINES` is 64
+    // (`rehlds/engine/inst_baseline.h:31`), so the field cannot overrun the
+    // array; the assert documents the coupling rather than guarding it.
     debug_assert!(count <= MAX_INSTANCED_BASELINES);
 
     let table = registry
@@ -2117,6 +2195,104 @@ mod tests {
                 "prefix of {cut} bytes decoded"
             );
         }
+    }
+
+    // -- svc_spawnbaseline: the guards that stop a mis-identified stream ----
+    //
+    // These exist because `svc_spawnbaseline` is the one block in this module
+    // whose caller cannot always prove it is looking at the right message. See
+    // the `parse_spawn_baseline` docs: a running-phase user-message burst that
+    // was mistaken for one decoded as nine baselines and 63 *instanced*
+    // baselines, and the instanced count gates a header bit -- so every entity
+    // frame afterwards was shifted by one bit and refused.
+
+    /// One baseline entry, written the way `SV_CreateBaseline` does.
+    fn write_baseline(w: &mut BitWriter, num: u16, ty: u8, table: &DeltaTable) {
+        w.write_bits(u32::from(num), MAX_EDICT_BITS);
+        w.write_bits(u32::from(ty), 2);
+        write_delta(w, table, &fields(&[("modelindex", Value::Int(1))]));
+    }
+
+    #[test]
+    fn baseline_entity_numbers_must_strictly_ascend() {
+        // `SV_CreateBaseline` writes `entnum` straight out of its loop counter
+        // (`sv_main.cpp:5891-5896`), so a real block only ever counts up.
+        // Numbers stay above `maxclients` so both entries use `entity_state_t`
+        // and the writer here matches the table the parser will pick.
+        let reg = registry();
+        for (a, b) in [(50u16, 30u16), (50, 50)] {
+            let mut w = BitWriter::new();
+            write_baseline(&mut w, a, ENTITY_NORMAL, &entity_table());
+            write_baseline(&mut w, b, ENTITY_NORMAL, &entity_table());
+            w.write_bits(BASELINE_SENTINEL, 16);
+            w.write_bits(0, MAX_BASELINE_BITS);
+            let bytes = w.into_bytes();
+
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(
+                parse_spawn_baseline(&mut r, &reg, 4).unwrap_err(),
+                EntityError::BaselineOutOfOrder {
+                    previous: a,
+                    got: b
+                },
+                "{a} then {b} must be refused"
+            );
+        }
+
+        // ...and the ascending case is still accepted.
+        let mut w = BitWriter::new();
+        write_baseline(&mut w, 30, ENTITY_NORMAL, &entity_table());
+        write_baseline(&mut w, 50, ENTITY_NORMAL, &entity_table());
+        w.write_bits(BASELINE_SENTINEL, 16);
+        w.write_bits(0, MAX_BASELINE_BITS);
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_spawn_baseline(&mut r, &reg, 4).unwrap().by_number.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_baseline_entity_type_outside_normal_and_beam_is_refused() {
+        // The writer assigns exactly one of the two (`sv_main.cpp:5848-5851`)
+        // and sends the low two bits (`:5897`). 0 and 3 are also precisely the
+        // values the writer's `custom` rule and HLTV's disagree about
+        // (`sv_main.cpp:5898` vs `World.cpp:2035`), so guessing one is worse
+        // than refusing.
+        let reg = registry();
+        for ty in [0u8, 3] {
+            let mut w = BitWriter::new();
+            write_baseline(&mut w, 1, ty, &entity_table());
+            w.write_bits(BASELINE_SENTINEL, 16);
+            w.write_bits(0, MAX_BASELINE_BITS);
+            let bytes = w.into_bytes();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(
+                parse_spawn_baseline(&mut r, &reg, 4).unwrap_err(),
+                EntityError::BadEntityType(ty)
+            );
+        }
+    }
+
+    #[test]
+    fn the_baseline_guards_fire_before_the_delta_payload_is_read() {
+        // Order matters: both checks are made on the 13 header bits, before
+        // `parse_delta` consumes anything. A stream that is not a baseline
+        // block must not be walked field by field on the strength of a byte
+        // that happened to be 22.
+        let reg = registry();
+        let mut w = BitWriter::new();
+        w.write_bits(9, MAX_EDICT_BITS);
+        w.write_bits(0, 2); // a type the writer cannot produce
+        // No payload follows at all -- a real entry would have one.
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            parse_spawn_baseline(&mut r, &reg, 4).unwrap_err(),
+            EntityError::BadEntityType(0)
+        );
+        assert!(!r.overflowed(), "refused without reading past the header");
     }
 
     #[test]
