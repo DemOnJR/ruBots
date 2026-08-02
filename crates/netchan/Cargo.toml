@@ -1,0 +1,9 @@
+[package]
+name = "netchan"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+proto = { path = "../proto" }
+bzip2-rs = "0.1"

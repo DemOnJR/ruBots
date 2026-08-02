@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/netchan",
+    "crates/auth",
+    "crates/bot",
+    "crates/nav",
+    "crates/client",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.75"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

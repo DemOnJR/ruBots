@@ -1,0 +1,34 @@
+# Bound to 127.0.0.1 only -- this server is for local protocol tests and must
+# not be reachable from the network.
+services:
+  cs16:
+    build: .
+    container_name: aiplayers-cs16
+    ports:
+      - "127.0.0.1:27015:27015/udp"
+      - "127.0.0.1:27015:27015/tcp"
+    volumes:
+      # Config is mounted, NOT baked in: without this, edits only take effect
+      # after a full `docker build`, so you end up testing against a config you
+      # think you changed but did not.
+      #
+      # The path MUST be /home/steam/hlds/... -- that is where the Dockerfile
+      # installs HLDS. An earlier version of this file mounted at /hlds/, which
+      # does not exist, so docker silently created an empty directory and every
+      # server.cfg edit was a no-op. `harness doctor` now reads the live cvars
+      # back over rcon specifically to catch that class of mistake.
+      - ./server.cfg:/home/steam/hlds/cstrike/server.cfg:ro
+      # game.cfg is exec'd by ReGameDLL's InstallGameRules on EVERY map load
+      # (regamedll/dlls/gamerules.cpp:136), whereas the engine exec's server.cfg
+      # exactly once at startup (rehlds/engine/sys_dll2.cpp:669). So game.cfg
+      # WINS over server.cfg from the first map change onward. Ours is a copy of
+      # the bundle's with a marked override block appended; the bundle's own
+      # copy under rehlds/ stays pristine.
+      - ./game.cfg:/home/steam/hlds/cstrike/game.cfg:ro
+      - ./mapcycle.txt:/home/steam/hlds/cstrike/mapcycle.txt:ro
+      # Log_Printf writes here (sv_log.cpp:117-168), one file per map load.
+      # The harness snapshots and diffs it as a secondary truth channel.
+      - ./logs:/home/steam/hlds/cstrike/logs
+    stdin_open: true
+    tty: true
+    restart: "no"

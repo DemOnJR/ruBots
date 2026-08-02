@@ -1,0 +1,287 @@
+//! Connect to a live server, reach the signon, then record the running-phase
+//! message stream to a file for offline analysis.
+//!
+//! This exists because the entity-update bit formats cannot be read reliably
+//! out of the disassembly (the BitReader calls are inlined) — the only sound
+//! way to get them is to look at what a real server actually sends.
+//!
+//! ```text
+//! cargo run -p client --example capture_running -- [addr] [seconds] [out]
+//! ```
+//!
+//! Output format: repeated `u32 length` + `length` bytes, each record being one
+//! fully-assembled, decompressed `svc_*` message stream.
+
+use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::time::{Duration, Instant};
+
+use client::{Identity, Session, Transport};
+
+/// Wraps a transport and records every datagram sent, so our own wire bytes
+/// can be diffed against a real client's capture.
+struct Logged<T: Transport> {
+    inner: T,
+    log: File,
+}
+
+impl<T: Transport> Transport for Logged<T> {
+    fn send(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.log.write_all(&(data.len() as u32).to_le_bytes())?;
+        self.log.write_all(data)?;
+        self.inner.send(data)
+    }
+    fn recv(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.recv()
+    }
+}
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:27015".into());
+    let secs: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let out_path = args.next().unwrap_or_else(|| "running.bin".into());
+
+    let inner = match client::UdpTransport::connect(addr.parse().expect("addr"), None) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("connect failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let sent_path = format!("{out_path}.sent");
+    let mut t = Logged { inner, log: File::create(&sent_path).expect("sent log") };
+    eprintln!("logging our outgoing packets to {sent_path}");
+
+    let mut session = Session::new(Identity { name: "AIPlayer".into(), ..Default::default() });
+    session.record_all = true;
+    match session.connect_and_signon(&mut t, Duration::from_secs(15)) {
+        Ok(signon) => eprintln!(
+            "signon reached: {} delta tables, map {}",
+            signon.registry.len(),
+            signon
+                .server_info
+                .as_ref()
+                .map(|si| si.map_name().to_string())
+                .unwrap_or_default()
+        ),
+        Err(e) => {
+            eprintln!("signon failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // The exact post-signon command sequence a real CS 1.6 client sends,
+    // recovered by decoding a genuine client's session. Note there is NO
+    // `spawn` and NO `begin` - protocol 48 does not use them.
+    // The real client asks for the resource list FIRST (~0.3s after `new`),
+    // then answers the allow_* stufftexts, and only reaches `sendents` ~1.4s
+    // later after uploading its consistency data.
+    // Clean entry sequence, with nothing queued ahead of it: a stuck reliable
+    // would block `sendents`, and `sendents` is the one command that makes the
+    // server consider us fully connected.
+    session.send_command(Session::SENDRES);
+    let res_until = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < res_until {
+        let _ = session.pump(&mut t, &[netchan::clc::NOP]);
+    }
+
+    eprintln!("  uploading clc_resourcelist (fragmented)");
+    session.upload_resource_list();
+    let up_until = Instant::now() + Duration::from_millis(1000);
+    while Instant::now() < up_until {
+        let _ = session.pump(&mut t, &[netchan::clc::NOP]);
+    }
+
+    let spawncount: u32 = env::var("AIPLAYERS_SPAWNCOUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| session.recorded.iter().find_map(|m| Session::spawncount_from(m)))
+        .unwrap_or(1);
+    {
+        let all = session.all_resources();
+        let n = all.len();
+        let c = all.iter().filter(|r| r.checksum.is_some()).count();
+        eprintln!("  resources: {n}, with checksum (consistency entries): {c}");
+        for r in all.iter().filter(|r| r.checksum.is_some()).take(5) {
+            eprintln!("     idx={} flags={} {}", r.index, r.flags, r.name);
+        }
+    }
+    eprintln!("  entering game: spawn {spawncount} then sendents ...");
+    match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
+        Ok(true) => eprintln!("  *** SERVER IS STREAMING - we are fully connected ***"),
+        Ok(false) => eprintln!("  !!! server never started streaming"),
+        Err(e) => eprintln!("  enter_game error: {e}"),
+    }
+
+    if env::var("AIPLAYERS_NO_JOIN").is_ok() {
+        eprintln!("  BISECT: fully connected, sending nothing but moves");
+    } else {
+        // Let the entry burst drain before adding the join burst on top of it.
+        // The server copies the WHOLE of `netchan.message` into `reliable_buf`
+        // in one go and only when the previous reliable was acknowledged, so
+        // anything the game queues meanwhile piles up in that one buffer. A
+        // real client waits ~1.5 s between `sendents` (1.67 s) and `jointeam`
+        // (3.17 s); firing them back to back stacks two bursts and overflows.
+        let settle = Instant::now()
+            + Duration::from_millis(
+                env::var("AIPLAYERS_JOIN_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2000),
+            );
+        while Instant::now() < settle {
+            let _ = session.pump(&mut t, &[netchan::clc::NOP]);
+        }
+        eprintln!("  joining team (paced like a real client)");
+        if let Err(e) = session.join_team(&mut t, 1, 1) {
+            eprintln!("  join error: {e}");
+        }
+        session.send_command("say BOTPROBE123");
+    }
+
+    let mut f = File::create(&out_path).expect("create output");
+    let mut records = 0usize;
+    let mut bytes = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut last_keep = Instant::now();
+
+    let mut settled_logged = false;
+    let start = Instant::now();
+    let intent = bot::Intent::default();
+    while Instant::now() < deadline {
+        // Pump continuously: every pump both consumes what arrived and sends
+        // our acknowledgement, which is what keeps the server's reliable
+        // buffer draining.
+        // Send a real clc_move every tick, exactly as a playing client does.
+        let step = if env::var("AIPLAYERS_NO_MOVES").is_ok() {
+            session.pump(&mut t, &[netchan::clc::NOP])
+        } else {
+            session.tick(&mut t, &intent, 20)
+        };
+        match step {
+            Ok(msgs) => {
+                for msg in msgs {
+                    f.write_all(&(msg.len() as u32).to_le_bytes()).unwrap();
+                    f.write_all(&msg).unwrap();
+                    records += 1;
+                    bytes += msg.len();
+                }
+            }
+            Err(e) => {
+                eprintln!("pump error: {e}");
+                break;
+            }
+        }
+        if !settled_logged && session.reliables_settled() {
+            eprintln!("all reliable commands acknowledged by the server");
+            settled_logged = true;
+        }
+        // Channel telemetry: is our acknowledgement actually advancing?
+        if std::env::var("AIPLAYERS_TRACE").is_ok()
+            && last_keep.elapsed() >= Duration::from_millis(500)
+        {
+            eprintln!(
+                "  t+{:>5}ms  in_seq={:<6} out_seq={:<6} in_rel={} out_rel={} \
+                 rel_inflight={} queued={} records={} stale={}
+            dgram={} split={}/{} frag={}/{} plain={} rejected={} resyncs={} LOST={}",
+                start.elapsed().as_millis(),
+                session.chan.incoming_sequence,
+                session.chan.outgoing_sequence,
+                session.chan.incoming_reliable,
+                session.chan.outgoing_reliable,
+                session.chan.reliable_in_flight(),
+                session.chan.queued_count(),
+                records,
+                session.chan.dropped_stale,
+                session.stats.datagrams,
+                session.stats.split_completed,
+                session.stats.split_seen,
+                session.stats.frag_completed,
+                session.stats.frag_seen,
+                session.stats.plain,
+                session.stats.read_rejected,
+                session.resyncs(),
+                session.chan.lost_packets,
+            );
+            last_keep = Instant::now();
+        }
+    }
+
+    // Exact decode of every message, using the registered user-message sizes.
+    let table = client::collect_user_messages(&session.recorded);
+    eprintln!("  user messages registered: {}", table.len());
+    let mut totals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut halted: std::collections::BTreeMap<u8, usize> = Default::default();
+    for msg in &session.recorded {
+        let w = client::walk_stream(msg, &table);
+        for it in &w.items {
+            if let client::Item::User { name, payload, .. } = it {
+                *totals.entry(name.clone()).or_default() += 1;
+                if matches!(name.as_str(), "TeamInfo" | "ScoreInfo" | "VGUIMenu" | "TextMsg" | "ShowMenu") {
+                    let txt: String = payload
+                        .iter()
+                        .map(|&c| if (32..127).contains(&c) { c as char } else { '.' })
+                        .collect();
+                    eprintln!("     {name}: {txt}");
+                }
+            }
+        }
+        if let Some(op) = w.stopped_on {
+            *halted.entry(op).or_default() += 1;
+        }
+    }
+    eprintln!("  ALL user messages decoded: {totals:?}");
+    eprintln!("  walks halted on opcode: {halted:?}");
+
+    // Report every svc_stufftext the server sent us, at any phase: these are
+    // commands a real client echoes straight back.
+    let mut stuff = Vec::new();
+    for msg in &session.recorded {
+        let mut i = 0usize;
+        while i < msg.len() {
+            if msg[i] == client::svc::SVC_STUFFTEXT {
+                if let Some(end) = msg[i + 1..].iter().position(|&b| b == 0) {
+                    let text = String::from_utf8_lossy(&msg[i + 1..i + 1 + end]).to_string();
+                    let printable = text
+                        .chars()
+                        .all(|c| c.is_ascii_graphic() || c == ' ' || c == '\n');
+                    if !text.is_empty() && printable {
+                        stuff.push(text);
+                    }
+                    i += 1 + end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    // What userinfo does the SERVER think we have? It echoes it back in
+    // svc_updateuserinfo; cl_updaterate there drives next_messageinterval.
+    for msg in &session.recorded {
+        if let Some(pos) = msg.windows(9).position(|w| w == b"updaterat") {
+            let start = pos.saturating_sub(80);
+            let end = (pos + 160).min(msg.len());
+            let txt: String = msg[start..end]
+                .iter()
+                .map(|&c| if (32..127).contains(&c) { c as char } else { '.' })
+                .collect();
+            eprintln!("  SERVER-SIDE USERINFO: {txt}");
+            break;
+        }
+    }
+    eprintln!("recorded {} messages; stufftext candidates:", session.recorded.len());
+    for t in stuff.iter().take(30) {
+        eprintln!("   STUFFTEXT {t:?}");
+    }
+
+    eprintln!(
+        "wrote {records} message records, {bytes} bytes to {out_path} \
+         (reliables settled: {})",
+        session.reliables_settled()
+    );
+}

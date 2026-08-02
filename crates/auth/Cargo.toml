@@ -1,0 +1,11 @@
+[package]
+name = "auth"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+md-5 = "0.10"
+
+[dev-dependencies]
+proto = { path = "../proto" }
