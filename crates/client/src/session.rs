@@ -46,6 +46,12 @@ pub struct Decision {
     pub use_action: bool,
     /// The bot believes it is carrying the C4.
     pub carrying_bomb: bool,
+    /// The bot believes a bomb is planted, and where. Without this there is no
+    /// way to tell "the defuse machine is broken" from "nobody ever told this
+    /// client there was a bomb" -- and for a client that joins mid-round those
+    /// are completely different problems in completely different layers.
+    pub bomb_planted: bool,
+    pub bomb_known_at: Option<[f32; 3]>,
     /// The plant machine has the button down and the timer running.
     pub arming: bool,
     /// Straight-line distance to the objective, which is the number that
@@ -1449,6 +1455,8 @@ impl Session {
             attack: intent.attack,
             use_action: intent.use_action,
             carrying_bomb: world.bomb.carried_by_me,
+            bomb_planted: world.bomb.planted,
+            bomb_known_at: world.bomb.origin,
             arming: self.brain.as_ref().is_some_and(|b| b.plant.is_arming()),
             to_goal,
             rung: self.brain.as_ref().map_or("none", |b| b.rung),

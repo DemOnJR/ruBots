@@ -346,9 +346,11 @@ fn main() {
                         dec.waypoints_left, dec.reroutes, dec.stuck,
                     );
                     eprintln!(
-                        "      obj: rung {:<10} bomb {} arming {} attack {} use {} to_goal {:.0}",
+                        "      obj: rung {:<10} bomb {} arming {} attack {} use {} to_goal {:.0}                          | planted {} at {:?}",
                         dec.rung, dec.carrying_bomb, dec.arming, dec.attack, dec.use_action,
                         dec.to_goal,
+                        dec.bomb_planted,
+                        dec.bomb_known_at.map(|b| [b[0] as i32, b[1] as i32]),
                     );
                     eprintln!(
                         "      hostage: escort {:<9} seen {} led {} to_hostage {:.0} edges {}",
