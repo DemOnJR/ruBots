@@ -153,9 +153,101 @@ impl Session {
                 self.clientdata = Some(cd);
             }
         }
+        self.answer_cvar_queries(msg);
         if self.record_all {
             self.recorded.push(msg.to_vec());
         }
+    }
+
+    /// Cvar values we report when a server asks.
+    ///
+    /// A server (or a Metamod plugin) can query any client cvar with
+    /// `svc_sendcvarvalue` / `svc_sendcvarvalue2`, and a client that never
+    /// answers leaves the request outstanding. ReHLDS itself does not mind, but
+    /// plugin-based anticheats routinely kick on the timeout — so a bot that
+    /// stays silent works on our test server and gets thrown off real ones.
+    ///
+    /// The list is what a real client would have; anything unlisted is answered
+    /// with an empty string, which is exactly what the engine reports for a
+    /// cvar that does not exist.
+    fn cvar_value(&self, name: &str) -> String {
+        let id = &self.client.identity;
+        match name {
+            "sv_version" => "1.1.2.7/Stdio,48,4419".into(),
+            "rate" => id.rate.to_string(),
+            "cl_updaterate" => id.update_rate.to_string(),
+            "cl_cmdrate" => "60".into(),
+            "cl_lw" | "cl_lc" => "1".into(),
+            "cl_dlmax" => "1024".into(),
+            "cl_nopred" => "0".into(),
+            "cl_timeout" => "60".into(),
+            "m_pitch" => "0.022".into(),
+            "gl_texturemode" => "GL_LINEAR_MIPMAP_LINEAR".into(),
+            "_cl_autowepswitch" => "1".into(),
+            "cl_download_ingame" => "1".into(),
+            "hud_fastswitch" => "0".into(),
+            "name" => id.name.clone(),
+            "model" => "gordon".into(),
+            _ => String::new(),
+        }
+    }
+
+    /// Answer any cvar query in this message.
+    ///
+    /// `svc_sendcvarvalue` (57) is `string cvar` and is answered with
+    /// `clc_cvarvalue` (10) `string value`. `svc_sendcvarvalue2` (58) adds a
+    /// request id that must be echoed back, and the reply also repeats the cvar
+    /// name (`SV_ParseCvarValue2`, `sv_user.cpp:1804-1815`).
+    fn answer_cvar_queries(&mut self, msg: &[u8]) {
+        for reply in self.cvar_replies(msg) {
+            self.chan.queue_reliable(&reply);
+        }
+    }
+
+    /// The `clc_cvarvalue` / `clc_cvarvalue2` replies `msg` calls for.
+    ///
+    /// Pure, so a test can assert on the exact bytes rather than on a queue
+    /// depth. `svc_sendcvarvalue` (57) is `string cvar`, answered with
+    /// `clc_cvarvalue` (10) `string value`. `svc_sendcvarvalue2` (58) adds a
+    /// request id that must come back verbatim, and its reply repeats the cvar
+    /// name too (`SV_ParseCvarValue2`, `sv_user.cpp:1804-1815`).
+    fn cvar_replies(&self, msg: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < msg.len() {
+            match msg[i] {
+                crate::svc::SVC_SENDCVARVALUE => {
+                    let Some(end) = msg[i + 1..].iter().position(|&b| b == 0) else {
+                        break;
+                    };
+                    let name = String::from_utf8_lossy(&msg[i + 1..i + 1 + end]).into_owned();
+                    let mut reply = vec![netchan::clc::CVARVALUE];
+                    reply.extend_from_slice(self.cvar_value(&name).as_bytes());
+                    reply.push(0);
+                    out.push(reply);
+                    i += 1 + end + 1;
+                }
+                crate::svc::SVC_SENDCVARVALUE2 => {
+                    if msg.len() < i + 5 {
+                        break;
+                    }
+                    let Some(end) = msg[i + 5..].iter().position(|&b| b == 0) else {
+                        break;
+                    };
+                    let name = String::from_utf8_lossy(&msg[i + 5..i + 5 + end]).into_owned();
+                    let mut reply = vec![netchan::clc::CVARVALUE2];
+                    reply.extend_from_slice(&msg[i + 1..i + 5]);
+                    reply.extend_from_slice(name.as_bytes());
+                    reply.push(0);
+                    reply.extend_from_slice(self.cvar_value(&name).as_bytes());
+                    reply.push(0);
+                    out.push(reply);
+                    i += 5 + end + 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
     }
 
     /// The five bytes `SV_WriteSpawn` + `SV_WriteVoiceCodec` always end on.
@@ -1057,6 +1149,49 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A server plugin can query any client cvar, and a client that never
+    /// answers leaves the request outstanding -- which plugin anticheats kick
+    /// for. Silence works on our test server and fails on real ones.
+    #[test]
+    fn a_cvar_query_is_answered_on_the_reliable_channel() {
+        let mut s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+        let mut msg = vec![crate::svc::SVC_SENDCVARVALUE];
+        msg.extend_from_slice(b"cl_lw ");
+        s.answer_cvar_queries(&msg);
+        assert_eq!(s.chan.queued_count(), 1, "no reply queued");
+    }
+
+    /// The v2 form carries a request id that must come back verbatim, and the
+    /// reply repeats the cvar name (SV_ParseCvarValue2, sv_user.cpp:1804-1815).
+    #[test]
+    fn a_v2_cvar_query_echoes_the_request_id_and_the_name() {
+        let s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+        let mut msg = vec![crate::svc::SVC_SENDCVARVALUE2];
+        msg.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        msg.extend_from_slice(b"name ");
+
+        let replies = s.cvar_replies(&msg);
+        assert_eq!(replies.len(), 1);
+        let out = &replies[0];
+        assert_eq!(out[0], netchan::clc::CVARVALUE2);
+        assert_eq!(&out[1..5], &0xDEADBEEFu32.to_le_bytes());
+        let rest = String::from_utf8_lossy(&out[5..]);
+        let mut parts = rest.split(' ');
+        assert_eq!(parts.next(), Some("name"));
+        assert_eq!(parts.next(), Some("Bot7"), "must report our real name");
+    }
+
+    /// An unknown cvar is reported as empty, which is what the engine does for
+    /// a cvar that does not exist -- not skipped, or the server waits forever.
+    #[test]
+    fn an_unknown_cvar_is_answered_with_an_empty_value() {
+        let s = Session::new(Identity::default());
+        assert_eq!(s.cvar_value("definitely_not_a_cvar"), "");
+        assert_eq!(s.cvar_value("cl_lw"), "1");
+    }
+
     use super::*;
     use proto::munge;
 

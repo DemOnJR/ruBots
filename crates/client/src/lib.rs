@@ -276,7 +276,7 @@ impl fmt::Display for Disconnect {
 /// The connection state machine.
 pub struct Client {
     state: State,
-    identity: Identity,
+    pub(crate) identity: Identity,
     challenge: Option<u32>,
     userid: Option<i32>,
     last_send: Option<Instant>,
