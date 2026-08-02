@@ -22,6 +22,7 @@
 
 pub mod bitbuf;
 pub mod connectionless;
+pub mod consistency;
 pub mod crc;
 pub mod delta;
 pub mod munge;

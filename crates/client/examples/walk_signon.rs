@@ -51,7 +51,7 @@ fn main() {
     println!("signon_num: {:?}", s.signon_num);
     if !s.resources.is_empty() {
         println!("resources: {}", s.resources.len());
-        let checked = s.resources.iter().filter(|r| r.checksum.is_some()).count();
+        let checked = s.resources.iter().filter(|r| r.reserved.is_some()).count();
         println!("   consistency-checked: {checked}");
         for r in s.resources.iter().take(3) {
             println!("   {:<40} size={}", r.name, r.size);

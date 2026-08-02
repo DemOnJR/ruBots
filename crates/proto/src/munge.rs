@@ -80,6 +80,93 @@ pub fn unmunge(data: &mut [u8], table: &[u8; 16], seq: i32) {
     }
 }
 
+// The six named GoldSrc entry points. Verified against ReHLDS
+// `engine/common.cpp:2526-2845`: all six are the *same* algorithm and differ
+// only in which 16-byte table they index, so they are one-line wrappers here
+// rather than six transcriptions. (ReHLDS also ships unrolled REHLDS_FIXES
+// variants of Munge2/UnMunge2; those reduce to the generic form -- their
+// constant `0xFFFFE7A5` is exactly `0xa5|(j<<j)|j|mungify_table2[j]` for
+// j = 0..3.)
+
+/// `COM_Munge` — the reliable/fragment path and the `clc_move` payload.
+#[inline]
+pub fn munge1(data: &mut [u8], seq: i32) {
+    munge(data, &TABLE1, seq)
+}
+
+/// `COM_UnMunge`.
+#[inline]
+pub fn unmunge1(data: &mut [u8], seq: i32) {
+    unmunge(data, &TABLE1, seq)
+}
+
+/// `COM_Munge2` — produces the `spawn` map-CRC argument.
+#[inline]
+pub fn munge2(data: &mut [u8], seq: i32) {
+    munge(data, &TABLE2, seq)
+}
+
+/// `COM_UnMunge2` — what the server applies to our `spawn` CRC argument
+/// (`sv_main.cpp:1653`).
+#[inline]
+pub fn unmunge2(data: &mut [u8], seq: i32) {
+    unmunge(data, &TABLE2, seq)
+}
+
+/// `COM_Munge3`.
+#[inline]
+pub fn munge3(data: &mut [u8], seq: i32) {
+    munge(data, &TABLE3, seq)
+}
+
+/// `COM_UnMunge3` — recovers the real map CRC from `svc_serverinfo`.
+#[inline]
+pub fn unmunge3(data: &mut [u8], seq: i32) {
+    unmunge(data, &TABLE3, seq)
+}
+
+/// The `(-1 - n) & 0xFF` key GoldSrc derives from a player number or spawncount.
+///
+/// Appears verbatim at `rehlds/engine/sv_main.cpp:1113` (serverinfo write) and
+/// `:1653` (spawn parse), and in the reference client at
+/// `HLTV/Core/src/Server.cpp:781` and `:1144`.
+#[inline]
+pub fn seq_key(n: u32) -> i32 {
+    (-1i32 - n as i32) & 0xFF
+}
+
+/// The `<crc>` argument of `spawn <spawncount> <crc>`.
+///
+/// `map_crc_wire` is the third `long` of `svc_serverinfo` exactly as received.
+/// The server wrote `COM_Munge3(worldmapCRC, seq_key(playernum))` there
+/// (`sv_main.cpp:1111-1115`), and on the way back in `SV_Spawn_f_internal`
+/// applies `COM_UnMunge2(crcValue, 4, seq_key(spawncount))`
+/// (`sv_main.cpp:1653`). So we undo its munge and redo the one it expects.
+/// Mirror of the reference client, `HLTV/Core/src/Server.cpp:781` and `:1143`.
+///
+/// **Sending `0` here is not a harmless placeholder.** Unmunging zero can never
+/// yield zero, so the server stores a garbage CRC, and `SV_CheckMapDifferences`
+/// (`sv_main.cpp:8092-8115`, every 5 s) reacts to the mismatch by setting
+/// `SIZEBUF_OVERFLOWED` on the reliable channel — which surfaces as the
+/// client being dropped for `"Reliable channel overflowed"`, a message that
+/// says nothing whatsoever about map CRCs.
+pub fn spawn_crc(map_crc_wire: u32, player_index: u8, spawncount: u32) -> i32 {
+    let mut b = map_crc_wire.to_le_bytes();
+    unmunge3(&mut b, seq_key(u32::from(player_index)));
+    munge2(&mut b, seq_key(spawncount));
+    i32::from_le_bytes(b)
+}
+
+/// The server's real `worldmapCRC`, recovered from `svc_serverinfo`.
+///
+/// Only useful as a cross-check: it must equal the value in the server's own
+/// `Started map "<name>" (CRC "<n>")` log line (`sv_main.cpp:6242`).
+pub fn world_map_crc(map_crc_wire: u32, player_index: u8) -> i32 {
+    let mut b = map_crc_wire.to_le_bytes();
+    unmunge3(&mut b, seq_key(u32::from(player_index)));
+    i32::from_le_bytes(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +206,97 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b);
+    }
+
+    /// Closed loop against the server's own arithmetic.
+    ///
+    /// Play both sides: munge a known `worldmapCRC` the way `SV_SendServerinfo`
+    /// does, run it through `spawn_crc`, then apply the `COM_UnMunge2` that
+    /// `SV_Spawn_f_internal` applies — and require the original back. If this
+    /// passes, `SV_CheckMapDifferences` cannot fire, without a server running.
+    #[test]
+    fn the_spawn_crc_survives_a_round_trip_through_the_servers_own_maths() {
+        for w in [0u32, 1, 0x2B99_5581, 0xFFFF_FFFF, 0xDEAD_BEEF] {
+            for p in [0u8, 1, 11, 31] {
+                for s in [0u32, 1, 5, 255, 256, 70_000] {
+                    let mut wire = w.to_le_bytes();
+                    munge3(&mut wire, seq_key(u32::from(p)));
+                    let wire = u32::from_le_bytes(wire);
+
+                    // What the client sends, and what the server does with it.
+                    let arg = spawn_crc(wire, p, s);
+                    let mut back = arg.to_le_bytes();
+                    unmunge2(&mut back, seq_key(s));
+
+                    assert_eq!(
+                        u32::from_le_bytes(back),
+                        w,
+                        "crc {w:#x} playernum {p} spawncount {s} did not round-trip"
+                    );
+                    assert_eq!(world_map_crc(wire, p) as u32, w, "world_map_crc disagrees");
+                }
+            }
+        }
+    }
+
+    /// Regression guard for the bug this all existed to fix.
+    ///
+    /// `SV_CheckMapDifferences` skips clients whose `crcValue` is zero, so if
+    /// unmunging zero gave zero, sending `spawn <n> 0` would have been benign.
+    /// It does not: for `len == 4` the unmunge reduces to
+    /// `bswap(mSeq ^ 0xFFFFE7A5)` with `mSeq = bswap(!seq) ^ seq`, and byte 1
+    /// of `mSeq` is always `0xFF`, never `0xE7`. So the result is never zero
+    /// for any key, and the mismatch — and the drop — was guaranteed.
+    #[test]
+    fn a_zero_spawn_crc_unmunges_to_the_value_that_got_us_dropped() {
+        let mut b = 0u32.to_le_bytes();
+        unmunge2(&mut b, seq_key(5));
+        assert_eq!(u32::from_le_bytes(b), 0xA018_00FA);
+
+        for spawncount in 0u32..512 {
+            let mut b = 0u32.to_le_bytes();
+            unmunge2(&mut b, seq_key(spawncount));
+            assert_ne!(
+                u32::from_le_bytes(b),
+                0,
+                "spawncount {spawncount}: a zero CRC argument would have been harmless"
+            );
+        }
+    }
+
+    /// The named wrappers must be the generic function with the right table.
+    #[test]
+    fn the_named_variants_match_the_generic_function() {
+        for (i, (m, u)) in [
+            (munge1 as fn(&mut [u8], i32), unmunge1 as fn(&mut [u8], i32)),
+            (munge2, unmunge2),
+            (munge3, unmunge3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let table = [&TABLE1, &TABLE2, &TABLE3][i];
+            let original = sample();
+
+            let mut a = original.clone();
+            m(&mut a, 77);
+            let mut b = original.clone();
+            munge(&mut b, table, 77);
+            assert_eq!(a, b, "munge variant {} disagrees", i + 1);
+
+            u(&mut a, 77);
+            assert_eq!(a, original, "unmunge variant {} did not invert", i + 1);
+        }
+    }
+
+    #[test]
+    fn seq_key_matches_the_engines_expression() {
+        // `(-1 - n) & 0xFF`, as written at sv_main.cpp:1113 and :1653.
+        assert_eq!(seq_key(0), 0xFF);
+        assert_eq!(seq_key(1), 0xFE);
+        assert_eq!(seq_key(5), 0xFA);
+        assert_eq!(seq_key(255), 0);
+        assert_eq!(seq_key(256), 0xFF);
     }
 
     #[test]

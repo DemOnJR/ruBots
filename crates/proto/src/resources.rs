@@ -18,45 +18,92 @@
 //! calls are inlined into `ParseResourceList`, so the widths are not readable
 //! statically). Validated by parsing a real 793-entry list end to end:
 //!
+//! Now corroborated directly against `SV_SendResources_internal`
+//! (`rehlds/engine/sv_main.cpp:1225-1259`), which resolves an ambiguity the
+//! capture alone could not:
+//!
 //! ```text
-//! count : 12 bits
+//! count : 12 bits                              RESOURCE_INDEX_BITS
 //! repeat count times:
-//!     type   :  4 bits
-//!     name   :  nul-terminated string, 8 bits per character
-//!     index  : 12 bits
-//!     size   : 24 bits
-//!     flags  :  4 bits
-//!     if flags & CHECKSUM: 32 further bytes
+//!     type     :  4 bits
+//!     name     :  nul-terminated string, 8 bits per character
+//!     index    : 12 bits
+//!     size     : 24 bits
+//!     flags    :  3 bits                       masked to RES_WASMISSING|RES_FATALIFMISSING
+//!     if flags & RES_CUSTOM: 16 bytes MD5      dead branch -- see below
+//!     reserved :  1 bit, and if set 32 bytes
+//! <consistency list>                           see `ConsistencyList`
 //! ```
 //!
+//! The earlier reading of "4 bits of flags, bit 3 means a 32-byte blob" decodes
+//! the same bits, because the engine writes 3 flag bits followed by the
+//! reserved-present bit — so a 4-bit read lands that bit at value 8. It is the
+//! *meaning* that was wrong, and it mattered: the 32-byte blob is
+//! `rguc_reserved`, **not** an MD5. It is a `COM_Munge`'d block holding a
+//! `check_type` byte plus model bounds (`sv_user.cpp:287-312`), and answering
+//! consistency with its first four bytes as if they were a hash is nonsense.
+//!
+//! **The MD5 is never on the wire.** The engine writes flags as
+//! `bits(ucFlags & (RES_WASMISSING|RES_FATALIFMISSING), 3)` — a `0x03` mask —
+//! so `RES_CUSTOM` (`1 << 2`) can never reach the client, and the branch that
+//! would carry the 16-byte hash is unreachable. It is mirrored here anyway,
+//! because the reference client mirrors it (`HLTV/Core/src/Server.cpp:1109`).
+//!
 //! The widths are corroborated by the decoded values being real files at real
-//! sizes â€” `models/player.mdl` at 2,329,328 bytes, `player/pl_grate1.wav` at
-//! 9,188 â€” and by the parse consuming 99.7% of the message with every one of
-//! the 793 names readable. An incorrect width desynchronises within one or two
-//! entries.
+//! sizes — `models/player.mdl` at 2,329,328 bytes, `player/pl_grate1.wav` at
+//! 9,188 — every one of the 793 names readable, and the bit cursor landing
+//! exactly on the end of the message once the consistency tail is consumed.
+//! An incorrect width desynchronises within one or two entries.
 
 use crate::bitbuf::BitReader;
 use md5::{Digest, Md5};
 
-/// Bits holding the resource count.
+/// Bits holding the resource count. `RESOURCE_INDEX_BITS`, `server.h:86`.
 pub const COUNT_BITS: u32 = 12;
 /// Bits per field of an entry.
 pub const TYPE_BITS: u32 = 4;
 pub const INDEX_BITS: u32 = 12;
 pub const SIZE_BITS: u32 = 24;
-pub const FLAGS_BITS: u32 = 4;
+/// Only three, and masked to `RES_WASMISSING|RES_FATALIFMISSING` on the way out
+/// (`sv_main.cpp:1240`).
+pub const FLAGS_BITS: u32 = 3;
 
-/// Flag marking an entry that carries [`CHECKSUM_LEN`] trailing bytes.
+/// `resource_t::ucFlags` bits, `public/rehlds/custom.h:52-60`.
+pub const RES_FATALIFMISSING: u8 = 1 << 0;
+pub const RES_WASMISSING: u8 = 1 << 1;
+/// Never observable on the wire — see the module docs.
+pub const RES_CUSTOM: u8 = 1 << 2;
+
+/// Size of `resource_t::rguc_reserved`, the munged bounds block.
+pub const RESERVED_LEN: usize = 32;
+/// Size of `resource_t::rgucMD5_hash`.
+pub const MD5_LEN: usize = 16;
+
+/// Bits of a delta-coded consistency index, and the absolute fallback.
+/// `SV_SendConsistencyList`, `sv_user.cpp:352-366`.
+pub const CONSISTENCY_DELTA_BITS: u32 = 5;
+pub const CONSISTENCY_ABSOLUTE_BITS: u32 = 10;
+
+/// Which resources the server wants a `clc_fileconsistency` answer for.
 ///
-/// 52 of the 793 entries in the reference capture set it, and they are the
-/// consistency-checked ones (`models/player.mdl`, the player models, ...).
-pub const FLAG_CHECKSUM: u32 = 8;
+/// Transmitted at the tail of the *same* bit block as the resource list
+/// (`SV_SendConsistencyList`, `sv_user.cpp:334-380`), so a parser that stops
+/// after the entries leaves the bit cursor short and desynchronises whatever
+/// reads next.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsistencyList {
+    /// The single gate bit. When clear the server is not asking, and a client
+    /// that answers anyway is dropped: `SV_ParseConsistencyResponse` requires
+    /// `length == g_psv.num_consistency` (`sv_user.cpp:194`), and
+    /// `num_consistency` stays non-zero even under `mp_consistency 0`.
+    pub should_send: bool,
+    /// Resource indices to answer, in the order the server listed them.
+    pub indices: Vec<u32>,
+}
 
-/// Size of the trailing blob on a checksummed entry.
-pub const CHECKSUM_LEN: usize = 32;
-
-/// Parse `svc_resourcelist` (opcode already consumed).
-pub fn parse_resource_list(r: &mut BitReader) -> Vec<Resource> {
+/// Parse `svc_resourcelist` (opcode already consumed), including the
+/// consistency tail that shares its bit block.
+pub fn parse_resource_list_full(r: &mut BitReader) -> (Vec<Resource>, ConsistencyList) {
     let count = r.read_bits(COUNT_BITS) as usize;
     let mut out = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
@@ -64,9 +111,18 @@ pub fn parse_resource_list(r: &mut BitReader) -> Vec<Resource> {
         let name = r.read_string();
         let index = r.read_bits(INDEX_BITS);
         let size = r.read_bits(SIZE_BITS);
-        let flags = r.read_bits(FLAGS_BITS);
-        let checksum = if flags & FLAG_CHECKSUM != 0 {
-            let mut b = [0u8; CHECKSUM_LEN];
+        let flags = r.read_bits(FLAGS_BITS) as u8;
+        let md5 = if flags & RES_CUSTOM != 0 {
+            let mut b = [0u8; MD5_LEN];
+            for x in b.iter_mut() {
+                *x = r.read_byte();
+            }
+            Some(b)
+        } else {
+            None
+        };
+        let reserved = if r.read_bits(1) != 0 {
+            let mut b = [0u8; RESERVED_LEN];
             for x in b.iter_mut() {
                 *x = r.read_byte();
             }
@@ -75,18 +131,119 @@ pub fn parse_resource_list(r: &mut BitReader) -> Vec<Resource> {
             None
         };
         if name.is_empty() || r.overflowed() {
-            break;
+            return (out, ConsistencyList::default());
         }
         out.push(Resource {
             name,
             res_type: ResourceType::from_u8(res_type),
             index,
             size,
-            flags: flags as u8,
-            checksum,
+            flags,
+            md5,
+            reserved,
         });
     }
-    out
+
+    // `bits(1)` gate, then `while bits(1) { bits(1) ? +5-bit delta : 10-bit
+    // absolute }`, terminated by a clear bit. `lastcheck` starts at 0, so the
+    // first entry at index 0 encodes as [1][00000].
+    let mut consistency = ConsistencyList::default();
+    consistency.should_send = r.read_bits(1) != 0;
+    if consistency.should_send {
+        let mut lastcheck = 0u32;
+        while r.read_bits(1) != 0 && !r.overflowed() {
+            let i = if r.read_bits(1) != 0 {
+                lastcheck + r.read_bits(CONSISTENCY_DELTA_BITS)
+            } else {
+                r.read_bits(CONSISTENCY_ABSOLUTE_BITS)
+            };
+            lastcheck = i;
+            consistency.indices.push(i);
+        }
+    }
+    (out, consistency)
+}
+
+/// Parse `svc_resourcelist`, discarding the consistency tail.
+///
+/// Only safe when nothing reads after this block. Prefer
+/// [`parse_resource_list_full`].
+pub fn parse_resource_list(r: &mut BitReader) -> Vec<Resource> {
+    parse_resource_list_full(r).0
+}
+
+/// The server's whole reply to `sendres`, parsed from the opcode byte.
+///
+/// The byte prologue and the bit block are one unit and have to be read
+/// together (`SV_SendResources_internal`, `sv_main.cpp:1210-1260`):
+///
+/// ```text
+/// byte  svc_resourcerequest (45)
+/// long  spawncount
+/// long  0
+/// [byte svc_resourcelocation (56); string sv_downloadurl]   // only if set
+/// byte  svc_resourcelist (43)
+/// <one bit block: entries, then the consistency list>
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceMessage {
+    pub spawncount: u32,
+    pub download_url: Option<String>,
+    pub resources: Vec<Resource>,
+    pub consistency: ConsistencyList,
+    /// Bytes consumed, so a caller walking a larger stream can resume.
+    pub consumed: usize,
+}
+
+/// Opcodes appearing in the `sendres` reply.
+const SVC_RESOURCEREQUEST: u8 = 45;
+const SVC_RESOURCELOCATION: u8 = 56;
+const SVC_RESOURCELIST: u8 = 43;
+
+/// Parse a message that begins with `svc_resourcerequest`.
+///
+/// Returns `None` if it does not, or if it is truncated.
+pub fn parse_resource_message(msg: &[u8]) -> Option<ResourceMessage> {
+    if msg.first() != Some(&SVC_RESOURCEREQUEST) || msg.len() < 10 {
+        return None;
+    }
+    let spawncount = u32::from_le_bytes(msg[1..5].try_into().ok()?);
+    // The second long is a start index and is always 0; the reference client
+    // validates it (`HLTV/Core/src/Server.cpp:908-919`).
+    if u32::from_le_bytes(msg[5..9].try_into().ok()?) != 0 {
+        return None;
+    }
+    let mut at = 9usize;
+
+    let mut download_url = None;
+    if msg.get(at) == Some(&SVC_RESOURCELOCATION) {
+        at += 1;
+        let end = msg[at..].iter().position(|&b| b == 0)?;
+        download_url = Some(String::from_utf8_lossy(&msg[at..at + end]).into_owned());
+        at += end + 1;
+    }
+
+    if msg.get(at) != Some(&SVC_RESOURCELIST) {
+        return None;
+    }
+    at += 1;
+
+    let mut r = BitReader::new(&msg[at..]);
+    let (resources, consistency) = parse_resource_list_full(&mut r);
+    if r.overflowed() {
+        return None;
+    }
+    // A bit block occupies ceil(bits/8) bytes and the reader resumes aligned
+    // (`MSG_EndBitReading`, common.cpp:628-656).
+    let consumed = at + r.byte_pos() + usize::from(r.bit_offset() > 0);
+
+    Some(ResourceMessage {
+        spawncount,
+        download_url,
+        resources,
+        consistency,
+        consumed,
+    })
 }
 
 /// GoldSrc resource types, as used in the resource list.
@@ -132,9 +289,14 @@ pub struct Resource {
     pub res_type: Option<ResourceType>,
     pub index: u32,
     pub size: u32,
+    /// Three bits, so only `RES_FATALIFMISSING` and `RES_WASMISSING` survive.
     pub flags: u8,
-    /// Present when the server demands a consistency check for this resource.
-    pub checksum: Option<[u8; CHECKSUM_LEN]>,
+    /// `rgucMD5_hash`. Unreachable in practice — see the module docs.
+    pub md5: Option<[u8; MD5_LEN]>,
+    /// `rguc_reserved`, still `COM_Munge`'d with the spawncount. Carries a
+    /// `check_type` byte and model bounds for consistency-checked models
+    /// (`sv_user.cpp:287-312`). **Not a hash.**
+    pub reserved: Option<[u8; RESERVED_LEN]>,
 }
 
 impl Resource {
@@ -198,7 +360,8 @@ mod tests {
             index: 3,
             size: 0,
             flags: 0,
-            checksum: None,
+            md5: None,
+            reserved: None,
         };
         assert_eq!(r.hash_path(), "sound/weapons/ak47-1.wav");
     }
@@ -211,7 +374,8 @@ mod tests {
             index: 4,
             size: 0,
             flags: 0,
-            checksum: None,
+            md5: None,
+            reserved: None,
         };
         assert_eq!(r.hash_path(), "sound/ambience/wind.wav");
     }
@@ -224,7 +388,8 @@ mod tests {
             index: 1,
             size: 0,
             flags: 0,
-            checksum: None,
+            md5: None,
+            reserved: None,
         };
         assert_eq!(r.hash_path(), "models/player.mdl");
     }

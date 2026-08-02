@@ -8,6 +8,7 @@
 //! (`internal/client/client.go:30`): `disconnected`, `challenging`,
 //! `connecting`, `connected`, `running`.
 
+pub mod content;
 pub mod control;
 pub mod messages;
 pub mod session;

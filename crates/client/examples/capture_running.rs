@@ -100,16 +100,47 @@ fn main() {
     let spawncount: u32 = env::var("AIPLAYERS_SPAWNCOUNT")
         .ok()
         .and_then(|v| v.parse().ok())
+        .or_else(|| session.resource_message.as_ref().map(|r| r.spawncount))
         .or_else(|| session.recorded.iter().find_map(|m| Session::spawncount_from(m)))
         .unwrap_or(1);
-    {
-        let all = session.all_resources();
-        let n = all.len();
-        let c = all.iter().filter(|r| r.checksum.is_some()).count();
-        eprintln!("  resources: {n}, with checksum (consistency entries): {c}");
-        for r in all.iter().filter(|r| r.checksum.is_some()).take(5) {
-            eprintln!("     idx={} flags={} {}", r.index, r.flags, r.name);
+    match session.resource_message.as_ref() {
+        Some(rm) => {
+            eprintln!(
+                "  resource message: {} resources, spawncount {}, consistency {} ({} demands)",
+                rm.resources.len(),
+                rm.spawncount,
+                if rm.consistency.should_send { "REQUESTED" } else { "not requested" },
+                rm.consistency.indices.len(),
+            );
+            if rm.consistency.should_send {
+                let demands =
+                    proto::consistency::demands(&rm.resources, &rm.consistency, rm.spawncount);
+                let exact = demands
+                    .iter()
+                    .filter(|d| matches!(d, proto::consistency::Demand::ExactFile { .. }))
+                    .count();
+                eprintln!(
+                    "     {} bounds (answerable from the wire), {exact} exact-file (need local content)",
+                    demands.len() - exact,
+                );
+                for d in demands
+                    .iter()
+                    .filter(|d| matches!(d, proto::consistency::Demand::ExactFile { .. }))
+                    .take(12)
+                {
+                    eprintln!("       exact-file: {}", d.path());
+                }
+            }
         }
+        None => eprintln!("  !!! no svc_resourcerequest seen -- sendres was not answered"),
+    }
+    if let Some(crc) = session.world_map_crc() {
+        // Cross-check this against the server's own log line:
+        //   Started map "<name>" (CRC "<n>")
+        eprintln!(
+            "  server map CRC: {crc}   (spawn argument: {})",
+            session.spawn_crc(spawncount)
+        );
     }
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {

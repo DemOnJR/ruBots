@@ -57,6 +57,17 @@ pub struct Session {
     /// signon phase, which `connect_and_signon` otherwise consumes silently.
     pub record_all: bool,
     pub recorded: Vec<Vec<u8>>,
+    /// The server's reply to `sendres`, captured the moment it arrives.
+    ///
+    /// It does **not** come inside the signon burst — it is its own message,
+    /// sent only after we ask — so `Signon::resources` is always empty and
+    /// anything that reads consistency out of the signon reads nothing. This
+    /// is the authoritative copy: it carries the resource list *and* the
+    /// consistency demands, which share one bit block.
+    pub resource_message: Option<proto::resources::ResourceMessage>,
+    /// Local game files, for the exact-file consistency demands that cannot be
+    /// answered from the wire alone. `None` when we have no content.
+    pub content: Option<crate::content::GameContent>,
 }
 
 /// Counters for the receive pipeline, so a stall can be attributed to the
@@ -87,12 +98,32 @@ impl Session {
             resyncs: 0,
             record_all: false,
             recorded: Vec::new(),
+            resource_message: None,
+            content: crate::content::GameContent::discover(),
         }
     }
 
     /// The `clc_stringcmd` payload for `cmd`, ready for [`NetChannel::build`].
     fn stringcmd(cmd: &str) -> Vec<u8> {
         NetChannel::string_command(cmd)
+    }
+
+    /// Single entry point for every fully-assembled message.
+    ///
+    /// Anything that must be caught the moment it arrives, rather than searched
+    /// for afterwards, belongs here. The resource message is the motivating
+    /// case: it is its own message rather than part of the signon burst, and
+    /// hunting for it later meant scanning recorded bytes for the raw value 43
+    /// — which is ASCII `'+'` and false-matches on payload data constantly.
+    fn note_message(&mut self, msg: &[u8]) {
+        if self.resource_message.is_none() {
+            if let Some(rm) = proto::resources::parse_resource_message(msg) {
+                self.resource_message = Some(rm);
+            }
+        }
+        if self.record_all {
+            self.recorded.push(msg.to_vec());
+        }
     }
 
     /// Feed one raw datagram through the whole receive pipeline, returning any
@@ -128,9 +159,7 @@ impl Session {
                     // The whole body is a message stream.
                     return match maybe_decompress(body) {
                         Ok(msg) if !msg.is_empty() => {
-                            if self.record_all {
-                                self.recorded.push(msg.clone());
-                            }
+                            self.note_message(&msg);
                             vec![msg]
                         }
                         _ => vec![],
@@ -168,9 +197,7 @@ impl Session {
                         // signon outright (live test: connect timeout).
                         if let Ok(msg) = maybe_decompress(assembled) {
                             if !msg.is_empty() {
-                                if self.record_all {
-                                    self.recorded.push(msg.clone());
-                                }
+                                self.note_message(&msg);
                                 out.push(msg);
                             }
                         }
@@ -402,19 +429,26 @@ impl Session {
         echoed
     }
 
-    /// A real client's `clc_resourcelist`, declaring its spray decal.
+    /// `clc_resourcelist` declaring no custom resources: opcode, then `short 0`.
     ///
-    /// Client-owned, so it is not map-specific. The real client sends this on
-    /// the **fragment stream** as `idx=1/1 len=41`, which is why replaying it
-    /// as a plain reliable message never satisfied the server.
-    pub const CLC_RESOURCELIST: &'static [u8] =
-        include_bytes!("../tests/fixtures/clc_resourcelist.bin");
+    /// Replaying a captured real client's list (which declares its spray decal)
+    /// is actively dangerous here. `SV_ParseResourceList` drops the client with
+    /// `"Too many resources in client resource list"` for `total > 1`
+    /// (`sv_upld.cpp:401-407`), and validates every entry hard: it must be
+    /// `t_decal`, carry `RES_CUSTOM`, be named exactly `tempdecal.wad`, and
+    /// have a non-zero size under 1 GiB (`:427-441`). A bot has no spray to
+    /// declare, so it declares nothing — which is precisely what the reference
+    /// client does in reply to `svc_resourcerequest`
+    /// (`HLTV/Core/src/Server.cpp:921-922`).
+    pub const CLC_RESOURCELIST: [u8; 3] = [netchan::clc::RESOURCELIST, 0x00, 0x00];
 
-    /// Upload the resource list the way a real client does — fragmented.
+    /// Answer `svc_resourcerequest`. Must come after `sendres`, before `spawn`.
     ///
-    /// Must come after `sendres` and before `sendents`.
+    /// Sent as a plain reliable message, like the reference client.
+    /// `Netchan_Process` hands whole and reassembled messages to the same
+    /// parser, so there is nothing the fragment stream would add.
     pub fn upload_resource_list(&mut self) {
-        self.chan.queue_fragmented(Self::CLC_RESOURCELIST);
+        self.chan.queue_reliable(&Self::CLC_RESOURCELIST);
     }
 
     /// Build the `clc_fileconsistency` upload that carries `spawn`.
@@ -442,7 +476,7 @@ impl Session {
     /// Cross-checked against the real client's upload, which opens
     /// `07 6d 05` — length `0x056d` = 1389, so the payload runs from offset 3
     /// to 1392, which is exactly where its trailing `clc_stringcmd` begins.
-    pub fn build_spawn_upload(spawncount: u32, consistency: &[u8]) -> Vec<u8> {
+    pub fn build_spawn_upload(spawncount: u32, crc: i32, consistency: &[u8]) -> Vec<u8> {
         let mut msg = vec![netchan::clc::FILECONSISTENCY];
         // The payload is MUNGED with the spawncount as key: ReHLDS
         // `SV_ParseConsistencyResponse` does
@@ -479,8 +513,16 @@ impl Session {
         msg.extend_from_slice(&payload);
 
         // A real client appends `spawn` to the tail of this same message.
+        //
+        // The second argument is the map CRC, and it is NOT optional. See
+        // `proto::munge::spawn_crc`: the server unmunges whatever we send and
+        // compares it against `worldmapCRC` every 5 seconds
+        // (`SV_CheckMapDifferences`, sv_main.cpp:8092-8115). A literal `0`
+        // unmunges to garbage -- never to 0 -- so the comparison always failed
+        // and the client was always dropped for "Reliable channel overflowed",
+        // roughly five seconds after every otherwise-successful spawn.
         msg.push(netchan::clc::STRINGCMD);
-        msg.extend_from_slice(format!("spawn {spawncount} 0").as_bytes());
+        msg.extend_from_slice(format!("spawn {spawncount} {crc}").as_bytes());
         msg.push(0);
         msg
     }
@@ -507,36 +549,52 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// Build the bit-packed body of a `clc_fileconsistency` response.
+    /// Build the `clc_fileconsistency` body the server's list asks for, or
+    /// `None` when it is not asking.
     ///
-    /// One entry per resource the server flagged for checking, **in resource
-    /// order**, then a terminating zero bit:
+    /// **`None` means send nothing at all.** It does not mean "send an empty
+    /// response". `SV_ParseConsistencyResponse` requires the entry count to
+    /// equal `g_psv.num_consistency` (`sv_user.cpp:194`), and that stays at
+    /// ~62 even under `mp_consistency 0` — the cvar only stops the server
+    /// *asking*, it does not zero the counter. Answering an unasked question
+    /// with zero entries is exactly the `"Bad file data"` drop this client
+    /// spent a long time hitting.
     ///
-    /// ```text
-    /// repeat: 1 bit set | 12-bit resource index | 32-bit hash
-    /// end:    1 bit clear
-    /// ```
-    ///
-    /// The entry count must equal the server's `num_consistency` exactly —
-    /// `SV_ParseConsistencyResponse` ends with
-    /// `if (c < 0 || length != g_psv.num_consistency)` → `sent bad file data`.
-    /// That is why an empty response only works on a server asking for none.
-    ///
-    /// The hash is simply **the first four bytes of the MD5 the server itself
-    /// sent us** in `svc_resourcelist`: the check is
-    /// `hash != *(uint32*)&res->rgucMD5_hash[0]`, so echoing it back satisfies
-    /// the server without us owning the file. That is what makes a consistency
-    /// response possible for a client with no game content on disk.
-    pub fn build_consistency_body(resources: &[proto::resources::Resource]) -> Vec<u8> {
-        let mut w = proto::bitbuf::BitWriter::new();
-        for r in resources {
-            let Some(sum) = r.checksum else { continue };
-            w.write_bits(1, 1);
-            w.write_bits(r.index, 12);
-            w.write_bits(u32::from_le_bytes([sum[0], sum[1], sum[2], sum[3]]), 32);
+    /// Bounds demands are answered by echoing the server's own bounds back;
+    /// exact-file demands need a real MD5 from [`crate::content`]. See
+    /// [`proto::consistency`] for why that is sound.
+    pub fn build_consistency(&self) -> Option<Vec<u8>> {
+        let msg = self.resource_message.as_ref()?;
+        if !msg.consistency.should_send {
+            return None;
         }
-        w.write_bits(0, 1);
-        w.into_bytes()
+        let demands =
+            proto::consistency::demands(&msg.resources, &msg.consistency, msg.spawncount);
+
+        let mut answers = Vec::with_capacity(demands.len());
+        for d in &demands {
+            let answer = match d {
+                proto::consistency::Demand::Bounds { mins, maxs, .. } => {
+                    proto::consistency::Answer::Bounds(*mins, *maxs)
+                }
+                proto::consistency::Demand::ExactFile { path, .. } => {
+                    // Without the file we cannot answer. Send the demand with a
+                    // zero hash rather than dropping the entry: the count must
+                    // still match, and a wrong hash is a *specific* server-side
+                    // complaint ("Bad file <name>") we can act on, whereas a
+                    // short count is the generic "Bad file data".
+                    let hash = self
+                        .content
+                        .as_ref()
+                        .and_then(|c| c.md5(path))
+                        .map(|m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]))
+                        .unwrap_or(0);
+                    proto::consistency::Answer::Hash(hash)
+                }
+            };
+            answers.push((d.index(), answer));
+        }
+        Some(proto::consistency::build_body(&answers))
     }
 
     /// Send `spawn` on the fragment stream — the step that makes the server
@@ -554,10 +612,42 @@ impl Session {
     /// (`*DEAD* AIPlayer : …` in the server log) — the first time any command
     /// after `new` was ever executed.
     pub fn upload_spawn(&mut self, spawncount: u32) {
-        // Answer with the checksums the server itself advertised.
-        let body = Self::build_consistency_body(&self.all_resources());
-        let msg = Self::build_spawn_upload(spawncount, &body);
+        let crc = self.spawn_crc(spawncount);
+        let msg = match self.build_consistency() {
+            Some(body) => Self::build_spawn_upload(spawncount, crc, &body),
+            // The server is not asking. Send `spawn` on its own -- answering
+            // anyway is a drop, not a no-op.
+            None => Self::build_spawn_only(spawncount, crc),
+        };
         self.chan.queue_fragmented(&msg);
+    }
+
+    /// `clc_stringcmd "spawn <spawncount> <crc>"`, with no consistency wrapper.
+    pub fn build_spawn_only(spawncount: u32, crc: i32) -> Vec<u8> {
+        let mut msg = vec![netchan::clc::STRINGCMD];
+        msg.extend_from_slice(format!("spawn {spawncount} {crc}").as_bytes());
+        msg.push(0);
+        msg
+    }
+
+    /// The `<crc>` argument for `spawn`, derived from the signon we received.
+    ///
+    /// Returns 0 only if we somehow have no `svc_serverinfo`, which cannot
+    /// happen on a real signon — and 0 is the value that gets us dropped, so a
+    /// regression here is loud rather than silent.
+    pub fn spawn_crc(&self, spawncount: u32) -> i32 {
+        self.signon
+            .as_ref()
+            .and_then(|s| s.server_info.as_ref())
+            .map(|si| proto::munge::spawn_crc(si.map_crc, si.player_index, spawncount))
+            .unwrap_or(0)
+    }
+
+    /// The server's real map CRC, for cross-checking against its own
+    /// `Started map "<name>" (CRC "<n>")` log line.
+    pub fn world_map_crc(&self) -> Option<i32> {
+        let si = self.signon.as_ref()?.server_info.as_ref()?;
+        Some(proto::munge::world_map_crc(si.map_crc, si.player_index))
     }
 
     /// Spawncount advertised by `svc_resourcerequest`, once seen.
