@@ -337,7 +337,20 @@ impl Controller {
         }
 
         // Whatever the navigation layer wants next.
-        if let Some(t) = self.objective.target {
+        //
+        // Falls back to the caller's `site` when no objective machine has
+        // claimed one. That fallback is what makes the bot move at all in the
+        // ordinary case: the bomb machine deliberately clears its target for a
+        // terrorist who is not carrying the C4 (`objective.rs` -- only the
+        // carrier plants), so without this a bot with a perfectly good route
+        // to a bomb site stands still and the navigation layer looks broken
+        // when it is working. Measured before the fix:
+        //
+        //     brain: alive true fwd 0 side 0 site Some([-1400,2320]) wp 5
+        //
+        // Going to the site is right whether or not there is an objective to
+        // perform there -- it is where the round happens.
+        if let Some(t) = self.objective.target.or(site) {
             self.view = turn_toward(self.view, aim_angles(world.me.origin, t), max_turn);
             let arrived = distance2d(world.me.origin, t) < ARRIVE_RADIUS;
             return Intent {
@@ -424,6 +437,58 @@ mod tests {
         let mut c = Controller::new(seed, Difficulty::Unfair);
         c.params.fire_chance = 1.0;
         c
+    }
+
+    /// The ordinary case, and the one that was broken: a terrorist with no
+    /// C4, no enemy in sight and somewhere to be must WALK there. The bomb
+    /// machine clears its own target for a non-carrier, so the fallback to the
+    /// caller's site is the only thing that moves this bot.
+    #[test]
+    fn a_bot_with_nothing_else_to_do_walks_to_the_site() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        let w = WorldView {
+            me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+        let site = [1000.0, 0.0, 0.0];
+        let intent = c.think(&w, Some(site), 0.1);
+
+        assert!(
+            intent.forwardmove > 0.0,
+            "should be walking toward the site, got {}",
+            intent.forwardmove
+        );
+        assert_eq!(intent.move_target, Some(site));
+    }
+
+    /// ...and stops once it is there, rather than grinding into the wall.
+    #[test]
+    fn arriving_at_the_site_stops_the_walk() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        let w = WorldView {
+            me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+        let intent = c.think(&w, Some([4.0, 0.0, 0.0]), 0.1);
+        assert_eq!(intent.forwardmove, 0.0, "already inside the arrive radius");
+    }
+
+    /// With no site and nothing to do it must still not freeze solid --
+    /// `CheckActivityInGame` kicks a player whose view has not moved.
+    #[test]
+    fn with_no_site_at_all_the_bot_still_drifts_its_view() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        let w = WorldView {
+            me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+        let a = c.think(&w, None, 0.1);
+        let b = c.think(&w, None, 0.1);
+        assert_eq!(a.forwardmove, 0.0);
+        assert!(
+            (a.view.yaw - b.view.yaw).abs() > 0.0 || (a.view.pitch - b.view.pitch).abs() > 0.0,
+            "the anti-idle drift must keep the view moving"
+        );
     }
 
     #[test]

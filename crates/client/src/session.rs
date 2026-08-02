@@ -96,6 +96,11 @@ pub struct Session {
     /// The loaded map: collision, entities and the navigation graph.
     pub map: Option<crate::map::Map>,
     follower: crate::navigate::PathFollower,
+    /// Where we were last frame, and when. `clientdata_t` does NOT carry
+    /// velocity -- the server omits it because a predicting client computes
+    /// its own -- so real speed has to be measured from successive origins.
+    last_origin: Option<([f32; 3], Instant)>,
+    last_speed: f32,
     /// What the brain decided last frame, for diagnostics.
     pub last_decision: Option<Decision>,
     last_think: Option<Instant>,
@@ -152,6 +157,8 @@ impl Session {
             site: None,
             map: None,
             follower: crate::navigate::PathFollower::new(),
+            last_origin: None,
+            last_speed: 0.0,
             last_decision: None,
             last_think: None,
             bought_at_reset: None,
@@ -920,15 +927,19 @@ impl Session {
         // Turn the objective into the NEXT waypoint. Steering straight at a
         // distant goal walks into walls -- on de_dust2 the straight line from
         // a T spawn to bombsite B crosses most of the map.
-        let site = match (self.map.as_ref(), self.site) {
-            (Some(m), Some(goal)) => self.follower.next_waypoint(
-                &m.grid,
-                world.me.origin,
-                goal,
-                world.me.velocity[0].hypot(world.me.velocity[1]),
-                dt,
-            ),
-            _ => self.site,
+        let speed = self.measured_speed(world.me.origin, now);
+        let site = match (self.map.take(), self.site) {
+            (Some(m), Some(goal)) => {
+                let w =
+                    self.follower
+                        .next_waypoint(&m.grid, world.me.origin, goal, speed, dt);
+                self.map = Some(m);
+                w
+            }
+            (m, _) => {
+                self.map = m;
+                self.site
+            }
         };
         let intent = self.brain.as_mut()?.think(&world, site, dt);
         self.last_decision = Some(Decision {
@@ -948,6 +959,32 @@ impl Session {
             }
         }
         Some(intent)
+    }
+
+    /// Horizontal speed, measured rather than reported.
+    ///
+    /// `clientdata_t` has a `velocity` field and the server does not send it:
+    /// dumping every field that arrives while running at 240 u/s gives eleven,
+    /// and velocity is not among them. That is not a decode failure -- a
+    /// client with prediction on computes its own velocity, so the server
+    /// saves the bits. Trusting the absent field means reading zero, which
+    /// makes a bot sprinting across the map look permanently stuck.
+    fn measured_speed(&mut self, origin: [f32; 3], now: Instant) -> f32 {
+        let speed = match self.last_origin {
+            Some((prev, at)) => {
+                let dt = now.saturating_duration_since(at).as_secs_f32();
+                if dt < 1e-3 {
+                    return self.last_speed;
+                }
+                let (dx, dy) = (origin[0] - prev[0], origin[1] - prev[1]);
+                (dx * dx + dy * dy).sqrt() / dt
+            }
+            None => 0.0,
+        };
+        self.last_origin = Some((origin, now));
+        // A respawn teleports us; that is not running.
+        self.last_speed = if speed > 1000.0 { 0.0 } else { speed };
+        self.last_speed
     }
 
     /// Load the map named in `svc_serverinfo` and pick an objective.
