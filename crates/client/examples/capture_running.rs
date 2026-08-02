@@ -221,6 +221,7 @@ fn main() {
     let mut last_keep = Instant::now();
 
     let mut settled_logged = false;
+    let mut announced_plant = false;
     let start = Instant::now();
     // Walk a square, turning every 3 s. Movement has to be *observable* to be
     // verifiable, and `svc_clientdata` gives us the server's own opinion of
@@ -354,6 +355,17 @@ fn main() {
                         dec.escort, dec.hostages, dec.hostages_led, dec.to_hostage,
                         dec.use_edges,
                     );
+                }
+                // A one-shot marker so a scenario script can wait for the bomb
+                // without touching the server. Polling the log for it is
+                // self-defeating: forcing a flush with `log off` ROTATES the
+                // file, so a plant recorded before the poll lands in a file the
+                // next poll no longer looks at.
+                if session.decoder.as_ref().is_some_and(|d| d.game.bomb_planted)
+                    && !announced_plant
+                {
+                    announced_plant = true;
+                    eprintln!("*** BOMB PLANTED (as decoded by this client) ***");
                 }
                 if let Some(d) = session.decoder.as_ref() {
                     eprintln!(

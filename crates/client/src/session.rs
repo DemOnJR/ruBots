@@ -1367,12 +1367,15 @@ impl Session {
         // the bomb machine and a CT with no planted bomb has nothing to say --
         // so without this the route is pinned to the map's declared objective,
         // a hostage spawn, for the entire walk back to the rescue zone.
-        let goal = self
+        // Where the FEET are going. The brain's own target wins -- a hostage or
+        // rescue zone, a dropped bomb to retrieve, a planted one to defuse --
+        // falling back to the map objective.
+        let route_goal = self
             .brain
             .as_ref()
             .and_then(|b| b.nav_goal.or(b.objective.target))
             .or(self.site);
-        let site = match (self.map.take(), goal) {
+        let site = match (self.map.take(), route_goal) {
             (Some(m), Some(goal)) => {
                 let w = self
                     .follower
@@ -1382,14 +1385,23 @@ impl Session {
             }
             (m, _) => {
                 self.map = m;
-                goal
+                route_goal
             }
         };
         // The goal and the next waypoint are different questions: arrival is
         // about the bomb site, steering is about the route to it. Passing the
         // waypoint as the goal made the bot declare itself on the plant spot at
         // every waypoint it reached.
-        let nav = bot::controller::Nav { goal, waypoint: site };
+        // The MAP objective goes to the brain, never the routing goal. Feeding
+        // the routing goal back in is a latch: `ObjectiveState::tick` sets its
+        // target from whatever it is given, so once anything moved that target
+        // -- a dropped bomb lying near spawn, say -- the goal became the
+        // target, which became the goal, for the rest of the round. Live, a
+        // terrorist sat in its own spawn buy zone reporting `to_goal 25` and
+        // `rung plant`, with the real bomb site 3600 units away, holding the C4
+        // and pressing nothing, because the server rightly said `bombzone
+        // false`.
+        let nav = bot::controller::Nav { goal: self.site, waypoint: site };
         let mut intent = self.brain.as_mut()?.think(&world, nav, dt);
 
         // Blocked by geometry the route does not model: strafe, jump, and
@@ -1418,7 +1430,7 @@ impl Session {
                     bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
             }
         }
-        let to_goal = goal
+        let to_goal = route_goal
             .map(|g| {
                 let (dx, dy) = (g[0] - world.me.origin[0], g[1] - world.me.origin[1]);
                 (dx * dx + dy * dy).sqrt()
