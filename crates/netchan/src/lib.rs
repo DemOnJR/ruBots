@@ -376,6 +376,33 @@ impl NetChannel {
         self.frag_out = Some(FragOut { data: payload.to_vec(), next: 1, total });
     }
 
+    /// Abandon everything in flight, exactly as ReHLDS `Netchan_Clear` does
+    /// (`rehlds/engine/net_chan.cpp`).
+    ///
+    /// The server calls it on **both** sides of a level change: `SV_ActivateServer`
+    /// does `Netchan_Clear(&cl->netchan)` and then writes
+    /// `svc_stufftext "reconnect"` (`sv_main.cpp:6217-6222`), and the client's
+    /// `reconnect` handler does the same before writing `clc_stringcmd "new"`
+    /// (`Host_Reconnect_f`, `host_cmd.cpp`). A client that skips this keeps
+    /// retransmitting a reliable the server has already thrown away, and keeps a
+    /// half-finished fragment upload that will be reassembled against a stream
+    /// the server has reset.
+    ///
+    /// The reliable bit is toggled when a reliable was still in flight —
+    /// `chan->reliable_sequence ^= 1` in the engine — because the peer never
+    /// acknowledged it and the next promotion must not reuse the same bit.
+    /// Sequence numbers are **not** reset: the engine leaves
+    /// `incoming_sequence`/`outgoing_sequence` alone, and so do we.
+    pub fn clear(&mut self) {
+        if !self.reliable_buf.is_empty() {
+            self.outgoing_reliable ^= 1;
+            self.reliable_buf.clear();
+        }
+        self.queued.clear();
+        self.frag_out = None;
+        self.frag_header = None;
+    }
+
     /// Is a fragmented upload still in progress?
     pub fn fragment_upload_active(&self) -> bool {
         self.frag_out.is_some()

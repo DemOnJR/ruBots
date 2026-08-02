@@ -95,14 +95,14 @@ fn main() {
     session.send_command(Session::SENDRES);
     let res_until = Instant::now() + Duration::from_millis(800);
     while Instant::now() < res_until {
-        let _ = session.pump(&mut t, &[netchan::clc::NOP]);
+        let _ = session.pump_idle(&mut t);
     }
 
     eprintln!("  uploading clc_resourcelist (fragmented)");
     session.upload_resource_list();
     let up_until = Instant::now() + Duration::from_millis(1000);
     while Instant::now() < up_until {
-        let _ = session.pump(&mut t, &[netchan::clc::NOP]);
+        let _ = session.pump_idle(&mut t);
     }
 
     let spawncount: u32 = env::var("AIPLAYERS_SPAWNCOUNT")
@@ -188,7 +188,7 @@ fn main() {
                     .unwrap_or(2000),
             );
         while Instant::now() < settle {
-            let _ = session.pump(&mut t, &[netchan::clc::NOP]);
+            let _ = session.pump_idle(&mut t);
         }
         eprintln!("  joining team, retrying until the server actually spawns us");
         let team: u8 = env::var("AIPLAYERS_TEAM")

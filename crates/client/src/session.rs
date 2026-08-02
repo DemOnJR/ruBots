@@ -83,6 +83,14 @@ pub struct Session {
     /// signon phase, which `connect_and_signon` otherwise consumes silently.
     pub record_all: bool,
     pub recorded: Vec<Vec<u8>>,
+    /// When each entry of `recorded` was assembled, index-parallel with it.
+    ///
+    /// Pushed in the same breath as the message, because the alternative --
+    /// timestamping a recording when something gets round to reading it --
+    /// produces a trace that says every message in a burst arrived at the same
+    /// instant, which is exactly the twelve-second blind spot a blocking call
+    /// like [`enter_game`](Session::enter_game) creates.
+    pub recorded_at: Vec<Instant>,
     /// The server's reply to `sendres`, captured the moment it arrives.
     ///
     /// It does **not** come inside the signon burst — it is its own message,
@@ -91,6 +99,15 @@ pub struct Session {
     /// is the authoritative copy: it carries the resource list *and* the
     /// consistency demands, which share one bit block.
     pub resource_message: Option<proto::resources::ResourceMessage>,
+    /// `spawn` has gone out on this signon.
+    ///
+    /// Reset by [`reconnect`](Session::reconnect), because a level change puts
+    /// the client back before `spawn` on the server's side too
+    /// (`SV_InactivateClients` clears `spawned`/`fully_connected`,
+    /// `sv_main.cpp:7702-7729`).
+    pub spawn_uploaded: bool,
+    /// The server has stuffed `reconnect` at us and we have not acted yet.
+    pub pending_reconnect: bool,
     /// Local game files, for the exact-file consistency demands that cannot be
     /// answered from the wire alone. `None` when we have no content.
     pub content: Option<crate::content::GameContent>,
@@ -155,6 +172,48 @@ pub struct RecvStats {
     pub read_rejected: u32,
 }
 
+/// One assembled `svc_*` stream, decoded into the messages it actually
+/// contains.
+///
+/// Produced by [`Session::trace_message`]. Every message here was **located by
+/// parsing** — the walker sized its predecessor and landed on this opcode — so
+/// an entry is a message boundary, not a byte that happened to hold that value.
+#[derive(Debug, Default, Clone)]
+pub struct StreamTrace {
+    pub items: Vec<crate::stream::Item>,
+    /// How far the walk got.
+    pub stopped_at: usize,
+    /// The opcode that halted it. `None` means the whole stream was consumed;
+    /// anything else means the tail after `stopped_at` was **not looked at**,
+    /// which is the honest answer and the one a scan cannot give.
+    pub stopped_on: Option<u8>,
+}
+
+impl StreamTrace {
+    /// The text of every `svc_stufftext`, in order.
+    pub fn strings_of(&self, id: u8) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(|it| match it {
+                crate::stream::Item::Engine { id: i, payload } if *i == id => {
+                    Some(String::from_utf8_lossy(payload).into_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The console commands the server pushed at us, in order.
+    pub fn stufftexts(&self) -> Vec<String> {
+        self.strings_of(crate::svc::SVC_STUFFTEXT)
+    }
+
+    /// Did the walk consume everything?
+    pub fn complete(&self) -> bool {
+        self.stopped_on.is_none()
+    }
+}
+
 impl Session {
     pub fn new(identity: Identity) -> Self {
         Self {
@@ -169,7 +228,10 @@ impl Session {
             resyncs: 0,
             record_all: false,
             recorded: Vec::new(),
+            recorded_at: Vec::new(),
             resource_message: None,
+            spawn_uploaded: false,
+            pending_reconnect: false,
             content: crate::content::GameContent::discover(),
             clock: crate::clock::MoveClock::new(Instant::now()),
             clientdata: None,
@@ -229,6 +291,7 @@ impl Session {
         self.answer_cvar_queries(msg);
         if self.record_all {
             self.recorded.push(msg.to_vec());
+            self.recorded_at.push(Instant::now());
         }
     }
 
@@ -437,11 +500,28 @@ impl Session {
         }
         self.phase = Phase::Signon;
 
-        // 2) Ask for the signon. This goes through the reliable queue, so it
-        //    is retransmitted until the server acknowledges it.
-        self.chan.queue_reliable(&Self::stringcmd("new"));
+        // 2) Ask for the signon and collect it.
+        self.request_new();
+        self.collect_signon(t, deadline)?;
+        Ok(self.signon.as_ref().unwrap())
+    }
 
-        // 3) Collect fragments, acking as we go.
+    /// Queue `clc_stringcmd "new"`, the request that makes the server send the
+    /// signon burst. Reliable, so it is retransmitted until acknowledged.
+    fn request_new(&mut self) {
+        self.chan.queue_reliable(&Self::stringcmd("new"));
+    }
+
+    /// Collect the signon burst until the `usercmd_t` table has been learned.
+    ///
+    /// Shared by the first connect and by [`resignon`](Self::resignon), because
+    /// the engine treats them identically: `Host_Reconnect_f` does not redo the
+    /// handshake, it clears the netchannel and writes `clc_stringcmd "new"`.
+    fn collect_signon<T: Transport>(
+        &mut self,
+        t: &mut T,
+        deadline: Instant,
+    ) -> Result<(), Disconnect> {
         let mut last_ack = Instant::now();
         while Instant::now() < deadline {
             match t.recv() {
@@ -458,7 +538,7 @@ impl Session {
                         if walked.registry.get("usercmd_t").is_some() {
                             self.signon = Some(walked);
                             self.phase = Phase::Running;
-                            return Ok(self.signon.as_ref().unwrap());
+                            return Ok(());
                         }
                     }
                 }
@@ -469,12 +549,130 @@ impl Session {
             // plus a nop, and is also how our acknowledgements reach the
             // server so it keeps streaming.
             if last_ack.elapsed() >= Duration::from_millis(50) {
-                let pkt = self.chan.transmit(&[netchan::clc::NOP]);
+                let body = self.idle_body();
+                let pkt = self.chan.transmit(&body);
                 t.send(&pkt).map_err(|_| Disconnect::Closed)?;
                 last_ack = Instant::now();
             }
         }
         Err(Disconnect::Timeout)
+    }
+
+    /// Carry out the engine's `reconnect` console command.
+    ///
+    /// **This is not a re-handshake.** `Host_Reconnect_f`
+    /// (`rehlds/engine/host_cmd.cpp`) is, in full:
+    ///
+    /// ```text
+    /// if (cls.state < ca_connected) return;
+    /// cls.signon = 0;  cls.state = ca_connected;
+    /// Netchan_Clear(&cls.netchan);  SZ_Clear(&cls.netchan.message);
+    /// MSG_WriteChar(clc_stringcmd);  MSG_WriteString("new");
+    /// ```
+    ///
+    /// No `getchallenge`, no `connect`, no new UDP socket, no certificate — the
+    /// same netchannel is reset and the signon is re-run on it. That matters
+    /// twice over: it is why a real client's `reconnect` can never collide with
+    /// its own slot (there is no second `connect` for `SV_ConnectClient` to
+    /// match, and Reunion's `IDClientsLimit` is never consulted), and it is why
+    /// the sequence numbers must be left alone — the engine does not reset
+    /// them, so neither do we.
+    ///
+    /// The server has done the mirror-image reset before sending us the
+    /// command: `SV_ActivateServer` calls `Netchan_Clear(&cl->netchan)` and
+    /// then writes the stufftext (`sv_main.cpp:6217-6222`), having already run
+    /// `SV_InactivateClients` to clear `active`/`spawned`/`fully_connected` and
+    /// each client's customization list (`sv_main.cpp:7702-7729`). Everything
+    /// we learned from the old signon — delta tables, user messages, baselines,
+    /// our own client data — belongs to a server instance that no longer
+    /// exists, so all of it is dropped here.
+    pub fn reconnect(&mut self) {
+        self.chan.clear();
+        self.pending_reconnect = false;
+        self.phase = Phase::Signon;
+        // `signon` is deliberately KEPT until the new burst replaces it.
+        //
+        // The engine does the same: `Host_Reconnect_f` clears the netchannel
+        // and the signon counter, and nothing in it touches the delta
+        // descriptions -- those live in the global list `Delta_ParseDescription`
+        // registered them into and simply get re-registered when the new
+        // `svc_serverinfo` arrives. Keeping ours matters for one concrete
+        // reason: [`idle_body`] needs the `usercmd_t` table to build a
+        // `clc_move`, and without it we would fall back to `clc_nop` for the
+        // whole re-signon -- three seconds of exactly the silence that gets a
+        // client flagged (see `idle_body`). A real client never goes quiet on a
+        // level change; it has had the table since the *first* signon.
+        self.sender = None;
+        self.resource_message = None;
+        self.spawn_uploaded = false;
+        self.clientdata = None;
+        self.decoder = None;
+        self.last_valid_frame = None;
+        self.user_msgs.clear();
+        self.cmd_history.clear();
+        self.frag = Default::default();
+        self.split = Default::default();
+        self.request_new();
+    }
+
+    /// [`reconnect`](Self::reconnect), then drive the new signon to completion.
+    ///
+    /// Returns the map name the server came back with, so a caller can notice
+    /// that a level change moved it somewhere its navigation does not cover.
+    pub fn resignon<T: Transport>(
+        &mut self,
+        t: &mut T,
+        timeout: Duration,
+    ) -> Result<String, Disconnect> {
+        self.reconnect();
+        let deadline = Instant::now() + timeout;
+        self.collect_signon(t, deadline)?;
+        Ok(self
+            .signon
+            .as_ref()
+            .and_then(|s| s.server_info.as_ref())
+            .map(|si| si.map_name().to_string())
+            .unwrap_or_default())
+    }
+
+    /// Everything a level change asks of a client, end to end.
+    ///
+    /// [`resignon`](Self::resignon) puts us back through the signon; the server
+    /// then wants the same post-signon exchange it wanted the first time,
+    /// because `SV_InactivateClients` cleared `m_bSentNewResponse`, `spawned`
+    /// and `fully_connected` (`sv_main.cpp:7702-7729`). Team and class are NOT
+    /// re-chosen: ReGameDLL keeps the player's team across a level change, so
+    /// `jointeam` here would be a second team change and be refused.
+    ///
+    /// Returns the map the server is now running.
+    pub fn rejoin_after_reconnect<T: Transport>(
+        &mut self,
+        t: &mut T,
+        timeout: Duration,
+    ) -> Result<String, Disconnect> {
+        let map = self.resignon(t, timeout)?;
+        let deadline = Instant::now() + timeout;
+
+        self.send_command(Self::SENDRES);
+        while Instant::now() < deadline && self.resource_message.is_none() {
+            self.pump_idle(t).map_err(|_| Disconnect::Closed)?;
+        }
+        self.upload_resource_list();
+        let settle = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < settle {
+            self.pump_idle(t).map_err(|_| Disconnect::Closed)?;
+        }
+
+        let spawncount = self
+            .resource_message
+            .as_ref()
+            .map(|r| r.spawncount)
+            .or_else(|| self.recorded.iter().find_map(|m| Self::spawncount_from(m)))
+            .unwrap_or(1);
+        self.start_decoding();
+        self.enter_game(t, spawncount, Duration::from_secs(12))
+            .map_err(|_| Disconnect::Closed)?;
+        Ok(map)
     }
 
     /// Once running, the `MoveSender` bound to the learned `usercmd_t` table.
@@ -576,7 +774,7 @@ impl Session {
         self.upload_spawn(spawncount);
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline && self.chan.fragment_upload_active() {
-            self.pump(t, &[netchan::clc::NOP])?;
+            self.pump_idle(t)?;
         }
 
         // 2) `sendents`, until traffic proves we are in.
@@ -587,7 +785,7 @@ impl Session {
                 self.send_command("sendents");
                 last_send = Instant::now();
             }
-            self.pump(t, &[netchan::clc::NOP])?;
+            self.pump_idle(t)?;
             if self.stats.plain > before + 20 {
                 return Ok(true);
             }
@@ -606,28 +804,21 @@ impl Session {
     /// immediate `svc_disconnect`.
     pub const ECHO_COMMANDS: [&'static str; 2] = ["allow_shaders", "allow_autoaim"];
 
-    /// Scan an assembled `svc_*` stream for stufftexts we are expected to echo,
-    /// and queue the echoes. Returns the commands echoed.
+    /// Walk an assembled `svc_*` stream and answer the stufftexts we are
+    /// expected to echo. Returns the commands echoed.
     ///
-    /// This is a targeted scan rather than a full stream walk: the stream can
-    /// contain user messages whose lengths we do not know, so walking it
-    /// blindly would desynchronise. Matching on the opcode byte followed by one
-    /// of the known command names is safe because those names do not occur in
-    /// binary payload data.
+    /// **Every stufftext here is located by parsing**, via
+    /// [`trace_message`](Self::trace_message). The previous version scanned the
+    /// stream for the byte 9 and read a NUL-terminated string from wherever it
+    /// found one, which reports a "command" for every 9 that happens to sit in
+    /// a delta description, an MD5, a resource hash or a user-message payload.
+    /// One live run produced thirty such lines of which exactly one was a real
+    /// message. This is the same defect that was fixed in
+    /// [`crate::world::Decoder::absorb_baselines`]; it was in two places.
     pub fn echo_stufftexts(&mut self, msg: &[u8]) -> Vec<String> {
+        let trace = self.trace_message(msg);
         let mut echoed = Vec::new();
-        let mut i = 0usize;
-        while i < msg.len() {
-            if msg[i] != crate::svc::SVC_STUFFTEXT {
-                i += 1;
-                continue;
-            }
-            let rest = &msg[i + 1..];
-            let Some(end) = rest.iter().position(|&b| b == 0) else {
-                break;
-            };
-            let text = String::from_utf8_lossy(&rest[..end]).to_string();
-            let head = text.split_whitespace().next().unwrap_or("");
+        for text in trace.stufftexts() {
             // Every console command the server pushes at us, verbatim. An
             // anticheat's whole interface to a client is stufftext, so this is
             // the only place its demands are visible -- and a command we do not
@@ -636,14 +827,178 @@ impl Session {
             if std::env::var_os("AIPLAYERS_TRACE_STUFF").is_some() {
                 eprintln!("  <<stufftext>> {:?}", text.trim());
             }
+            let head = text.split_whitespace().next().unwrap_or("");
+            if head == "reconnect" {
+                // Cannot be acted on here: this runs inside the receive path,
+                // which does not own the transport. Latch it and let the frame
+                // loop (or an explicit `resignon`) carry it out.
+                self.pending_reconnect = true;
+                echoed.push("reconnect".to_string());
+                continue;
+            }
             if Self::ECHO_COMMANDS.contains(&head) {
                 let cmd = text.trim_end_matches(['\n', '\r']).to_string();
                 self.send_command(&cmd);
                 echoed.push(cmd);
             }
-            i += 1 + end + 1;
         }
         echoed
+    }
+
+    /// Decode one fully-assembled `svc_*` stream into the messages it contains.
+    ///
+    /// This is [`crate::stream::walk`] driven in a loop: the byte walker sizes
+    /// everything it can and halts on the messages it cannot size byte-wise,
+    /// and [`step_over_packed`](Self::step_over_packed) then measures those by
+    /// *parsing* them and hands the walk back its resume offset. Nothing is
+    /// ever found by searching for an opcode value, so a `9` inside an MD5 or a
+    /// delta description is never mistaken for `svc_stufftext`.
+    ///
+    /// It is also where the user-message registrations are learned: an
+    /// `svc_newusermsg` the walk stepped over is a registration at a real
+    /// message boundary, so the table it builds cannot contain a phantom entry
+    /// the way a scan for the raw byte 39 can.
+    ///
+    /// Where it stops matters and is reported rather than papered over. The
+    /// truly bit-packed messages (`svc_clientdata`, `svc_packetentities`,
+    /// `svc_spawnbaseline`, …) need the delta tables and the baselines to
+    /// measure, which is [`crate::world::Decoder`]'s job; this walk halts on
+    /// them with `stopped_on` set. That costs nothing for the traffic this
+    /// function exists to read: a netchannel packet is
+    /// `[reliable messages][unreliable datagram]` and every stufftext the
+    /// engine writes goes on the **reliable** side (`sv_main.cpp:1584`,
+    /// `sv_upld.cpp:82`, `sv_user.cpp:1961`, `SV_BroadcastCommand`
+    /// `sv_main.cpp:5940`), so it is always in front of the bit-packed block.
+    pub fn trace_message(&mut self, msg: &[u8]) -> StreamTrace {
+        let mut out = StreamTrace::default();
+        let mut at = 0usize;
+        loop {
+            let walk = crate::stream::walk(&msg[at..], &self.user_msgs);
+            for item in &walk.items {
+                self.learn_user_message(item);
+            }
+            out.items.extend(walk.items);
+            let stop = at + walk.stopped_at;
+            let Some(op) = walk.stopped_on else {
+                out.stopped_at = stop;
+                return out;
+            };
+            // A registration we just learned from this very stream. The table
+            // is fixed for the duration of one `stream::walk` call, so a server
+            // that registers a user message and then sends one in the same
+            // burst halts the first pass on an id we now know. Resume rather
+            // than give up -- `stop > at` guarantees progress, so this cannot
+            // spin.
+            if stop > at && self.user_msgs.contains_key(&op) {
+                at = stop;
+                continue;
+            }
+            match Self::step_over_packed(msg, stop) {
+                Some(next) if next > stop && next <= msg.len() => {
+                    out.items.push(crate::stream::Item::Engine {
+                        id: op,
+                        payload: msg[stop + 1..next].to_vec(),
+                    });
+                    at = next;
+                    if at >= msg.len() {
+                        out.stopped_at = at;
+                        return out;
+                    }
+                }
+                _ => {
+                    out.stopped_at = stop;
+                    out.stopped_on = Some(op);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Register an `svc_newusermsg` the walk stepped over.
+    ///
+    /// Payload is `u8 id`, `u8 size`, then a fixed 16-byte name field
+    /// (`SV_SendUserReg`, `rehlds/engine/sv_main.cpp:1495-1507`). A size of 255
+    /// means the game DLL registered it with `-1`: variable length, with a
+    /// leading length byte.
+    fn learn_user_message(&mut self, item: &crate::stream::Item) {
+        let crate::stream::Item::Engine { id, payload } = item else {
+            return;
+        };
+        if *id != crate::svc::SVC_NEWUSERMSG || payload.len() < 18 {
+            return;
+        }
+        let name: String = payload[2..18]
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as char)
+            .collect();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_graphic()) {
+            return;
+        }
+        self.user_msgs
+            .insert(payload[0], crate::stream::UserMsgDef { name, size: payload[1] });
+    }
+
+    /// Measure one bit-packed-but-byte-aligned message at `at`, returning the
+    /// offset just past it.
+    ///
+    /// Only the three the *reliable* signon burst is made of, because those are
+    /// what stands between the start of a stream and the stufftexts behind
+    /// them. `SV_New_f` (`rehlds/engine/sv_main.cpp:1509-1594`) builds its
+    /// reply as `svc_serverinfo` (with the seven `svc_deltadescription`s
+    /// inside `SV_SendServerinfo`), then the `svc_newusermsg` registrations,
+    /// then `svc_stufftext "fullserverinfo …"` — so a walk that cannot step
+    /// over a delta description never reaches a single stufftext in the signon.
+    /// `svc_resourcelist` is the same story for the reply to `sendres`.
+    ///
+    /// Each is measured by parsing it with the same code that consumes it for
+    /// real, and every bit region ends byte-aligned, which is what makes the
+    /// resume offset exact rather than a guess. A parse that does not produce
+    /// what the header promised returns `None`, which halts the walk instead of
+    /// resuming it somewhere wrong.
+    fn step_over_packed(msg: &[u8], at: usize) -> Option<usize> {
+        let id = *msg.get(at)?;
+        let mut r = crate::messages::Reader::new(msg);
+        r.seek(at + 1);
+        if r.pos() != at + 1 {
+            return None;
+        }
+        match id {
+            // int protocol, int spawncount, int crc, 16-byte dll md5, three
+            // bytes, three strings, then the map cycle and a trailing flag.
+            crate::svc::SVC_SERVERINFO => {
+                crate::messages::ServerInfo::parse(&mut r)?;
+                r.cstr()?;
+                r.u8()?;
+                Some(r.pos())
+            }
+            // string name, u16 field count, then the packed field table.
+            crate::svc::SVC_DELTADESCRIPTION => {
+                r.cstr()?;
+                let lo = r.u8()?;
+                let hi = r.u8()?;
+                let count = usize::from(u16::from_le_bytes([lo, hi]));
+                let base = r.pos();
+                let mut br = proto::bitbuf::BitReader::new(msg.get(base..)?);
+                let fields = proto::delta::parse_description(&mut br, count);
+                if fields.len() != count {
+                    return None;
+                }
+                Some(base + br.byte_pos() + usize::from(br.bit_offset() > 0))
+            }
+            // Entries and the consistency demands share ONE bit block, so both
+            // have to be read to know where the block ends.
+            crate::svc::SVC_RESOURCELIST => {
+                let base = r.pos();
+                let mut br = proto::bitbuf::BitReader::new(msg.get(base..)?);
+                let (list, _consistency) = proto::resources::parse_resource_list_full(&mut br);
+                if list.is_empty() || br.overflowed() {
+                    return None;
+                }
+                Some(base + br.byte_pos() + usize::from(br.bit_offset() > 0))
+            }
+            _ => None,
+        }
     }
 
     /// `clc_resourcelist` declaring no custom resources: opcode, then `short 0`.
@@ -829,6 +1184,7 @@ impl Session {
     /// (`*DEAD* AIPlayer : …` in the server log) — the first time any command
     /// after `new` was ever executed.
     pub fn upload_spawn(&mut self, spawncount: u32) {
+        self.spawn_uploaded = true;
         let crc = self.spawn_crc(spawncount);
         let msg = match self.build_consistency() {
             Some(body) => Self::build_spawn_upload(spawncount, crc, &body),
@@ -925,7 +1281,7 @@ impl Session {
             self.send_command(&cmd);
             let until = Instant::now() + Self::JOIN_STEP;
             while Instant::now() < until {
-                self.pump(t, &[netchan::clc::NOP])?;
+                self.pump_idle(t)?;
             }
         }
         Ok(())
@@ -1327,7 +1683,7 @@ impl Session {
     fn pump_moving<T: Transport>(&mut self, t: &mut T) -> io::Result<Vec<Vec<u8>>> {
         let msecs = self.clock.due(Instant::now());
         if msecs.is_empty() {
-            return self.pump(t, &[netchan::clc::NOP]);
+            return self.pump_idle(t);
         }
         let body = self.build_move_body(&msecs, &bot::Intent::default());
         self.pump(t, &body)
@@ -1464,6 +1820,47 @@ impl Session {
         Ok(out)
     }
 
+    /// The unreliable body a real client puts in a packet it has nothing to
+    /// say in — which is **never `clc_nop`** once it is connected.
+    ///
+    /// Verified from `captures/real_client_relay.bin`: a stock CS 1.6 client
+    /// sends `clc_nop` only while it is still collecting the signon burst. From
+    /// the moment it answers `svc_resourcerequest` it puts a `clc_move` in
+    /// every packet — the first one is `mlen=8 loss=0 backup=2 cmds=0`, i.e.
+    /// two backup commands and no new ones, *before* `spawn` has even been
+    /// sent (`dec_real.txt:832-833`, `[12.214] C->S`). It keeps doing so
+    /// through the spawn, the entity burst and `sendents`.
+    ///
+    /// So "connected but idle" for a real client means *a move with no new
+    /// commands in it*, not silence. This builds exactly that: packet-loss
+    /// byte, `numbackup` = whatever history we have, `numcmds` = 0.
+    pub fn idle_body(&mut self) -> Vec<u8> {
+        let Some(table) = self
+            .signon
+            .as_ref()
+            .and_then(|s| s.registry.get("usercmd_t"))
+            .cloned()
+        else {
+            // Still in the signon: `clc_nop` is what a real client sends here.
+            return vec![netchan::clc::NOP];
+        };
+        let mut cmds: Vec<proto::usercmd::UserCmd> = self.cmd_history.iter().copied().collect();
+        while cmds.len() < 2 {
+            cmds.insert(0, proto::usercmd::UserCmd::default());
+        }
+        let numbackup = cmds.len() as u8;
+        let payload =
+            proto::usercmd::build_move_payload_backup(self.packet_loss(), &cmds, numbackup, &table);
+        let seq = self.chan.outgoing_sequence as i32;
+        proto::usercmd::build_clc_move(&payload, seq)
+    }
+
+    /// [`pump`](Self::pump) carrying [`idle_body`](Self::idle_body).
+    pub fn pump_idle<T: Transport>(&mut self, t: &mut T) -> io::Result<Vec<Vec<u8>>> {
+        let body = self.idle_body();
+        self.pump(t, &body)
+    }
+
     /// Are all queued reliable commands acknowledged?
     pub fn reliables_settled(&self) -> bool {
         !self.chan.reliable_in_flight() && self.chan.queued_count() == 0
@@ -1503,7 +1900,7 @@ impl Session {
         while Instant::now() < deadline {
             // Drive the channel until the reliable carrying `dropclient` has
             // been acknowledged; an unsent queue entry is not a disconnect.
-            self.pump(t, &[netchan::clc::NOP])?;
+            self.pump_idle(t)?;
             if self.reliables_settled() {
                 break;
             }
@@ -1606,7 +2003,9 @@ impl Session {
 
         let msecs = self.clock.due(Instant::now());
         let body = if msecs.is_empty() {
-            vec![netchan::clc::NOP]
+            // NOT `clc_nop`: see `idle_body`. A connected client that has
+            // nothing new to say still sends a move.
+            self.idle_body()
         } else {
             self.build_move_body(&msecs, intent)
         };
@@ -1787,7 +2186,6 @@ mod tests {
         assert!(found, "no packet on the wire carried `dropclient`");
     }
 
-    use super::*;
     use proto::munge;
 
     /// Build a server→client sequenced packet the way HLDS would: header in the
@@ -1846,5 +2244,222 @@ mod tests {
         assert!(s.ingest(&split(0, 2, &full[..mid])).is_empty());
         let out = s.ingest(&split(1, 2, &full[mid..]));
         assert_eq!(out, vec![payload]);
+    }
+}
+
+/// The stufftext handler must find messages by **parsing**, never by looking
+/// for the byte 9.
+///
+/// A scan cannot tell an opcode from a payload byte, and `svc_stufftext` is
+/// opcode 9 — a value that occurs constantly inside delta descriptions, MD5
+/// hashes, resource hashes and user-message payloads. The old handler read a
+/// NUL-terminated string from wherever it found a 9 and reported it as a
+/// console command the server had sent us; one live run produced thirty such
+/// lines, of which exactly one (`fullserverinfo …`) was a real message.
+///
+/// These tests pin the property that replaces it: a 9 that is not at a message
+/// boundary is never seen, and a real stufftext behind an arbitrary amount of
+/// binary data still is.
+#[cfg(test)]
+mod stufftext_is_parsed_not_scanned {
+    use super::*;
+    use crate::stream::Item;
+    use crate::svc;
+
+    fn cstr(s: &str) -> Vec<u8> {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    }
+
+    /// The naive scan, kept verbatim so the tests can show what it reports on
+    /// the very same bytes. Nothing but the tests calls it.
+    fn scan_for_stufftexts(msg: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < msg.len() {
+            if msg[i] != svc::SVC_STUFFTEXT {
+                i += 1;
+                continue;
+            }
+            let rest = &msg[i + 1..];
+            let Some(end) = rest.iter().position(|&b| b == 0) else {
+                break;
+            };
+            out.push(String::from_utf8_lossy(&rest[..end]).into_owned());
+            i += 1 + end + 1;
+        }
+        out
+    }
+
+    /// `svc_updateuserinfo` ends in a 16-byte CD-key hash — raw binary that the
+    /// server has no way to keep 9-free. Put a 9 in it followed by text that
+    /// looks exactly like the command we are hunting for.
+    fn updateuserinfo_with_a_fake_command() -> Vec<u8> {
+        let mut m = vec![svc::SVC_UPDATEUSERINFO, 1];
+        m.extend_from_slice(&7u32.to_le_bytes());
+        m.extend(cstr("\\name\\Probe\\rate\\100000"));
+        let mut hash = [0xAAu8; 16];
+        hash[0] = svc::SVC_STUFFTEXT;
+        hash[1..12].copy_from_slice(b"reconnect\n\0");
+        m.extend_from_slice(&hash);
+        m
+    }
+
+    #[test]
+    fn a_nine_inside_a_binary_payload_is_not_read_as_a_command() {
+        let mut msg = updateuserinfo_with_a_fake_command();
+        msg.extend_from_slice(&[svc::SVC_STUFFTEXT]);
+        msg.extend(cstr("allow_shaders 0\n"));
+
+        // The defect is real on these exact bytes: the scan invents a
+        // `reconnect` the server never sent.
+        let scanned = scan_for_stufftexts(&msg);
+        assert!(
+            scanned.contains(&"reconnect\n".to_string()),
+            "the scan was supposed to be fooled by this payload: {scanned:?}"
+        );
+        assert_eq!(scanned.len(), 2);
+
+        // The walker sees one message boundary carrying a stufftext, and it is
+        // the real one.
+        let mut s = Session::named("Probe");
+        let trace = s.trace_message(&msg);
+        assert_eq!(trace.stopped_on, None, "halted at byte {}", trace.stopped_at);
+        assert_eq!(trace.stopped_at, msg.len());
+        assert_eq!(trace.stufftexts(), vec!["allow_shaders 0\n".to_string()]);
+
+        // And the echo follows the walk, not the scan.
+        assert_eq!(s.echo_stufftexts(&msg), vec!["allow_shaders 0".to_string()]);
+    }
+
+    /// The same trap inside a **user message** payload, which is where most of
+    /// the phantom hits came from live: `SayText`, `TextMsg` and friends carry
+    /// arbitrary bytes and are only sizeable against the registration table.
+    #[test]
+    fn a_nine_inside_a_user_message_payload_is_not_read_as_a_command() {
+        // Register SayText (id 76) as variable-length, exactly as the server
+        // does with svc_newusermsg.
+        let mut msg = vec![svc::SVC_NEWUSERMSG, 76, 255];
+        let mut name = [0u8; 16];
+        name[..7].copy_from_slice(b"SayText");
+        msg.extend_from_slice(&name);
+
+        // Then send one whose payload starts with a 9 and reads like a command.
+        let body: Vec<u8> = {
+            let mut b = vec![svc::SVC_STUFFTEXT];
+            b.extend(cstr("reconnect\n"));
+            b.extend_from_slice(&[0xFF, 0x09, 0x00]);
+            b
+        };
+        msg.push(76);
+        msg.push(u8::try_from(body.len()).unwrap());
+        msg.extend_from_slice(&body);
+
+        // Finally the real one.
+        msg.push(svc::SVC_STUFFTEXT);
+        msg.extend(cstr("allow_autoaim 0\n"));
+
+        assert!(scan_for_stufftexts(&msg).contains(&"reconnect\n".to_string()));
+
+        let mut s = Session::named("Probe");
+        let trace = s.trace_message(&msg);
+        assert_eq!(trace.stopped_on, None, "halted at byte {}", trace.stopped_at);
+        assert_eq!(trace.stufftexts(), vec!["allow_autoaim 0\n".to_string()]);
+        // The registration was learned from a walked message, not a scan.
+        assert_eq!(s.user_msgs[&76].name, "SayText");
+        assert!(s.user_msgs[&76].is_variable());
+        assert_eq!(trace.items.iter().filter(|i| matches!(i, Item::User { .. })).count(), 1);
+        assert_eq!(s.echo_stufftexts(&msg), vec!["allow_autoaim 0".to_string()]);
+    }
+
+    /// The live signon burst, byte for byte.
+    ///
+    /// This is the case the walk exists for, and the fixture settles it
+    /// empirically: it holds **seven** bytes equal to 9, of which **three** are
+    /// real `svc_stufftext` messages and four are payload. The scan cannot tell
+    /// them apart; the walk does, and it reaches them at all only because it
+    /// steps over `svc_serverinfo` and the seven bit-packed
+    /// `svc_deltadescription`s in front of them by parsing.
+    ///
+    /// `SV_New_f` (`rehlds/engine/sv_main.cpp:1509-1594`) is the reason for
+    /// that order: serverinfo (with the delta tables inside
+    /// `SV_SendServerinfo`), then the `svc_newusermsg` registrations, then
+    /// `svc_stufftext "fullserverinfo …"`.
+    #[test]
+    fn the_live_signon_separates_three_real_commands_from_four_payload_bytes() {
+        const SIGNON: &[u8] = include_bytes!("../tests/fixtures/signon.bin");
+        assert_eq!(
+            SIGNON.iter().filter(|&&b| b == svc::SVC_STUFFTEXT).count(),
+            7,
+            "fixture no longer contains the payload bytes this test is about"
+        );
+
+        let mut s = Session::named("Probe");
+        let trace = s.trace_message(SIGNON);
+        assert_eq!(
+            trace.stopped_on.map(svc::name),
+            None,
+            "halted at byte {} of {}",
+            trace.stopped_at,
+            SIGNON.len()
+        );
+        assert_eq!(trace.stopped_at, SIGNON.len());
+
+        let real = trace.stufftexts();
+        assert_eq!(
+            real,
+            vec![
+                "fullserverinfo \"\\*gamedir\\cstrike\"\n".to_string(),
+                "allow_shaders 0\n".to_string(),
+                "allow_autoaim 0\n".to_string(),
+            ],
+        );
+
+        // The scan on the same bytes: it finds four bogus extras and cannot
+        // say which three of its seven answers are the messages.
+        let scanned = scan_for_stufftexts(SIGNON);
+        assert_eq!(scanned.len(), 7);
+        assert_eq!(
+            scanned.iter().filter(|t| real.contains(t)).count(),
+            3,
+            "four of the scan's seven hits are payload bytes: {scanned:?}"
+        );
+
+        // Seven delta descriptions were stepped over by parsing them; without
+        // that the walk stops at byte 0 on `svc_serverinfo` and finds nothing.
+        assert_eq!(
+            trace
+                .items
+                .iter()
+                .filter(|i| matches!(i, Item::Engine { id, .. } if *id == svc::SVC_DELTADESCRIPTION))
+                .count(),
+            7
+        );
+        // And the registrations were learned, not scanned for.
+        assert!(
+            s.user_msgs.len() > 20,
+            "user message table: {} entries",
+            s.user_msgs.len()
+        );
+    }
+
+    /// A message the walk genuinely cannot size must halt it and say so.
+    /// Silence and a wrong resume offset are the two ways this goes bad; a
+    /// reported stop is neither.
+    #[test]
+    fn an_unsizeable_message_halts_the_walk_and_is_reported() {
+        let mut msg = vec![svc::SVC_STUFFTEXT];
+        msg.extend(cstr("allow_shaders 0\n"));
+        msg.push(svc::SVC_PACKETENTITIES);
+        msg.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let mut s = Session::named("Probe");
+        let trace = s.trace_message(&msg);
+        assert_eq!(trace.stopped_on, Some(svc::SVC_PACKETENTITIES));
+        assert_eq!(trace.stopped_at, 18, "opcode + 17 bytes of string");
+        // Everything in FRONT of it was still decoded -- halting costs the
+        // tail, not the message.
+        assert_eq!(trace.stufftexts(), vec!["allow_shaders 0\n".to_string()]);
     }
 }
