@@ -107,6 +107,8 @@ pub struct Session {
     /// Which round we last bought in, so a buy happens once per spawn rather
     /// than every frame we happen to be standing in the zone.
     bought_at_reset: Option<u32>,
+    /// Which spawn we last deployed a weapon on.
+    deployed_at_reset: Option<u32>,
     /// The world model: baselines, entities, and accumulated game state.
     /// Built once the signon has taught us the delta tables and the user
     /// message table.
@@ -162,6 +164,7 @@ impl Session {
             last_decision: None,
             last_think: None,
             bought_at_reset: None,
+            deployed_at_reset: None,
             decoder: None,
             cmd_history: std::collections::VecDeque::new(),
             last_valid_frame: None,
@@ -1013,6 +1016,39 @@ impl Session {
         self.follower.reset();
     }
 
+    /// Deploy a weapon after spawning.
+    ///
+    /// A freshly spawned player HOLDS a knife but has not DEPLOYED one, and
+    /// nothing deploys it automatically for a network client. The symptoms are
+    /// easy to misread: `maxspeed` reports 240, which `ResetMaxSpeed` gives to
+    /// a player with **no active item** (`player.cpp:8074-8105`), and no
+    /// `CurWeapon` ever arrives because `CBasePlayerWeapon::UpdateClientData`
+    /// only sends one for a weapon that is actually out (`weapons.cpp:1380`).
+    /// The bot then looks armed-but-silent and can never shoot.
+    ///
+    /// A real client does this explicitly: the relay capture shows
+    /// `weapon_knife` at +3.180 s, right after its spawn burst. `SelectItem`
+    /// is the only path -- `usercmd_t.weaponselect` is never read by
+    /// ReGameDLL.
+    fn maybe_deploy_weapon(&mut self) {
+        let Some(d) = self.decoder.as_ref() else {
+            return;
+        };
+        if d.game.hud_resets == 0 || self.deployed_at_reset == Some(d.game.hud_resets) {
+            return;
+        }
+        // Already holding something: nothing to do.
+        if d.game.weapon_id != 0 {
+            self.deployed_at_reset = Some(d.game.hud_resets);
+            return;
+        }
+        if !self.clientdata.as_ref().is_some_and(|c| c.alive()) {
+            return;
+        }
+        self.deployed_at_reset = Some(d.game.hud_resets);
+        self.console.push("weapon_knife");
+    }
+
     /// Queue a loadout when we are alive, in a buy zone, and have not already
     /// bought for this spawn.
     ///
@@ -1340,6 +1376,7 @@ impl Session {
 
         // One console command per frame at most, and only when the reliable
         // channel is idle -- see `crate::console` for why a burst is fatal.
+        self.maybe_deploy_weapon();
         self.maybe_buy();
         if let Some(cmd) = self.console.next(Instant::now(), self.reliables_settled()) {
             self.send_command(&cmd);

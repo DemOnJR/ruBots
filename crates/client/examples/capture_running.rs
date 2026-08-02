@@ -367,7 +367,7 @@ fn main() {
         for it in &w.items {
             if let client::Item::User { name, payload, .. } = it {
                 *totals.entry(name.clone()).or_default() += 1;
-                if matches!(name.as_str(), "TeamInfo" | "ScoreInfo" | "VGUIMenu" | "TextMsg" | "ShowMenu") {
+                if matches!(name.as_str(), "TeamInfo" | "TextMsg" | "StatusIcon" | "CurWeapon" | "Money") {
                     let txt: String = payload
                         .iter()
                         .map(|&c| if (32..127).contains(&c) { c as char } else { '.' })
