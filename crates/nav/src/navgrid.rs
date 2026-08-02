@@ -76,6 +76,15 @@ pub const MAX_FALL: f32 = 200.0;
 /// you would rather the bots never took a scratch.
 pub const SAFE_FALL: f32 = 156.25;
 
+/// The steepest grade a player can run up without sliding back.
+///
+/// `PM_CatagorizePosition` keeps the player on ground while the surface normal
+/// satisfies `normal[2] >= 0.7` (`pm_shared.cpp:1220`). Turned into a rise over
+/// run that is `sqrt(1 - 0.7^2) / 0.7`, a little over 45 degrees. A slope
+/// inside this limit is a walk, however much height it gains; a slope outside
+/// it is not walkable at all, whatever the height.
+pub const MAX_WALK_GRADE: f32 = 1.020_20;
+
 /// Vertical spacing of the nodes on a ladder.
 pub const LADDER_STEP: f32 = 32.0;
 
@@ -126,6 +135,14 @@ pub enum Move {
     Crouch,
     /// Along a `func_ladder`.
     Ladder,
+    /// Through a `func_breakable`: legal, but the bot has to shoot it first.
+    ///
+    /// This exists because the alternative answers are both wrong. A breakable
+    /// is the only way out of the CT spawn on de_prodigy, so calling it a wall
+    /// strands the team; calling it open sends bots walking into crates on
+    /// every other map. It is a passage that costs a magazine, and the router
+    /// prices it that way.
+    Break,
 }
 
 impl Move {
@@ -141,6 +158,7 @@ impl Move {
             Self::Jump => 1.5,
             Self::Crouch => 2.0,
             Self::Ladder => 2.5,
+            Self::Break => 8.0,
         }
     }
 
@@ -151,6 +169,7 @@ impl Move {
             Self::Fall => 2,
             Self::Crouch => 3,
             Self::Ladder => 4,
+            Self::Break => 5,
         }
     }
 
@@ -161,6 +180,7 @@ impl Move {
             2 => Self::Fall,
             3 => Self::Crouch,
             4 => Self::Ladder,
+            5 => Self::Break,
             _ => return None,
         })
     }
@@ -257,7 +277,11 @@ pub fn checksum(bsp_bytes: &[u8]) -> u64 {
 /// furniture.
 pub struct World<'a> {
     bsp: &'a Bsp,
+    /// Hard blockers first, then the breakables. Ordering the vector this way
+    /// means "everything" and "everything permanent" are both a slice, with no
+    /// second allocation and no per-trace filtering.
     blockers: Vec<SolidBrush>,
+    hard: usize,
     /// Union of every blocker's box, so a segment nowhere near one is rejected
     /// by a single test instead of a loop.
     span: Option<Aabb>,
@@ -292,16 +316,18 @@ impl<'a> World<'a> {
     /// The world hull only. Hand-built test maps have no brush entities, and
     /// nor does a caller who only wants line of sight.
     pub fn bare(bsp: &'a Bsp) -> Self {
-        Self { bsp, blockers: Vec::new(), span: None }
+        Self { bsp, blockers: Vec::new(), hard: 0, span: None }
     }
 
     pub fn new(bsp: &'a Bsp, info: &MapInfo) -> Self {
-        let blockers: Vec<SolidBrush> = info
+        let mut blockers: Vec<SolidBrush> = info
             .solid_brushes
             .iter()
             .filter(|b| b.model < bsp.models.len())
             .copied()
             .collect();
+        blockers.sort_by_key(|b| b.breakable);
+        let hard = blockers.iter().filter(|b| !b.breakable).count();
         let span = blockers.iter().map(|b| b.bounds).reduce(|a, b| {
             Aabb::new(
                 [
@@ -316,7 +342,20 @@ impl<'a> World<'a> {
                 ],
             )
         });
-        Self { bsp, blockers, span }
+        Self { bsp, blockers, hard, span }
+    }
+
+    /// Does the map have anything a bot could shoot its way through?
+    pub fn has_breakables(&self) -> bool {
+        self.hard < self.blockers.len()
+    }
+
+    fn blockers_for(&self, include_breakable: bool) -> &[SolidBrush] {
+        if include_breakable {
+            &self.blockers
+        } else {
+            &self.blockers[..self.hard]
+        }
     }
 
     pub fn bsp(&self) -> &Bsp {
@@ -329,6 +368,16 @@ impl<'a> World<'a> {
 
     /// Nearest hit across the world and every overlapping brush entity.
     pub fn trace(&self, hull: Hull, a: Vec3, b: Vec3) -> Trace {
+        self.trace_with(hull, a, b, true)
+    }
+
+    /// [`World::trace`] pretending every `func_breakable` has already been
+    /// shot away.
+    pub fn trace_ignoring_breakables(&self, hull: Hull, a: Vec3, b: Vec3) -> Trace {
+        self.trace_with(hull, a, b, false)
+    }
+
+    fn trace_with(&self, hull: Hull, a: Vec3, b: Vec3, breakables: bool) -> Trace {
         let mut best = self.bsp.hull_trace(hull, a, b);
         if best.start_solid {
             return best;
@@ -340,7 +389,7 @@ impl<'a> World<'a> {
         if !seg.intersects(&expand_for(&span, hull)) {
             return best;
         }
-        for br in &self.blockers {
+        for br in self.blockers_for(breakables) {
             if !seg.intersects(&expand_for(&br.bounds, hull)) {
                 continue;
             }
@@ -360,15 +409,26 @@ impl<'a> World<'a> {
     }
 
     pub fn clear(&self, hull: Hull, a: Vec3, b: Vec3) -> bool {
-        self.trace(hull, a, b).is_clear()
+        self.trace_with(hull, a, b, true).is_clear()
     }
 
-    /// Can a player of this hull have its origin at `p`?
+    fn clear_with(&self, hull: Hull, a: Vec3, b: Vec3, breakables: bool) -> bool {
+        self.trace_with(hull, a, b, breakables).is_clear()
+    }
+
+    /// Can a player of this hull have its origin at `p`, once anything
+    /// breakable in the way has been shot?
+    ///
+    /// Breakables are deliberately not consulted. They are obstacles a player
+    /// removes, not geometry: the floor behind a breakable window is somewhere
+    /// a bot really can stand, and refusing to put a node there is what strands
+    /// the CT team on de_prodigy. What a breakable does affect is the *edges* —
+    /// see [`classify`], which prices them as [`Move::Break`].
     pub fn fits(&self, hull: Hull, p: Vec3) -> bool {
         if self.bsp.hull_point_contents(hull, p) == crate::bsp::contents::SOLID {
             return false;
         }
-        for br in &self.blockers {
+        for br in self.blockers_for(false) {
             if !expand_for(&br.bounds, hull).contains(p) {
                 continue;
             }
@@ -381,8 +441,33 @@ impl<'a> World<'a> {
         true
     }
 
+    /// Is there a continuous surface under the straight line from `a` to `b`?
+    ///
+    /// A clear diagonal on its own is not a ramp — it is also what you get by
+    /// drawing a line through thin air from a floor to a ledge. Probing the
+    /// midpoint and requiring the ground there to track the line is what tells
+    /// a staircase from a gap: on stairs the floor is right where the line is,
+    /// over a gap it is a storey below.
+    pub fn has_ground_between(&self, a: Vec3, b: Vec3) -> bool {
+        let mid = [
+            (a[0] + b[0]) * 0.5,
+            (a[1] + b[1]) * 0.5,
+            (a[2] + b[2]) * 0.5,
+        ];
+        match self.drop_to_floor(mid[0], mid[1], mid[2] + STEP_SIZE, STEP_SIZE * 2.0) {
+            Some(g) => (g[2] - mid[2]).abs() <= STEP_SIZE,
+            None => false,
+        }
+    }
+
+    /// Where the floor is, ignoring breakables for the same reason
+    /// [`World::fits`] does.
     fn drop_to_floor(&self, x: f32, y: f32, from_z: f32, distance: f32) -> Option<Vec3> {
-        let t = self.trace(Hull::Stand, [x, y, from_z], [x, y, from_z - distance]);
+        let t = self.trace_ignoring_breakables(
+            Hull::Stand,
+            [x, y, from_z],
+            [x, y, from_z - distance],
+        );
         if t.start_solid || t.fraction >= 1.0 {
             return None;
         }
@@ -431,13 +516,15 @@ pub fn ground_snap(world: &World, p: Vec3) -> Option<Vec3> {
 /// `:1214`). Without modelling that, every kerb in the map would read as a
 /// wall, because the expanded hull turns a 4-unit step into a 4-unit cliff face
 /// sitting 16 units out from the real one.
-fn step_move(world: &World, hull: Hull, a: Vec3, b: Vec3) -> bool {
-    if world.clear(hull, a, b) {
+fn step_move(world: &World, hull: Hull, a: Vec3, b: Vec3, breakables: bool) -> bool {
+    if world.clear_with(hull, a, b, breakables) {
         return true;
     }
     let ah = raise(a, STEP_SIZE);
     let bh = raise(b, STEP_SIZE);
-    world.clear(hull, a, ah) && world.clear(hull, ah, bh) && world.clear(hull, bh, b)
+    world.clear_with(hull, a, ah, breakables)
+        && world.clear_with(hull, ah, bh, breakables)
+        && world.clear_with(hull, bh, b, breakables)
 }
 
 /// Can a player get from origin `from` to origin `to` in one move, and how?
@@ -450,17 +537,52 @@ fn step_move(world: &World, hull: Hull, a: Vec3, b: Vec3) -> bool {
 ///
 /// Both arguments are player origins. `None` means no legal move.
 pub fn classify(world: &World, from: Vec3, to: Vec3) -> Option<Move> {
+    if let Some(m) = classify_with(world, from, to, true) {
+        return Some(m);
+    }
+    // Nothing in the way but a breakable? Then the move is legal, at the price
+    // of shooting it. Anything that fails even with the breakables gone is a
+    // wall and stays a wall.
+    if world.has_breakables() && classify_with(world, from, to, false).is_some() {
+        return Some(Move::Break);
+    }
+    None
+}
+
+fn classify_with(world: &World, from: Vec3, to: Vec3, breakables: bool) -> Option<Move> {
     let dz = to[2] - from[2];
+    let horizontal = {
+        let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+        (dx * dx + dy * dy).sqrt()
+    };
+
+    // A ramp or staircase you simply run up or down. The lattice pitch is 40
+    // units, so a flight of stairs gains far more than `sv_stepsize` between
+    // two adjacent nodes even though a player walks it without pressing jump --
+    // which is why the step-size test alone leaves the upper and lower floors
+    // of a map like cs_747 as separate islands.
+    //
+    // The admission rule is the engine's own walkable-slope limit: the direct
+    // hull trace has to be clear *and* the grade has to be one the player would
+    // not slide back down (`WALKABLE_NORMAL_Z`, `pm_shared.cpp:1220`).
+    if dz.abs() > STEP_SIZE
+        && horizontal > 0.0
+        && dz.abs() <= horizontal * MAX_WALK_GRADE
+        && world.has_ground_between(from, to)
+        && world.clear_with(Hull::Stand, from, to, breakables)
+    {
+        return Some(Move::Walk);
+    }
 
     if dz.abs() <= STEP_SIZE {
-        if step_move(world, Hull::Stand, from, to) {
+        if step_move(world, Hull::Stand, from, to, breakables) {
             return Some(Move::Walk);
         }
         // Standing does not fit. A ducking origin sits 18 above the feet
         // instead of 36, so drop both ends by 18 to keep the feet where they
         // were and ask hull 3 the same question.
         let d = Hull::Stand.eye_to_feet() - Hull::Duck.eye_to_feet();
-        if step_move(world, Hull::Duck, raise(from, -d), raise(to, -d)) {
+        if step_move(world, Hull::Duck, raise(from, -d), raise(to, -d), breakables) {
             return Some(Move::Crouch);
         }
         return None;
@@ -470,17 +592,21 @@ pub fn classify(world: &World, from: Vec3, to: Vec3) -> Option<Move> {
         // Rise straight up first -- that vertical trace is the head-clearance
         // check -- and only then move across.
         let apex = [from[0], from[1], to[2]];
-        if world.clear(Hull::Stand, from, apex) && world.clear(Hull::Stand, apex, to) {
+        if world.clear_with(Hull::Stand, from, apex, breakables)
+            && world.clear_with(Hull::Stand, apex, to, breakables)
+        {
             return Some(Move::Jump);
         }
         return None;
     }
 
-    if dz < -STEP_SIZE && dz >= -MAX_FALL {
+    if (-MAX_FALL..-STEP_SIZE).contains(&dz) {
         // Walk off the ledge, then fall. If a railing blocks the first leg
         // there is nothing to fall from.
         let over = [to[0], to[1], from[2]];
-        if world.clear(Hull::Stand, from, over) && world.clear(Hull::Stand, over, to) {
+        if world.clear_with(Hull::Stand, from, over, breakables)
+            && world.clear_with(Hull::Stand, over, to, breakables)
+        {
             return Some(Move::Fall);
         }
         return None;
@@ -701,7 +827,7 @@ impl<'a> Builder<'a> {
                 if let Some(existing) = self.columns.get(&(jx, jy)) {
                     for &j in existing {
                         let dz = self.nodes[j as usize].origin[2] - p[2];
-                        if dz <= MAX_JUMP && dz >= -MAX_FALL && !candidates.contains(&j) {
+                        if (-MAX_FALL..=MAX_JUMP).contains(&dz) && !candidates.contains(&j) {
                             candidates.push(j);
                         }
                     }
@@ -1137,6 +1263,9 @@ mod tests {
         let m = flat_map();
         let w = World::bare(&m);
         let a = [0.0, 0.0, 36.0];
+        // The rise is inside the walkable grade, but there is no ramp under it
+        // -- the floor at the midpoint is a long way below the line -- so this
+        // is a jump and not a walk.
         assert_eq!(classify(&w, a, [CELL, 0.0, 36.0 + 40.0]), Some(Move::Jump));
         assert_eq!(classify(&w, [CELL, 0.0, 36.0 + 40.0], a), Some(Move::Fall));
         // A fall is one-way in the sense that the reverse of a *big* drop is
@@ -1241,7 +1370,11 @@ mod tests {
         });
         let info = MapInfo {
             t_spawns: vec![[0.0, 0.0, 40.0]],
-            solid_brushes: vec![SolidBrush { model: 1, bounds: Aabb::new(mins, maxs) }],
+            solid_brushes: vec![SolidBrush {
+                model: 1,
+                bounds: Aabb::new(mins, maxs),
+                breakable: false,
+            }],
             ..Default::default()
         };
         (m, info)
@@ -1478,11 +1611,18 @@ mod tests {
 
     #[test]
     fn every_move_kind_survives_a_byte_round_trip() {
-        for m in [Move::Walk, Move::Jump, Move::Fall, Move::Crouch, Move::Ladder] {
+        for m in [
+            Move::Walk,
+            Move::Jump,
+            Move::Fall,
+            Move::Crouch,
+            Move::Ladder,
+            Move::Break,
+        ] {
             assert_eq!(Move::from_byte(m.to_byte()), Some(m));
             assert!(m.cost_multiplier() >= 1.0, "{m:?} would break A* admissibility");
         }
-        assert_eq!(Move::from_byte(9), None);
+        assert_eq!(Move::from_byte(6), None);
     }
 
     // -------------------------------------------------------- the real maps
@@ -1614,6 +1754,77 @@ mod tests {
         }
     }
 
+    /// Generation must survive every map in the rotation, not just the three
+    /// the other tests poke at, and on the large majority of them both teams'
+    /// spawns must end up in one component.
+    ///
+    /// Not *all* of them, and the exceptions are known rather than tolerated.
+    /// cs_747, cs_backalley and cs_siege each come out split at a level
+    /// transition -- a stairwell or a gateway that the fixed 40-unit lattice
+    /// never places a node inside, so the two floors never meet. It is the
+    /// lattice and not the collision model: regenerating those three with every
+    /// brush entity removed leaves them exactly as split. Sub-cell probing is
+    /// the fix and is not done here. The ratio asserted below is what turns
+    /// "three known maps" into a regression guard -- break the fill and it
+    /// falls straight through.
+    #[test]
+    fn every_shipped_map_generates_a_usable_grid() {
+        let dir = maps_dir();
+        if !dir.is_dir() {
+            eprintln!("SKIP: {} is not a directory", dir.display());
+            return;
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("readable")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension()? == "bsp").then(|| p.file_stem()?.to_str().map(str::to_string))?
+            })
+            .collect();
+        names.sort();
+        if names.is_empty() {
+            eprintln!("SKIP: no .bsp files in {}", dir.display());
+            return;
+        }
+
+        let (mut checked, mut connected) = (0usize, 0usize);
+        let mut split: Vec<String> = Vec::new();
+        for name in &names {
+            let data = std::fs::read(dir.join(format!("{name}.bsp"))).expect("readable");
+            let bsp = Bsp::parse(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let info = MapInfo::from_bsp(&bsp).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let started = Instant::now();
+            let grid = NavGrid::generate(&bsp, &info, checksum(&data));
+            eprintln!(
+                "{name:<16} {:>6} nodes {:>7} edges  {:.1}s",
+                grid.len(),
+                grid.edge_count(),
+                started.elapsed().as_secs_f32()
+            );
+            assert!(grid.len() > 200, "{name}: only {} nodes", grid.len());
+            assert!(grid.len() <= MAX_NODES, "{name}: hit the node cap");
+
+            if info.t_spawns.is_empty() || info.ct_spawns.is_empty() {
+                continue;
+            }
+            let t = grid.nearest(info.t_spawns[0]).expect("a node near the T spawn");
+            let ct = grid.nearest(info.ct_spawns[0]).expect("a node near the CT spawn");
+            checked += 1;
+            if grid.find_path(t, ct).is_some() {
+                connected += 1;
+            } else {
+                split.push(name.clone());
+                eprintln!("   ^ SPLIT: the two spawns are in different components");
+            }
+        }
+
+        eprintln!("spawns connected on {connected}/{checked} maps; split: {split:?}");
+        assert!(
+            connected * 5 >= checked * 4,
+            "only {connected} of {checked} maps connect both spawns: {split:?}"
+        );
+    }
+
     #[test]
     fn de_dust2_generates_a_few_thousand_nodes() {
         let Some(g) = real_grid("de_dust2") else { return };
@@ -1693,8 +1904,11 @@ mod tests {
                 if n.flags & flags::LADDER != 0 {
                     continue; // ladder nodes hang on purpose
                 }
+                // Breakables are ignored on purpose: a node behind a shot-out
+                // window is standing on real floor, and World::fits and the
+                // ground probe both take that view.
                 let below = [n.origin[0], n.origin[1], n.origin[2] - 8.0];
-                let t = world.trace(Hull::Stand, n.origin, below);
+                let t = world.trace_ignoring_breakables(Hull::Stand, n.origin, below);
                 assert!(!t.start_solid, "{name}: node {i} at {:?} is in solid", n.origin);
                 assert!(
                     t.fraction < 1.0 && (t.end[2] - n.origin[2]).abs() < 1.0,
@@ -1824,15 +2038,15 @@ mod tests {
     fn the_move_mix_on_a_real_map_is_mostly_walking() {
         let Some(g) = real_grid("de_dust2") else { return };
         let grid = &g.2;
-        let mut counts = [0usize; 5];
+        let mut counts = [0usize; 6];
         for n in &grid.nodes {
             for l in &n.links {
                 counts[l.kind.to_byte() as usize] += 1;
             }
         }
         eprintln!(
-            "de_dust2 moves: walk={} jump={} fall={} crouch={} ladder={}",
-            counts[0], counts[1], counts[2], counts[3], counts[4]
+            "de_dust2 moves: walk={} jump={} fall={} crouch={} ladder={} break={}",
+            counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
         );
         let total: usize = counts.iter().sum();
         assert!(

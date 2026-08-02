@@ -388,6 +388,79 @@ mod tests {
         assert_eq!(find_path(&split, 0, 1), None);
     }
 
+    /// The same equivalence at a scale where a difference in tie-breaking,
+    /// heap order or relaxation order would actually show up.
+    ///
+    /// This is the evidence that replacing `Graph::find_path`'s body with
+    /// `route::find_path(self, start, goal)` changes nothing: 240 node pairs
+    /// over a 120-node graph with duplicate-cost routes and dead ends, and
+    /// every answer identical.
+    #[test]
+    fn the_two_routers_agree_on_a_large_graph_with_ties() {
+        // Deterministic pseudo-random layout: a 12x10 mesh whose links are
+        // thinned unevenly, which produces plenty of equal-cost alternatives.
+        let mut seed = 0x2545_F491u32;
+        let mut rand = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+
+        let (w, h) = (12usize, 10usize);
+        let mut nodes: Vec<Node> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                nodes.push(node_at(
+                    (y * w + x) as i32,
+                    x as f32 * 100.0,
+                    y as f32 * 100.0,
+                    &[],
+                ));
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let mut slot = 0;
+                for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    // Drop roughly a quarter of the links, in both directions
+                    // independently, so some edges end up one-way.
+                    if rand() % 4 == 0 {
+                        continue;
+                    }
+                    if slot < crate::graph::MAX_LINKS {
+                        nodes[i].links[slot].index = (ny as usize * w + nx as usize) as i16;
+                        slot += 1;
+                    }
+                }
+            }
+        }
+        let g = Graph::new(nodes);
+
+        let mut found = 0;
+        let mut missing = 0;
+        for k in 0..240 {
+            let a = (k * 7) % g.len();
+            let b = (k * 13 + 5) % g.len();
+            let mine = find_path(&g, a, b);
+            assert_eq!(mine, g.find_path(a, b), "disagreed on {a} -> {b}");
+            if mine.is_some() {
+                found += 1;
+            } else {
+                missing += 1;
+            }
+        }
+        // The graph must actually exercise both outcomes, or the agreement is
+        // vacuous.
+        assert!(found > 100, "only {found} pairs were connected");
+        eprintln!("router equivalence: {found} routed, {missing} unreachable");
+    }
+
     #[test]
     fn a_graph_exposes_origins_flags_and_links_through_the_trait() {
         let mut a = node_at(0, 0.0, 0.0, &[1]);

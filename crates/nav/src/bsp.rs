@@ -509,6 +509,9 @@ impl Bsp {
         }
     }
 
+    // Eight arguments, because this is PM_RecursiveHullCheck's signature and
+    // keeping it recognisable is worth more than pleasing the lint.
+    #[allow(clippy::too_many_arguments)]
     fn recurse<T: Tree>(
         &self,
         tree: &T,

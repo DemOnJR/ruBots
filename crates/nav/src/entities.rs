@@ -95,10 +95,17 @@ pub struct SolidBrush {
     pub model: usize,
     /// World-space box, for a cheap rejection test before tracing.
     pub bounds: Aabb,
+    /// A `func_breakable`: solid, but any player can shoot it away.
+    ///
+    /// Worth distinguishing because a breakable is the *only* way out of the
+    /// CT spawn on de_prodigy. Treated as a permanent wall it strands the whole
+    /// team; treated as open it sends bots walking into crates. It is neither —
+    /// it is a passage with a price.
+    pub breakable: bool,
 }
 
 /// What the round is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Scenario {
     /// `de_` — plant or defuse.
     Bomb,
@@ -109,6 +116,7 @@ pub enum Scenario {
     /// `es_` — get the terrorists to an escape zone.
     Escape,
     /// None of the above: no objective entities at all.
+    #[default]
     Deathmatch,
 }
 
@@ -279,12 +287,6 @@ pub struct MapInfo {
     pub solid_brushes: Vec<SolidBrush>,
 }
 
-impl Default for Scenario {
-    fn default() -> Self {
-        Self::Deathmatch
-    }
-}
-
 /// Classnames, kept as constants so the mirror of `CheckMapConditions` is
 /// checkable by eye.
 pub mod classname {
@@ -391,7 +393,11 @@ impl MapInfo {
             let idx = e.brush_model().ok_or_else(|| {
                 EntityError::MissingBrushModel(e.classname().to_string())
             })?;
-            solid_brushes.push(SolidBrush { model: idx, bounds: brush(e)? });
+            solid_brushes.push(SolidBrush {
+                model: idx,
+                bounds: brush(e)?,
+                breakable: e.classname() == "func_breakable",
+            });
         }
 
         // --- bomb sites: brush form first, then the legacy point form.
@@ -731,8 +737,16 @@ mod tests {
         assert_eq!(
             info.solid_brushes,
             vec![
-                SolidBrush { model: 1, bounds: Aabb::new([0.0; 3], [8.0; 3]) },
-                SolidBrush { model: 3, bounds: Aabb::new([200.0; 3], [208.0; 3]) },
+                SolidBrush {
+                    model: 1,
+                    bounds: Aabb::new([0.0; 3], [8.0; 3]),
+                    breakable: false,
+                },
+                SolidBrush {
+                    model: 3,
+                    bounds: Aabb::new([200.0; 3], [208.0; 3]),
+                    breakable: true,
+                },
             ],
             "func_illusionary is SOLID_NOT and func_door opens; neither belongs"
         );
