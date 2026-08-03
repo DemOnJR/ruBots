@@ -10,6 +10,7 @@
 //! cargo run -p client --example mapinfo -- cs_italy cs_office de_dust2
 //! ```
 
+use nav::route::NavSource;
 use std::env;
 
 fn main() {
@@ -36,6 +37,31 @@ fn main() {
                     i.ct_spawns.len(),
                     i.hostage_spawns.len(),
                 );
+
+                // Can the bot physically REACH the objective it is given?
+                // `ARRIVE_RADIUS` is 24 units, so if the nearest walkable node
+                // is further than that from the objective's centre, the bot
+                // can never arrive and the plant rung never fires -- it just
+                // stands as close as the graph allows, forever.
+                for (label, goal) in i
+                    .bomb_sites
+                    .iter()
+                    .map(|z| ("bombsite", z.centre()))
+                    .chain(i.rescue_zones.iter().map(|z| ("rescue  ", z.centre())))
+                {
+                    match m.grid.nearest(goal) {
+                        Some(n) => {
+                            let o = m.grid.origin(n);
+                            let d = ((o[0] - goal[0]).powi(2) + (o[1] - goal[1]).powi(2)).sqrt();
+                            let verdict = if d < 24.0 { "reachable" } else { "TOO FAR" };
+                            println!(
+                                "    {label} [{:.0} {:.0} {:.0}] nearest node {:.0} units away  {verdict}",
+                                goal[0], goal[1], goal[2], d
+                            );
+                        }
+                        None => println!("    {label}: no node at all"),
+                    }
+                }
 
                 // A route from a T spawn to the objective is the real question:
                 // a graph with the right node count is still useless if the

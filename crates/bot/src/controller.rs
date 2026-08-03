@@ -517,7 +517,21 @@ impl Controller {
                 // and never reaches the site. On a server with
                 // `mp_plant_c4_anywhere` that is instant; on a normal one it
                 // happens on the lip of the trigger.
-                let out = if arrived {
+                // Once the arm has started, keep going even if `arrived`
+                // flickers. It is a hard distance test against ARRIVE_RADIUS,
+                // and a bot standing on the spot reports `to_goal 24` -- the
+                // threshold exactly -- so it crosses back and forth on rounding
+                // alone. Every false tick called reset(), which released
+                // IN_ATTACK, and releasing for ONE tick runs CC4::WeaponIdle
+                // and throws the whole three seconds away
+                // (`wpn_c4.cpp:287-300`). Measured: `bombzone true, on_ground
+                // true, attack true, to_goal 24` and no plant, over and over.
+                //
+                // Dropping out is still correct when the machine is idle -- and
+                // the machine itself already aborts on the server's real
+                // conditions, leaving the zone or leaving the ground, so this
+                // cannot hold the button somewhere it should not.
+                let out = if arrived || self.plant.is_arming() {
                     self.plant.tick(world, dt)
                 } else {
                     self.plant.reset();
@@ -1481,6 +1495,47 @@ mod tests {
         assert!(crate::fire::accurate_speed(WeaponId::Ak47) > 100.0);
         assert!(crate::fire::accurate_speed(WeaponId::Deagle) < 50.0);
         assert!(crate::fire::accurate_speed(WeaponId::Scout) > 150.0);
+    }
+
+    /// Standing exactly on the arrive radius must not cancel the plant.
+    ///
+    /// `arrived` is a hard distance test, and a bot planted on the spot reports
+    /// `to_goal 24` -- ARRIVE_RADIUS exactly -- so it crosses the threshold on
+    /// rounding alone. Each false tick used to call reset(), releasing
+    /// IN_ATTACK, and one released tick runs CC4::WeaponIdle and throws away
+    /// the whole three seconds (`wpn_c4.cpp:287-300`).
+    #[test]
+    fn a_plant_survives_the_arrive_radius_flickering() {
+        let site: Vec3 = [1000.0, 0.0, 0.0];
+        let mut c = Controller::new(7, Difficulty::Normal);
+
+        // Hovering either side of ARRIVE_RADIUS, as a stationary bot does.
+        let at = |d: f32| WorldView {
+            me: SelfState {
+                in_bomb_zone: true,
+                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                ..me_at([site[0] - d, 0.0, 0.0], Team::Terrorist)
+            },
+            bomb: BombState { carried_by_me: true, ..Default::default() },
+            ..Default::default()
+        };
+
+        // Settle into the arm.
+        for _ in 0..10 {
+            c.think(&at(ARRIVE_RADIUS - 2.0), Some(site), 0.05);
+        }
+        assert!(c.plant.is_arming(), "never started arming");
+
+        // Now wobble across the boundary; the button must never come up.
+        let mut released = 0;
+        for i in 0..40 {
+            let d = if i % 2 == 0 { ARRIVE_RADIUS + 1.0 } else { ARRIVE_RADIUS - 1.0 };
+            if !c.think(&at(d), Some(site), 0.05).attack {
+                released += 1;
+            }
+        }
+        assert_eq!(released, 0, "released the trigger {released} times while arming");
+        assert!(c.plant.is_arming(), "the arm was thrown away");
     }
 
     /// The bomb carrier walks past a fight it can walk past.
