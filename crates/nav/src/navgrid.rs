@@ -88,6 +88,75 @@ pub const MAX_WALK_GRADE: f32 = 1.020_20;
 /// Vertical spacing of the nodes on a ladder.
 pub const LADDER_STEP: f32 = 32.0;
 
+// ---------------------------------------------------- node radius (wayzones)
+
+/// The scan distances the radius sweep tries, in order.
+///
+/// YaPB's loop is `for (scanDistance = 32; scanDistance < 128; scanDistance +=
+/// 16)` (`yapb/src/graph.cpp:1470`), so the last distance actually tried is 112
+/// and the largest radius that can survive the two `-= 16` steps is 96.
+pub const RADIUS_SCANS: [f32; 6] = [32.0, 48.0, 64.0, 80.0, 96.0, 112.0];
+
+/// What one failed probe costs, and the quantum every radius is a multiple of.
+pub const RADIUS_STEP: f32 = 16.0;
+
+/// How many directions each scan distance is probed in.
+///
+/// 18 at 20 degrees is a full turn. **YaPB's own loop does not do this**: it
+/// ends each iteration with `direction.y = wrapAngle(direction.y +
+/// circleRadius)` (`graph.cpp:1541`), adding the *loop counter* rather than the
+/// step, so its yaw runs 0, 0, 20, 60, 120, 200, 300, 60, ... — some bearings
+/// probed twice and others never. That is a typo for `+ 20.0f`, in the same
+/// family as the two YaPB bugs the humanisation plan already refuses to port,
+/// so this walks the circle evenly instead.
+pub const RADIUS_DIRS: usize = 18;
+
+/// How far below a probe point the floor is allowed to be.
+///
+/// The trace is `scan + 60` long (`graph.cpp:1508`): a node keeps its radius
+/// only while the ground stays under the whole disc, so a bot jittered toward
+/// the edge cannot be jittered off a ledge.
+pub const RADIUS_DROP: f32 = 60.0;
+
+/// Head clearance demanded at the edge of the disc (`graph.cpp:1531`).
+pub const RADIUS_HEADROOM: f32 = 34.0;
+
+/// The largest radius the sweep can return.
+pub const MAX_RADIUS: f32 = 96.0;
+
+/// The hull the sweep probes with.
+///
+/// YaPB passes `head_hull`, which is hull 3 — the ducking box
+/// (`yapb/src/graph.cpp:1495`). Centred on a *standing* origin it spans the
+/// player's waist to shoulders, which is the part of the body that actually
+/// clips a corner when the bot cuts one.
+const RADIUS_HULL: Hull = Hull::Duck;
+
+/// Node classes that are never given a radius.
+///
+/// A bot must arrive *precisely* at these, so there is nothing to vary: YaPB
+/// zeroes `Ladder | Goal | Camp | Rescue | Crouch` outright
+/// (`yapb/src/graph.cpp:1456`). [`flags::CROUCH`] and [`flags::CAMP`] are never
+/// set by generation today; they are listed because a `.graph` loaded through
+/// the same flag set does set them, and because [`NavGrid::annotate`] sets
+/// [`flags::NARROW`] on the nodes that are our crouch equivalent.
+const NO_RADIUS: u32 = flags::LADDER
+    | flags::GOAL
+    | flags::CAMP
+    | flags::RESCUE
+    | flags::CROUCH
+    | flags::NARROW;
+
+// ------------------------------------------------------------- path smoothing
+
+/// The longest hop [`NavGrid::smooth_path`] will merge a run of nodes into
+/// (`yapb/src/planner.cpp:203`).
+pub const SKIP_MAX_DIST: f32 = 400.0;
+
+/// Two nodes further apart than this in z are not the same floor, so the
+/// straight line between them is not walkable (`yapb/src/planner.cpp:191`).
+pub const SKIP_MAX_RISE: f32 = 17.0;
+
 /// Hard ceiling on the number of nodes.
 ///
 /// A real map is bounded by solid space and by `models[0]`'s box, so this never
@@ -199,6 +268,17 @@ pub struct NavNode {
     /// The player **origin**, not the feet: 36 above the floor it rests on.
     pub origin: Vec3,
     pub flags: u32,
+    /// How far from [`origin`](Self::origin) the node still *is* this node.
+    ///
+    /// One of `{0, 16, 32, 48, 64, 80, 96}`, measured offline by
+    /// [`node_radius`]. Zero means "stand exactly here" — a ladder, a bomb
+    /// site, a doorway.
+    ///
+    /// This is the number that stops a route being a queue. A waypoint with a
+    /// radius is a **disc**, not a point: bots steer at different spots inside
+    /// it and count it as reached at different distances, so thirty bots
+    /// following one corridor occupy its width instead of its centre line.
+    pub radius: f32,
     pub links: Vec<Link>,
 }
 
@@ -615,6 +695,72 @@ fn classify_with(world: &World, from: Vec3, to: Vec3, breakables: bool) -> Optio
     None
 }
 
+// ------------------------------------------------------------- node radius
+
+/// Would a hull of this size be inside solid at `p`?
+///
+/// This is YaPB's degenerate `testHull (start, start, ...)`
+/// (`yapb/src/graph.cpp:1495`): a zero-length trace reports nothing but whether
+/// the box fits where it began.
+fn solid_at(world: &World, hull: Hull, p: Vec3) -> bool {
+    world.trace(hull, p, p).start_solid
+}
+
+/// Is there ground within `reach` below `p`?
+///
+/// A trace that starts inside solid leaves the fraction at 1.0 (see
+/// [`crate::bsp::Trace`]), so it answers "no floor" here — which is the
+/// conservative answer and the one that shrinks the radius.
+fn floor_within(world: &World, p: Vec3, reach: f32) -> bool {
+    world.trace(RADIUS_HULL, p, raise(p, -reach)).fraction < 1.0
+}
+
+/// How much room a bot has around a node, computed once at grid-build time.
+///
+/// A port of `BotGraph::calculatePathRadius` (`yapb/src/graph.cpp:1451-1545`).
+/// The sweep grows a disc outwards in 16-unit steps and stops at the first
+/// direction that fails, so the answer is "the largest disc that is open all
+/// the way round, floored, and with headroom" — with two 16-unit safety
+/// margins subtracted, one for the failing step and one after the loop.
+///
+/// Each direction asks four questions at `origin + forward * scan`:
+///
+/// 1. does the hull fit out there at all;
+/// 2. is there floor under it, within `scan + 60`;
+/// 3. is there floor under the *opposite* side too — this is what keeps a node
+///    on the lip of a drop from claiming the open air beyond it;
+/// 4. is there 34 units of headroom above it.
+///
+/// The one thing not ported is YaPB's door check (`graph.cpp:1499-1505`, radius
+/// 0 when the blocking entity is a door). `MapInfo` deliberately does not treat
+/// `func_door` as solid at all (`entities.rs:309`) — a door opens — so there is
+/// no door for a trace here to hit, and the frame around it is ordinary world
+/// geometry that shrinks the radius on its own.
+pub fn node_radius(world: &World, origin: Vec3) -> f32 {
+    let mut radius = 0.0f32;
+    'sweep: for &scan in &RADIUS_SCANS {
+        radius = scan;
+        for step in 0..RADIUS_DIRS {
+            let yaw = step as f32 * (360.0 / RADIUS_DIRS as f32);
+            let (sin, cos) = yaw.to_radians().sin_cos();
+            let (dx, dy) = (cos * scan, sin * scan);
+            let out = [origin[0] + dx, origin[1] + dy, origin[2]];
+            let back = [origin[0] - dx, origin[1] - dy, origin[2]];
+
+            let blocked = solid_at(world, RADIUS_HULL, out)
+                || !floor_within(world, out, scan + RADIUS_DROP)
+                || !floor_within(world, back, scan + RADIUS_DROP)
+                || !world.clear(RADIUS_HULL, out, raise(out, RADIUS_HEADROOM));
+
+            if blocked {
+                radius -= RADIUS_STEP;
+                break 'sweep;
+            }
+        }
+    }
+    (radius - RADIUS_STEP).max(0.0)
+}
+
 // ---------------------------------------------------------------- building
 
 struct Builder<'a> {
@@ -683,7 +829,10 @@ impl<'a> Builder<'a> {
             return i;
         }
         let i = self.nodes.len() as u32;
-        self.nodes.push(NavNode { origin, flags, links: Vec::new() });
+        // The radius is measured once the graph is final -- see
+        // [`NavGrid::measure_radii`]. Sweeping here would pay for every node
+        // the prune is about to throw away.
+        self.nodes.push(NavNode { origin, flags, radius: 0.0, links: Vec::new() });
         self.airborne.push(airborne);
         self.columns.entry((ix, iy)).or_default().push(i);
         i
@@ -904,6 +1053,11 @@ impl NavGrid {
         // data, it is noise that makes every A* run slower.
         let roots: Vec<usize> = spawn_nodes.iter().map(|&i| i as usize).collect();
         grid.prune(&roots);
+
+        // Last, on the nodes that survived: the sweep is the most expensive
+        // part of generation and there is no point measuring a node nobody can
+        // reach.
+        grid.measure_radii(&world);
         grid
     }
 
@@ -936,6 +1090,40 @@ impl NavGrid {
             if info.buy_zones.iter().any(|z| player.intersects(z)) {
                 n.flags |= flags::BUY_ZONE;
             }
+            // Our stand-in for YaPB's hand-placed `NodeFlag::Crouch` /
+            // `NodeFlag::Narrow`. A node you can only leave by ducking is the
+            // mouth of a gap a player barely fits through, which is exactly
+            // where a bot must not be handed a jittered target or allowed to
+            // cut the corner.
+            if n.links.iter().any(|l| l.kind == Move::Crouch) {
+                n.flags |= flags::NARROW;
+            }
+        }
+    }
+
+    /// Measure every node's [`radius`](NavNode::radius).
+    ///
+    /// Two classes never get one, matching `graph.cpp:1456-1466`: the node
+    /// types a bot has to hit precisely, and anything linked to a ladder —
+    /// stepping off a ladder is a placement problem, and a bot aiming at a
+    /// point 60 units from the rung misses it.
+    fn measure_radii(&mut self, world: &World) {
+        let is_ladder: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|n| n.flags & flags::LADDER != 0)
+            .collect();
+        for i in 0..self.nodes.len() {
+            let n = &self.nodes[i];
+            let precise = n.flags & NO_RADIUS != 0
+                || n.links.iter().any(|l| {
+                    matches!(l.kind, Move::Ladder | Move::Crouch) || is_ladder[l.to as usize]
+                });
+            self.nodes[i].radius = if precise {
+                0.0
+            } else {
+                node_radius(world, self.nodes[i].origin)
+            };
         }
     }
 
@@ -1044,6 +1232,166 @@ impl NavGrid {
         route::find_path_tuned(self, start, goal, penalty, h_weight)
     }
 
+    /// How far from node `i` still counts as being at node `i`.
+    pub fn radius(&self, i: usize) -> f32 {
+        self.nodes.get(i).map_or(0.0, |n| n.radius)
+    }
+
+    // ----------------------------------------------------------- smoothing
+
+    /// Where every node sits on the lattice, so a straight line can be walked
+    /// cell by cell without a scan over the whole graph per step.
+    fn columns(&self) -> HashMap<(i32, i32), Vec<u32>> {
+        let mut cols: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            cols.entry(lattice(n.origin)).or_default().push(i as u32);
+        }
+        cols
+    }
+
+    /// The node in lattice cell `cell` closest in height to `z`.
+    fn node_in(&self, cols: &HashMap<(i32, i32), Vec<u32>>, cell: (i32, i32), z: f32) -> Option<usize> {
+        let best = cols.get(&cell)?.iter().copied().min_by(|&a, &b| {
+            let (da, db) = (
+                (self.nodes[a as usize].origin[2] - z).abs(),
+                (self.nodes[b as usize].origin[2] - z).abs(),
+            );
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        ((self.nodes[best as usize].origin[2] - z).abs() <= Z_MERGE).then_some(best as usize)
+    }
+
+    /// Is there a walkable edge `from -> to`, or are they the same node?
+    fn walks_between(&self, from: usize, to: usize) -> bool {
+        from == to || self.move_between(from, to) == Some(Move::Walk)
+    }
+
+    /// Can a bot walk the *straight line* between two nodes?
+    ///
+    /// YaPB answers this from `vistab`, a per-node-pair visibility bitmap built
+    /// with traces when the graph is authored (`yapb/src/planner.cpp:186`). We
+    /// cannot: the follower is handed a [`NavGrid`] and nothing else — no BSP,
+    /// no `World`, no way to trace — and a 4715-node map would need eleven
+    /// million traces and a 2.8 MB table to carry one.
+    ///
+    /// So this asks the graph instead, and the graph is not a weaker source
+    /// than a trace: **every edge in it was admitted by a hull trace** through
+    /// [`classify`]. Walk the lattice cells the line crosses; each one must
+    /// hold a node at roughly the line's height, and consecutive ones must be
+    /// joined by a [`Move::Walk`] edge. A wall between the two ends breaks that
+    /// chain — either the cell inside it has no node, or the two cells either
+    /// side of it have no edge, because `classify` refused to make one.
+    ///
+    /// Walk edges only, deliberately. A chain that needs a jump, a drop, a
+    /// crouch or a breakable is a place a bot has to be steered *through*, not
+    /// a corner it may cut.
+    fn corridor_clear(&self, a: usize, b: usize, cols: &HashMap<(i32, i32), Vec<u32>>) -> bool {
+        let (pa, pb) = (self.nodes[a].origin, self.nodes[b].origin);
+        let span = route::dist(pa, pb);
+        // Half a cell, so no sample can skip a cell the line passes through.
+        let steps = ((span / (CELL * 0.5)).ceil() as usize).max(1);
+
+        let mut prev = a;
+        let mut prev_cell = lattice(pa);
+        for s in 1..=steps {
+            let t = s as f32 / steps as f32;
+            let p = [
+                pa[0] + (pb[0] - pa[0]) * t,
+                pa[1] + (pb[1] - pa[1]) * t,
+                pa[2] + (pb[2] - pa[2]) * t,
+            ];
+            let cell = lattice(p);
+            if cell == prev_cell {
+                continue;
+            }
+            let Some(next) = self.node_in(cols, cell, p[2]) else {
+                return false;
+            };
+            if !self.walks_between(prev, next) {
+                return false;
+            }
+            prev = next;
+            prev_cell = cell;
+        }
+        self.walks_between(prev, b)
+    }
+
+    /// Must the route stop at a node between `a` and `b`?
+    ///
+    /// `AStarAlgo::cantSkipNode` (`yapb/src/planner.cpp:176-220`), minus one
+    /// test. Its `tooClose` clause reads `distanceSq < cr::sqrtf (40.0f)` —
+    /// `sqrtf`, not `sqrf`, so the threshold is 6.32 *square* units and the
+    /// test fires only for two nodes less than 2.5 units apart. Verified
+    /// against the source rather than assumed: `crlib`'s `sqrf` and `sqrtf` are
+    /// both in scope there, and no graph puts two nodes that close. It is dead
+    /// code, and reproducing it would only look like intent.
+    pub fn cant_skip(
+        &self,
+        a: usize,
+        b: usize,
+        visible: &dyn Fn(usize, usize) -> bool,
+    ) -> bool {
+        let (na, nb) = (&self.nodes[a], &self.nodes[b]);
+        // No radius means "be exactly here", and a node you must arrive at is
+        // not one you may skip past.
+        if na.radius <= 0.0 || nb.radius <= 0.0 {
+            return true;
+        }
+        if (na.origin[2] - nb.origin[2]).abs() > SKIP_MAX_RISE {
+            return true;
+        }
+        if (na.flags | nb.flags) & flags::NARROW != 0 {
+            return true;
+        }
+        if route::dist(na.origin, nb.origin) > SKIP_MAX_DIST {
+            return true;
+        }
+        // A jump is a button press at a place, not a direction of travel: merge
+        // the node away and the bot walks into the lip it was meant to clear.
+        if na.links.iter().chain(&nb.links).any(|l| l.kind == Move::Jump) {
+            return true;
+        }
+        !visible(a, b)
+    }
+
+    /// Drop the nodes a bot does not need to visit.
+    ///
+    /// A\* on a 40-unit lattice returns a staircase: the shortest route across
+    /// open ground is a zig-zag of 40-unit hops, and a bot that steers at every
+    /// one of them walks the zig-zag. Greedy skip fixes exactly that — keep the
+    /// last node emitted, and emit the next only when the one *after* it cannot
+    /// be reached directly (`yapb/src/planner.cpp:222-240`).
+    ///
+    /// The result is never worse connected than the input: two consecutive
+    /// nodes of the output are either adjacent in the input or a pair
+    /// [`cant_skip`](Self::cant_skip) has already passed, so nothing further
+    /// apart than [`SKIP_MAX_DIST`] survives.
+    pub fn smooth_path(&self, path: &[usize]) -> Vec<usize> {
+        let cols = self.columns();
+        self.smooth_path_with(path, &|a, b| self.corridor_clear(a, b, &cols))
+    }
+
+    /// [`smooth_path`](Self::smooth_path) with the line-of-sight test supplied
+    /// by the caller — for anyone holding a [`World`] and able to trace.
+    pub fn smooth_path_with(
+        &self,
+        path: &[usize],
+        visible: &dyn Fn(usize, usize) -> bool,
+    ) -> Vec<usize> {
+        if path.len() < 3 {
+            return path.to_vec();
+        }
+        let mut out = vec![path[0]];
+        for i in 1..path.len() - 1 {
+            let last = *out.last().expect("seeded with path[0]");
+            if self.cant_skip(last, path[i + 1], visible) {
+                out.push(path[i]);
+            }
+        }
+        out.push(path[path.len() - 1]);
+        out
+    }
+
     /// The move recorded for the edge `from -> to`, if there is one.
     pub fn move_between(&self, from: usize, to: usize) -> Option<Move> {
         self.nodes
@@ -1058,10 +1406,18 @@ impl NavGrid {
 
     /// `"NAVG"` little-endian.
     pub const MAGIC: u32 = 0x4756_414E;
-    pub const VERSION: u32 = 1;
+    /// On-disk layout number.
+    ///
+    /// **Bump this whenever a node's serialized fields change.** Version 2
+    /// added [`NavNode::radius`] between `flags` and the link count; a version
+    /// 1 file read with the version 2 reader would take the first link's index
+    /// as a radius and slide every field after it, producing a graph that loads
+    /// without complaint and routes bots into walls. The version check is the
+    /// only thing standing between a stale cache and that.
+    pub const VERSION: u32 = 2;
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24 + self.nodes.len() * 24);
+        let mut out = Vec::with_capacity(24 + self.nodes.len() * 28);
         out.extend_from_slice(&Self::MAGIC.to_le_bytes());
         out.extend_from_slice(&Self::VERSION.to_le_bytes());
         out.extend_from_slice(&self.checksum.to_le_bytes());
@@ -1071,6 +1427,7 @@ impl NavGrid {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             out.extend_from_slice(&n.flags.to_le_bytes());
+            out.extend_from_slice(&n.radius.to_le_bytes());
             out.extend_from_slice(&(n.links.len() as u32).to_le_bytes());
             for l in &n.links {
                 out.extend_from_slice(&l.to.to_le_bytes());
@@ -1114,6 +1471,8 @@ impl NavGrid {
             }
             let flags = rd_u32(o)?;
             o += 4;
+            let radius = f32::from_bits(rd_u32(o)?);
+            o += 4;
             let nlinks = rd_u32(o)? as usize;
             o += 4;
             let mut links = Vec::with_capacity(nlinks.min(64));
@@ -1127,7 +1486,7 @@ impl NavGrid {
                     kind: Move::from_byte(kind).ok_or(NavError::BadMoveKind(kind))?,
                 });
             }
-            nodes.push(NavNode { origin, flags, links });
+            nodes.push(NavNode { origin, flags, radius, links });
         }
 
         for (i, n) in nodes.iter().enumerate() {
@@ -1332,6 +1691,37 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn open_ground_measures_the_widest_radius_and_a_wall_shrinks_it() {
+        let m = flat_map();
+        let w = World::bare(&m);
+
+        // The middle of a 2000-unit room: every scan distance passes, so the
+        // sweep runs out of scan distances rather than out of room.
+        assert_eq!(node_radius(&w, [0.0, 0.0, 36.0]), MAX_RADIUS);
+
+        // The walls' *expanded* face is at 984. Hard against it there is not
+        // even 32 units of room, so the first scan fails and both -16 steps
+        // take the answer below zero, where it clamps.
+        assert_eq!(node_radius(&w, [960.0, 0.0, 36.0]), 0.0);
+
+        // In between, the answer comes back quantised and never grows as the
+        // wall gets closer. That monotonicity is the property worth asserting:
+        // a sweep that broke out of the wrong loop would still return legal
+        // values, just not ordered ones.
+        let mut last = MAX_RADIUS;
+        for x in [700.0f32, 800.0, 850.0, 880.0, 900.0, 920.0, 940.0] {
+            let r = node_radius(&w, [x, 0.0, 36.0]);
+            assert!(
+                (0.0..=MAX_RADIUS).contains(&r) && (r / RADIUS_STEP).fract() == 0.0,
+                "radius {r} at x={x} is not one of the seven legal values"
+            );
+            assert!(r <= last, "radius grew from {last} to {r} while approaching the wall");
+            last = r;
+        }
+        assert!(last < MAX_RADIUS, "the wall never shrank the radius at all");
     }
 
     #[test]
@@ -1590,6 +1980,7 @@ mod tests {
             nodes: vec![NavNode {
                 origin: [1.0, 2.0, 3.0],
                 flags: 0,
+                radius: 32.0,
                 links: vec![Link { to: 0, kind: Move::Walk }],
             }],
             checksum: 5,
@@ -1622,6 +2013,44 @@ mod tests {
         let mut bad_kind = good.clone();
         *bad_kind.last_mut().unwrap() = 200;
         assert_eq!(NavGrid::from_bytes(&bad_kind, 5), Err(NavError::BadMoveKind(200)));
+    }
+
+    /// The trap the version number exists for.
+    ///
+    /// A version 1 record is `origin, flags, link count, links`; version 2 put
+    /// the radius between `flags` and the link count. Read one as the other and
+    /// the first link's index becomes a radius, the link count becomes an
+    /// index, and every node after it is misaligned -- a graph that loads
+    /// cleanly and is entirely wrong. It has to be refused, not misread.
+    #[test]
+    fn a_cache_in_the_previous_layout_is_refused_rather_than_misread() {
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&NavGrid::MAGIC.to_le_bytes());
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&7u64.to_le_bytes());
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        for v in [10.0f32, 20.0, 30.0] {
+            v1.extend_from_slice(&v.to_le_bytes());
+        }
+        v1.extend_from_slice(&flags::GOAL.to_le_bytes());
+        v1.extend_from_slice(&1u32.to_le_bytes()); // one link
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        v1.push(Move::Walk.to_byte());
+
+        assert_eq!(NavGrid::from_bytes(&v1, 7), Err(NavError::BadVersion(1)));
+        // And the version 2 writer really did move the layout: same one-node
+        // grid, four bytes longer.
+        let v2 = NavGrid {
+            nodes: vec![NavNode {
+                origin: [10.0, 20.0, 30.0],
+                flags: flags::GOAL,
+                radius: 0.0,
+                links: vec![Link { to: 0, kind: Move::Walk }],
+            }],
+            checksum: 7,
+        }
+        .to_bytes();
+        assert_eq!(v2.len(), v1.len() + 4);
     }
 
     #[test]
@@ -2140,6 +2569,136 @@ mod tests {
             "a CT must be able to walk to the rescue zone"
         );
         assert!(!grid.nodes_with_flag(flags::RESCUE).is_empty());
+    }
+
+    /// What the sweep actually found on a real map.
+    ///
+    /// Prints the histogram, because "the radius is computed" and "the radius
+    /// is useful" are different claims: a sweep that returned 0 everywhere
+    /// would pass every other assertion here and silently disable both the
+    /// destination jitter and the path smoothing that depend on it.
+    #[test]
+    fn de_dust2_nodes_get_a_spread_of_wayzone_radii() {
+        let Some(g) = real_grid("de_dust2") else { return };
+        let grid = &g.2;
+
+        let mut hist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        for n in &grid.nodes {
+            *hist.entry(n.radius as i32).or_default() += 1;
+        }
+        eprintln!(
+            "de_dust2 radius histogram over {} nodes: {:?}",
+            grid.len(),
+            hist
+        );
+
+        for (i, n) in grid.nodes.iter().enumerate() {
+            assert!(
+                (0.0..=MAX_RADIUS).contains(&n.radius)
+                    && (n.radius / RADIUS_STEP).fract() == 0.0,
+                "node {i} has radius {}, which is not one of {{0,16,..,96}}",
+                n.radius
+            );
+        }
+
+        // The classes that must be exact.
+        for flag in [flags::GOAL, flags::LADDER] {
+            for i in grid.nodes_with_flag(flag) {
+                assert_eq!(
+                    grid.nodes[i].radius, 0.0,
+                    "node {i} carries flag {flag:#x} and must be arrived at exactly"
+                );
+            }
+        }
+
+        let open = grid.nodes.iter().filter(|n| n.radius > 0.0).count();
+        assert!(
+            open * 4 >= grid.len(),
+            "only {open} of {} nodes have any room around them; the sweep is \
+             measuring something wrong",
+            grid.len()
+        );
+    }
+
+    /// The zig-zag, and what smoothing does to it.
+    ///
+    /// A 40-unit lattice cannot represent a diagonal, so A\* returns a
+    /// staircase and a bot that steers at every step walks the staircase. The
+    /// acceptance numbers are from the humanisation plan: at most 60 % of the
+    /// raw node count, and nothing further apart than 400 units.
+    #[test]
+    fn post_smoothing_takes_the_zig_zag_out_of_a_real_route() {
+        let Some(g) = real_grid("de_dust2") else { return };
+        let (bsp, info, grid) = (&g.0, &g.1, &g.2);
+        let world = World::new(bsp, info);
+
+        let from = grid.nearest(info.t_spawns[0]).expect("a node near the T spawn");
+        let to = grid
+            .nearest(info.bomb_sites[0].centre())
+            .expect("a node near site A");
+        let raw = grid.find_path(from, to).expect("T spawn should reach site A");
+        let smooth = grid.smooth_path(&raw);
+        eprintln!(
+            "de_dust2 T spawn -> site A: {} raw nodes -> {} smoothed ({} %)",
+            raw.len(),
+            smooth.len(),
+            smooth.len() * 100 / raw.len()
+        );
+
+        assert_eq!(smooth.first(), raw.first(), "smoothing moved the start");
+        assert_eq!(smooth.last(), raw.last(), "smoothing moved the destination");
+        assert!(
+            smooth.len() * 100 <= raw.len() * 60,
+            "smoothing kept {} of {} nodes, over the 60 % budget",
+            smooth.len(),
+            raw.len()
+        );
+
+        // A subsequence, never a re-route: smoothing may drop nodes and must
+        // not invent one.
+        let mut raw_iter = raw.iter();
+        assert!(
+            smooth.iter().all(|s| raw_iter.any(|r| r == s)),
+            "the smoothed path is not a subsequence of the raw one"
+        );
+
+        let mut new_lines = 0;
+        for w in smooth.windows(2) {
+            let (a, b) = (grid.nodes[w[0]].origin, grid.nodes[w[1]].origin);
+            let d = route::dist(a, b);
+            assert!(
+                d <= SKIP_MAX_DIST,
+                "smoothed hop {} -> {} is {d:.0} units, past the {SKIP_MAX_DIST} limit",
+                w[0],
+                w[1]
+            );
+            // Every hop is either an edge the graph already believed in, or a
+            // *new* straight line the corridor test invented -- and the second
+            // kind has to be held to the engine's answer, because the corridor
+            // test is only a stand-in for YaPB's traced visibility table. Hull
+            // 3 at a standing origin spans waist to shoulders, so a kerb inside
+            // `sv_stepsize` -- which a player walks over -- is not an
+            // obstruction, but a wall is.
+            //
+            // The distinction matters: an edge can legitimately be a *fall*,
+            // where the straight line leaves the ledge and passes through the
+            // wall below it. Asserting a clear line on those would be asserting
+            // something untrue about a route the bot has always walked.
+            let recorded = grid.move_between(w[0], w[1]).is_some();
+            assert!(
+                recorded || world.trace(Hull::Duck, a, b).is_clear(),
+                "smoothed hop {} -> {} ({a:?} -> {b:?}) is neither an edge nor a \
+                 clear line",
+                w[0],
+                w[1]
+            );
+            new_lines += usize::from(!recorded);
+        }
+        // Without this the trace check above could pass by never running.
+        assert!(
+            new_lines > 5,
+            "only {new_lines} hops were genuinely new straight lines"
+        );
     }
 
     #[test]

@@ -17,14 +17,36 @@
 //!   dead bot. Stuck-ness is measured from the server's own velocity, not from
 //!   our own idea of where we should be.
 
-use nav::navgrid::NavGrid;
+use nav::navgrid::{flags, Move, NavGrid};
 use nav::route::NavSource;
 
-/// How close counts as arrived, horizontally.
+/// How close counts as arrived, horizontally, where precision matters.
 ///
 /// Comfortably inside the 40-unit lattice pitch so a slightly overshot
-/// waypoint still registers.
+/// waypoint still registers. This is now the *tight* case — a ladder, a bomb
+/// site, a gap you have to duck through — and the distance to the destination
+/// itself. An ordinary waypoint uses [`arrive_radius`] instead.
 pub const ARRIVE_RADIUS: f32 = 32.0;
+
+/// The floor under an ordinary waypoint's arrival distance.
+///
+/// YaPB's `desiredDistanceSq` starts at `sqrf(48)` and only ever grows, to
+/// `sqrf(radius)` (`yapb/src/navigate.cpp:1327`, `:1364`). 48 is already past
+/// the 40-unit lattice pitch on purpose: a waypoint is a place to *pass*, and a
+/// bot that has to touch each one walks the lattice instead of the corridor.
+pub const MIN_ARRIVE: f32 = 48.0;
+
+/// Above this radius the steering target is drawn from the whole disc; at or
+/// below it, from a single random bearing (`yapb/src/navigate.cpp:2639`).
+pub const WIDE_RADIUS: f32 = 16.0;
+
+/// How many candidate points a wide node draws before picking one.
+///
+/// `kMaxAlternatives` (`yapb/src/navigate.cpp:2630`). The pick is the one
+/// **nearest the bot**, which is the whole trick: near-edge selection is what
+/// makes a bot cut the corner it is walking round instead of driving into the
+/// middle of the node and turning on the spot.
+pub const STEER_CANDIDATES: usize = 5;
 
 /// How much closer to the waypoint counts as real progress rather than noise.
 ///
@@ -64,6 +86,12 @@ pub struct PathFollower {
     best_dist: f32,
     /// How long we have failed to get closer to `tracked`.
     no_progress_for: f32,
+    /// Where inside the current waypoint's disc this bot is steering, and how
+    /// many random draws it has taken. Held across ticks: a target that is
+    /// re-rolled every frame is noise, and the bot walks at its average, which
+    /// is the node centre we were trying to get away from.
+    steer: Option<[f32; 3]>,
+    draws: u64,
     /// How much this bot trusts the straight-line estimate, and the seed its
     /// per-edge cost jitter is drawn from. See [`PathFollower::with_seed`].
     h_weight: f32,
@@ -106,6 +134,31 @@ pub struct Unstick {
 fn dist2d(a: [f32; 3], b: [f32; 3]) -> f32 {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
     (dx * dx + dy * dy).sqrt()
+}
+
+/// How close to a waypoint counts as having reached it.
+///
+/// `max(radius, 48)` in the open, and [`ARRIVE_RADIUS`] where the node has to
+/// be hit properly. YaPB's ladder (`yapb/src/navigate.cpp:1327-1386`) tightens
+/// those cases much further -- 25 on a goal, 6 on a ladder or a crouch node, 0
+/// on a jump link -- but it can afford to, because it backs them with a
+/// velocity prediction that decides the bot has *passed* the point
+/// (`navigate.cpp:1388-1396`). We have no per-tick velocity here, and a
+/// threshold the bot cannot satisfy is not precision: the distance simply never
+/// comes down, [`STUCK_SECONDS`] elapses, and the follower re-routes. So the
+/// tight cases keep the flat 32 they have always had, and only the open ones
+/// widen.
+fn arrive_radius(grid: &NavGrid, node: usize) -> f32 {
+    let precise = grid.flags(node) & (flags::LADDER | flags::GOAL | flags::NARROW) != 0
+        || grid.nodes[node]
+            .links
+            .iter()
+            .any(|l| matches!(l.kind, Move::Ladder | Move::Jump | Move::Crouch));
+    if precise {
+        ARRIVE_RADIUS
+    } else {
+        grid.radius(node).max(MIN_ARRIVE)
+    }
 }
 
 impl PathFollower {
@@ -182,6 +235,7 @@ impl PathFollower {
     pub fn reset(&mut self) {
         self.path.clear();
         self.at = 0;
+        self.steer = None;
         self.goal = None;
         self.no_progress_for = 0.0;
         self.unstick_for = 0.0;
@@ -309,11 +363,26 @@ impl PathFollower {
         goal: [f32; 3],
     ) -> Option<[f32; 3]> {
         while self.at < self.path.len() {
-            let p = grid.origin(self.path[self.at]);
-            if dist2d(from, p) <= ARRIVE_RADIUS {
+            let node = self.path[self.at];
+            let point = match self.steer {
+                Some(p) => p,
+                None => {
+                    let p = self.steer_point(grid, node, from);
+                    self.steer = Some(p);
+                    p
+                }
+            };
+            // Measured against the point actually being steered at, not the
+            // node centre -- `pev->origin.distanceSq (m_pathOrigin)`,
+            // `yapb/src/navigate.cpp:1328`. Using the centre here would hand
+            // back a target the bot is never judged against, and a bot walking
+            // to the edge of a disc it is measured at the middle of arrives
+            // twice.
+            if dist2d(from, point) <= arrive_radius(grid, node) {
                 self.at += 1;
+                self.steer = None;
             } else {
-                return Some(p);
+                return Some(point);
             }
         }
         if dist2d(from, goal) > ARRIVE_RADIUS {
@@ -321,6 +390,77 @@ impl PathFollower {
         } else {
             None
         }
+    }
+
+    /// Where inside a waypoint's disc to actually walk.
+    ///
+    /// `Bot::setPathOrigin` (`yapb/src/navigate.cpp:2629-2679`). A node with
+    /// room around it is a **disc**, and thirty bots steering at thirty
+    /// different points in it is thirty bodies filling a corridor instead of
+    /// one line of them tracking its centre.
+    ///
+    /// Two regimes, as YaPB has them:
+    ///
+    /// * a wide node draws [`STEER_CANDIDATES`] points from the square
+    ///   `[-r, r]^2` and takes the one **nearest the bot** -- deliberately the
+    ///   near edge, which is what cuts corners;
+    /// * a narrow one (`0 < r <= 16`) takes a single bearing at a random
+    ///   distance. YaPB draws that bearing within +-90 degrees of the bot's own
+    ///   body yaw; this layer is handed a position and not a view, so it draws
+    ///   the whole circle. The difference is which half of a 16-unit disc gets
+    ///   used.
+    ///
+    /// The square rather than the disc is YaPB's, and its corners reach
+    /// `r * 1.41` -- a little past what the radius sweep certified for the two
+    /// widest classes. It is a steering target and not a teleport: the bot is
+    /// already "arrived" at `max(r, 48)` away, so it never walks the last of
+    /// that distance.
+    fn steer_point(&mut self, grid: &NavGrid, node: usize, from: [f32; 3]) -> [f32; 3] {
+        let origin = grid.origin(node);
+        let r = grid.radius(node);
+        if r <= 0.0 {
+            return origin;
+        }
+        if r > WIDE_RADIUS && grid.flags(node) & flags::NARROW == 0 {
+            let mut best = origin;
+            let mut best_dist = f32::INFINITY;
+            for _ in 0..STEER_CANDIDATES {
+                let c = [
+                    origin[0] + self.draw_range(-r, r),
+                    origin[1] + self.draw_range(-r, r),
+                    origin[2],
+                ];
+                let d = dist2d(from, c);
+                if d < best_dist {
+                    best_dist = d;
+                    best = c;
+                }
+            }
+            return best;
+        }
+        let yaw = self.draw_range(0.0, 360.0).to_radians();
+        let out = self.draw_range(0.0, r);
+        [
+            origin[0] + yaw.cos() * out,
+            origin[1] + yaw.sin() * out,
+            origin[2],
+        ]
+    }
+
+    /// One uniform draw in `[lo, hi)` from this bot's own stream.
+    ///
+    /// Counter-based off the seed rather than a stateful generator, for the
+    /// reason [`with_seed`](Self::with_seed) gives: the same bot fed the same
+    /// route must produce the same walk, or a run cannot be reproduced.
+    fn draw_range(&mut self, lo: f32, hi: f32) -> f32 {
+        self.draws = self.draws.wrapping_add(1);
+        let mut z = self
+            .seed
+            .wrapping_add(self.draws.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        lo + (hi - lo) * ((z >> 40) as f32 / (1u64 << 24) as f32)
     }
 
     /// Re-base the progress measurement when the waypoint changes.
@@ -337,11 +477,12 @@ impl PathFollower {
     fn replan(&mut self, grid: &NavGrid, from: [f32; 3], goal: [f32; 3]) {
         self.goal = Some(goal);
         self.at = 0;
+        self.steer = None;
         self.tracked = None;
         self.best_dist = f32::INFINITY;
         self.no_progress_for = 0.0;
         let blocked = std::mem::take(&mut self.blocked);
-        self.path = match (grid.nearest(from), grid.nearest(goal)) {
+        let raw = match (grid.nearest(from), grid.nearest(goal)) {
             (Some(a), Some(b)) => grid
                 .find_path_tuned(
                     a,
@@ -356,6 +497,10 @@ impl PathFollower {
             _ => Vec::new(),
         };
         self.blocked = blocked;
+        // A* on a 40-unit lattice returns a staircase, and a bot that steers at
+        // every step of one walks the staircase. Smoothing drops the nodes that
+        // only exist because the grid cannot draw a diagonal.
+        self.path = grid.smooth_path(&raw);
     }
 
     /// Give up on the current waypoint.
@@ -381,6 +526,7 @@ impl PathFollower {
             self.replan(grid, from, goal);
         } else {
             self.at += 1;
+            self.steer = None;
         }
     }
 
@@ -587,6 +733,101 @@ mod tests {
         let distinct: std::collections::BTreeSet<_> =
             routes.iter().map(|r| r.iter().copied().collect::<Vec<_>>()).collect();
         assert!(distinct.len() >= 2, "8 seeds produced {} distinct routes", distinct.len());
+    }
+
+    /// A waypoint with room around it is a disc, and the bot aims at the near
+    /// edge of it.
+    ///
+    /// The near-edge bias is the part that matters. A point drawn uniformly in
+    /// the disc would only smear the queue about; taking the *nearest* of five
+    /// candidates pulls the aim toward the side the bot is coming from, which
+    /// is what turns a corner into a cut corner instead of a stop and a turn.
+    #[test]
+    fn a_wide_waypoint_is_aimed_at_off_centre_and_toward_the_bot() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let grid = &map.grid;
+        let wide = (0..grid.len())
+            .find(|&i| grid.radius(i) >= 48.0)
+            .expect("de_dust2 has open ground");
+        let tight = (0..grid.len())
+            .find(|&i| grid.radius(i) == 0.0)
+            .expect("de_dust2 has doorways");
+
+        let o = grid.origin(wide);
+        let r = grid.radius(wide);
+        // Approaching from -x, a long way off.
+        let from = [o[0] - 600.0, o[1], o[2]];
+
+        let mut f = PathFollower::with_seed(3);
+        let mut sum_dx = 0.0;
+        for _ in 0..64 {
+            let p = f.steer_point(grid, wide, from);
+            assert!(
+                (p[0] - o[0]).abs() <= r && (p[1] - o[1]).abs() <= r && p[2] == o[2],
+                "steering point {p:?} is outside the {r}-unit disc around {o:?}"
+            );
+            assert_ne!(p, o, "a node with room should not be aimed at dead centre");
+            sum_dx += p[0] - o[0];
+        }
+        assert!(
+            sum_dx / 64.0 < -r * 0.2,
+            "the pick should lean toward the bot; mean offset was {:.1} on a \
+             radius of {r}",
+            sum_dx / 64.0
+        );
+
+        // A node with no room is aimed at exactly, and arrival there keeps the
+        // old flat distance rather than widening to 48.
+        assert_eq!(f.steer_point(grid, tight, from), grid.origin(tight));
+        assert!(arrive_radius(grid, wide) >= MIN_ARRIVE);
+        assert!(arrive_radius(grid, wide) >= r);
+        for i in grid.nodes_with_flag(nav::navgrid::flags::GOAL) {
+            assert_eq!(arrive_radius(grid, i), ARRIVE_RADIUS);
+        }
+    }
+
+    /// The steering point has to survive between ticks.
+    ///
+    /// Re-rolled every frame it is white noise, the bot walks at its average --
+    /// the node centre -- and the whole thing has bought nothing but a jittery
+    /// view. Worse, the follower measures being stuck as progress toward the
+    /// target, so a target that moves every tick manufactures stuck verdicts.
+    #[test]
+    fn the_steering_point_is_held_until_the_waypoint_changes() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+
+        let mut f = PathFollower::with_seed(11);
+        let first = f
+            .next_waypoint(&map.grid, start, goal, 0.02)
+            .expect("a first waypoint");
+        let node = f.path[f.at];
+        for _ in 0..20 {
+            assert_eq!(
+                f.next_waypoint(&map.grid, start, goal, 0.02),
+                Some(first),
+                "the steering point moved without the waypoint changing"
+            );
+        }
+
+        // Within the disc of the node it belongs to, wherever that is.
+        let o = map.grid.origin(node);
+        let r = map.grid.radius(node);
+        assert!(
+            (first[0] - o[0]).abs() <= r && (first[1] - o[1]).abs() <= r,
+            "{first:?} is not inside the {r}-unit disc around {o:?}"
+        );
+
+        // Walking onto it advances the route and draws a new point.
+        f.next_waypoint(&map.grid, first, goal, 0.02);
+        assert!(f.at > 0 || f.path.len() <= 1, "arriving did not consume the waypoint");
     }
 
     /// The bug that made a speed threshold useless.
