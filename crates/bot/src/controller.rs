@@ -69,6 +69,22 @@ pub const ARRIVE_RADIUS: f32 = 24.0;
 /// speed compared there is the resulting *velocity*, not the requested move.
 pub const WALK_SPEED: f32 = ESCORT_WALK_SPEED;
 
+/// Speed multiplier while turning hard, and the angle bands it applies in.
+///
+/// **Nobody sprints sideways.** A player rounding a corner slows into it and
+/// accelerates out; a bot that holds exactly 250 u/s through every turn reads as
+/// a machine from across the map, and it was our most mechanical remaining
+/// signal -- 84.7% of walking samples were `fwd` exactly 250.0.
+///
+/// The bands are on the angle between where the bot is LOOKING and where it is
+/// going, which after the view/movement decoupling is a real quantity: it is
+/// large exactly when the bot is strafing or backing rather than running
+/// forward.
+pub const TURN_SLOW_ANGLE: f64 = 45.0;
+pub const TURN_STOP_ANGLE: f64 = 100.0;
+pub const TURN_SLOW_SCALE: f32 = 0.78;
+pub const TURN_HARD_SCALE: f32 = 0.55;
+
 /// How close an enemy has to be before the bomb carrier will stop for it.
 ///
 /// **The carrier's job is the plant, not the duel.** A bot that trades with
@@ -190,6 +206,12 @@ pub struct Controller {
     /// The weapon we last saw ourselves holding, so the fire latches can be
     /// cleared on a switch.
     last_weapon: WeaponId,
+    /// This bot's own cruising pace, as a fraction of full speed.
+    ///
+    /// Drawn once per bot. Real players do not all move at an identical
+    /// velocity, and a fleet that does is a tell no amount of path variety
+    /// hides -- thirty dots crossing a map in perfect lockstep.
+    pace: f32,
     /// Which way the bot is currently circling, and how long is left on it.
     strafe: (f32, f32),
     /// Where the brain wants to be routed, when that is not the bomb
@@ -227,6 +249,9 @@ impl Controller {
             tracking: None,
             aim_offset: (Angles::default(), f32::INFINITY),
             last_weapon: WeaponId::None,
+            // 0.82..1.00 of full speed. Wide enough to be visible when two bots
+            // run the same corridor, narrow enough that nobody is left behind.
+            pace: 0.82 + (seed % 19) as f32 * 0.01,
             strafe: (1.0, 0.0),
             nav_goal: None,
             rung: "init",
@@ -294,7 +319,20 @@ impl Controller {
     /// is executing, so decomposing against anything else walks the bot
     /// somewhere it did not ask to go.
     fn travel(&self, view: Angles, from: Vec3, to: Vec3, speed: f32) -> (f32, f32) {
-        move_axes(view.yaw, aim_angles(from, to).yaw, speed)
+        let bearing = aim_angles(from, to).yaw;
+        // Slow into the turn. `delta` is the angle between where the bot is
+        // looking and where it is going, which is only large when it is
+        // strafing or backing -- exactly the cases where a human is not at full
+        // tilt. See TURN_SLOW_ANGLE.
+        let delta = norm_angle(f64::from(bearing) - f64::from(view.yaw)).abs();
+        let turn = if delta >= TURN_STOP_ANGLE {
+            TURN_HARD_SCALE
+        } else if delta >= TURN_SLOW_ANGLE {
+            TURN_SLOW_SCALE
+        } else {
+            1.0
+        };
+        move_axes(view.yaw, bearing, speed * turn * self.pace)
     }
 
     /// Advance the circling timer and return the current side.
@@ -1410,8 +1448,34 @@ mod tests {
         let err = norm_angle(f64::from(travel_bearing(&intent) - want)).abs();
         assert!(err < 1.0, "walking {err:.1} degrees off the waypoint");
 
+        // A hard turn is now DELIBERATELY slower -- nobody sprints sideways,
+        // see TURN_SLOW_ANGLE. This is a 90-degree turn, so expect the hard
+        // band, scaled by the bot's own pace.
+        // Which band it lands in depends on how much of the turn the view has
+        // already absorbed this tick, so assert the property rather than the
+        // constant: turning costs speed.
         let speed = travel_speed(&intent);
-        assert!((speed - FORWARD_SPEED).abs() < 1.0, "speed {speed}");
+        let full = FORWARD_SPEED * c.pace;
+        assert!(
+            speed < full * 0.95,
+            "turning hard cost nothing: speed {speed} against a full {full}"
+        );
+        assert!(speed > full * TURN_HARD_SCALE - 1.0, "slowed more than the hard band");
+
+        // ...and running straight at it is full pace, undiminished.
+        let straight: Vec3 = [800.0, 0.0, 0.0];
+        let mut c2 = Controller::new(3, Difficulty::Normal);
+        for _ in 0..200 {
+            c2.think(&world, Some(straight), 0.05);
+        }
+        let ahead = c2.think(&world, Some(straight), 0.05);
+        let s2 = travel_speed(&ahead);
+        assert!(
+            (s2 - FORWARD_SPEED * c2.pace).abs() < 1.0,
+            "running straight: speed {s2}, expected {}",
+            FORWARD_SPEED * c2.pace
+        );
+        assert!(s2 > speed, "a straight run must be faster than a hard turn");
     }
 
     /// Running at 250 u/s is not a firing position, and the bot must not
