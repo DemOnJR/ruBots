@@ -4,6 +4,17 @@
     python scripts/rcon.py "status"
     python scripts/rcon.py "mp_friendlyfire"
 
+**Keep the number of calls down.** Semicolon batching does NOT work here --
+`rcon "mp_roundtime 3; mp_freezetime 4"` sets mp_roundtime to the literal
+string "3;" and drops the rest, verified. So each cvar really is its own call.
+
+Each call is two connectionless packets (challenge + command), and Reunion's
+query limiter bans the source for an hour past `QueryFloodBanLevel` (160).
+Setting eight cvars as eight calls is sixteen packets; a loop that polls is
+worse. When the ban lands, rcon AND the connect handshake stop answering while
+the container runs happily -- it reads exactly like a client regression, and it
+has cost this project two debugging detours. `docker compose restart` clears it.
+
 This lives in the repo rather than a scratch directory on purpose: it is the
 only channel that tells the truth about the running server. The log file lags
 in 8 KB blocks and `docker logs` is cumulative across restarts, so both can show

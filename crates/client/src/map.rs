@@ -66,20 +66,63 @@ impl Map {
     /// map offers no objective, which is the correct answer for a deathmatch
     /// map rather than a reason to invent one.
     pub fn objective(&self, is_ct: bool, seed: usize) -> Option<[f32; 3]> {
-        let pick = |v: &Vec<nav::entities::Aabb>| -> Option<[f32; 3]> {
+        // Two independent draws off the seed: WHICH zone, and WHERE in it.
+        //
+        // Both matter, and the second is the one that was missing. Handing every
+        // bot on a team the same zone CENTRE is what produced the pile: 80% of
+        // live bots inside one 192-unit box, and 71.8% of `arrived` samples in
+        // a single 64-unit cell. A bomb site is a room, not a point -- players
+        // spread across it, and so should we.
+        //
+        // Kept deterministic in the seed so a given bot always wants the same
+        // spot: a destination that moves under a bot mid-round makes the
+        // navigation layer look broken for reasons that have nothing to do with
+        // navigation.
+        let mut rng = crate::map::seed_rng(seed);
+        let mut spot = |v: &Vec<nav::entities::Aabb>| -> Option<[f32; 3]> {
             if v.is_empty() {
-                None
-            } else {
-                Some(v[seed % v.len()].centre())
+                return None;
             }
+            let zone = &v[rng() % v.len()];
+            let c = zone.centre();
+            // Stay well inside the brush: the edge of a bomb-target volume is
+            // not reliably standable, and being outside it means no plant.
+            let frac = |lo: f32, hi: f32, r: usize| -> f32 {
+                let half = (hi - lo) * 0.5 * 0.6;
+                let t = (r % 1000) as f32 / 1000.0 * 2.0 - 1.0;
+                (lo + hi) * 0.5 + t * half
+            };
+            Some([
+                frac(zone.mins[0], zone.maxs[0], rng()),
+                frac(zone.mins[1], zone.maxs[1], rng()),
+                c[2],
+            ])
         };
         if is_ct && !self.info.rescue_zones.is_empty() && !self.info.hostage_spawns.is_empty() {
             // On a hostage map the CT objective is the hostages, not the zone
             // -- you have to collect before you can deliver.
             let h = &self.info.hostage_spawns;
-            return Some(h[seed % h.len()]);
+            return Some(h[rng() % h.len()]);
         }
-        pick(&self.info.bomb_sites).or_else(|| pick(&self.info.rescue_zones))
+        spot(&self.info.bomb_sites).or_else(|| spot(&self.info.rescue_zones))
+    }
+}
+
+/// A tiny deterministic sequence from a seed, for picking a goal.
+///
+/// Deliberately not shared with `bot::rng`: this runs once per round to choose
+/// a destination, and it must give the SAME answer for the same bot every time
+/// it is asked, independently of how many aim errors that bot has drawn since.
+pub fn seed_rng(seed: usize) -> impl FnMut() -> usize {
+    // SplitMix64, which has no bad seeds -- including 0, which is exactly the
+    // seed every bot used to be given.
+    let mut state = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xDEAD_BEEF_CAFE_F00D;
+    move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 1) as usize
     }
 }
 

@@ -60,7 +60,40 @@ fn main() {
     // Distinct name AND key per bot: Reunion's IDClientsLimit is 1, so two
     // bots sharing a CD key are one identity and the second is refused.
     let name = env::var("AIPLAYERS_NAME").unwrap_or_else(|_| "AIPlayer".into());
+
     let key = env::var("AIPLAYERS_KEY").unwrap_or_else(|_| "AIPLAYER0000000".into());
+
+    // Every bot used to be constructed with a literal seed and a literal
+    // difficulty, so thirty processes computed the same function of (map, team)
+    // and produced thirty copies of one answer walking in a line. Human variance
+    // is DIFFERENT INPUTS per bot, not noise sprinkled on a shared output.
+    //
+    // Defaults to a hash of the RevEmu key, which is already unique per bot, so
+    // the swarm gets a spread without having to pass anything extra -- and the
+    // same bot keeps the same personality across runs, which makes a
+    // reproduction reproducible.
+    let seed: usize = env::var("AIPLAYERS_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            key.bytes()
+                .fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3u64)
+                }) as usize
+        });
+    let difficulty = match env::var("AIPLAYERS_DIFFICULTY").as_deref() {
+        Ok("easy") => bot::Difficulty::Easy,
+        Ok("normal") => bot::Difficulty::Normal,
+        Ok("hard") => bot::Difficulty::Hard,
+        Ok("unfair") => bot::Difficulty::Unfair,
+        // A fleet of identically-skilled bots is itself a tell.
+        _ => match seed % 3 {
+            0 => bot::Difficulty::Easy,
+            1 => bot::Difficulty::Normal,
+            _ => bot::Difficulty::Hard,
+        },
+    };
+    eprintln!("  seed {seed} difficulty {difficulty:?}");
     let mut session = Session::new(Identity {
         name: name.clone(),
         key: key.into_bytes(),
@@ -153,10 +186,10 @@ fn main() {
     session.start_decoding();
     // Give the bot a brain unless we are capturing raw protocol.
     if env::var("AIPLAYERS_NO_BRAIN").is_err() {
-        session.brain = Some(bot::Controller::new(0xA1F0, bot::Difficulty::Normal));
+        session.brain = Some(bot::Controller::new(seed as u64, difficulty));
         eprintln!("  bot brain enabled");
     }
-    session.load_map(0);
+    session.load_map(seed);
     match session.map.as_ref() {
         Some(m) => eprintln!(
             "  map {} loaded: {} nav nodes, {} bomb sites, {} rescue zones",
@@ -204,7 +237,7 @@ fn main() {
                 // see Identity::setinfo_name_command for the whole chain.
                 session.reassert_name();
                 eprintln!("  re-asserted name {:?}", session.name());
-                session.refresh_objective(0);
+                session.refresh_objective(seed);
                 if let Some(site) = session.site {
                     eprintln!("  objective: [{:.0} {:.0} {:.0}]", site[0], site[1], site[2]);
                 }

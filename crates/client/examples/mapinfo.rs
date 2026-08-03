@@ -38,6 +38,22 @@ fn main() {
                     i.hostage_spawns.len(),
                 );
 
+                // Do different bots actually get different destinations?
+                // Every bot used to be handed the same zone CENTRE, which is
+                // most of why 80% of them ended up in one 192-unit box.
+                let mut seen = std::collections::BTreeSet::new();
+                for seed in 0..12usize {
+                    if let Some(g) = m.objective(false, seed) {
+                        seen.insert((g[0] as i32 / 32, g[1] as i32 / 32));
+                    }
+                }
+                println!("    objective spread over 12 seeds: {} distinct 32u cells", seen.len());
+                for seed in 0..6usize {
+                    if let Some(g) = m.objective(false, seed) {
+                        println!("      seed {seed} -> [{:.0} {:.0} {:.0}]", g[0], g[1], g[2]);
+                    }
+                }
+
                 // Can the bot physically REACH the objective it is given?
                 // `ARRIVE_RADIUS` is 24 units, so if the nearest walkable node
                 // is further than that from the objective's centre, the bot
