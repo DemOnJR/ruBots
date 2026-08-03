@@ -1031,6 +1031,19 @@ impl NavGrid {
         route::find_path_avoiding(self, start, goal, penalty)
     }
 
+    /// [`Self::find_path_avoiding`] with the heuristic weight from
+    /// [`route::find_path_tuned`] -- the knob that makes two bots with the same
+    /// goal walk different routes.
+    pub fn find_path_tuned(
+        &self,
+        start: usize,
+        goal: usize,
+        penalty: &dyn Fn(usize) -> f32,
+        h_weight: f32,
+    ) -> Option<Vec<usize>> {
+        route::find_path_tuned(self, start, goal, penalty, h_weight)
+    }
+
     /// The move recorded for the edge `from -> to`, if there is one.
     pub fn move_between(&self, from: usize, to: usize) -> Option<Move> {
         self.nodes

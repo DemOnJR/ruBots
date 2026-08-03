@@ -189,6 +189,7 @@ fn main() {
         session.brain = Some(bot::Controller::new(seed as u64, difficulty));
         eprintln!("  bot brain enabled");
     }
+    session.set_seed(seed as u64);
     session.load_map(seed);
     match session.map.as_ref() {
         Some(m) => eprintln!(

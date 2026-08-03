@@ -258,7 +258,7 @@ impl Session {
             brain: None,
             site: None,
             map: None,
-            follower: crate::navigate::PathFollower::new(),
+            follower: crate::navigate::PathFollower::new(),  // re-seeded by set_seed
             last_origin: None,
             last_speed: 0.0,
             last_decision: None,
@@ -1527,6 +1527,15 @@ impl Session {
         };
         self.map = crate::map::Map::load(&name);
         self.refresh_objective(seed);
+    }
+
+    /// Give the navigation layer this bot's identity.
+    ///
+    /// Must be called before the first route is planned. Without it every bot
+    /// shares seed 0, runs the same search over the same graph, and produces the
+    /// same path -- which is the conga line, not a steering problem.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.follower = crate::navigate::PathFollower::with_seed(seed);
     }
 
     /// Re-pick where to go, e.g. after switching team or a new round.

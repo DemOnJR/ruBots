@@ -110,6 +110,43 @@ pub fn find_path_avoiding<S: NavSource + ?Sized>(
     goal: usize,
     penalty: &dyn Fn(usize) -> f32,
 ) -> Option<Vec<usize>> {
+    find_path_tuned(src, start, goal, penalty, 1.0)
+}
+
+/// How much a bot trusts the straight-line estimate.
+///
+/// The weight on `h` is what makes two bots with the same map, the same goal
+/// and the same graph produce **different routes**, which is the thing our
+/// fleet most conspicuously lacked -- thirty identical searches give thirty
+/// identical answers, and thirty copies of one answer walking at one speed is
+/// the conga line the user complained about.
+///
+/// * `0.0` is Dijkstra: ignores the destination and expands evenly, so it finds
+///   the genuinely shortest route and will happily go the long way round.
+/// * `1.0` is textbook A*: admissible, optimal, and the route everyone agrees on.
+/// * `> 1.0` is greedy/weighted A*: follows the heuristic, commits early, and
+///   returns a slightly worse but visibly different path.
+///
+/// YaPB gets the same effect by giving each bot one of three (g,h) pairs chosen
+/// per round from personality and a morale coin-flip
+/// (`yapb/src/manager.cpp:1766-1790`, cost functions at
+/// `yapb/src/navigate.cpp:3493-3522`). Its `g` variants lean on a learned danger
+/// table we do not have, so this is the portable half.
+pub const H_DIJKSTRA: f32 = 0.0;
+pub const H_ASTAR: f32 = 1.0;
+pub const H_GREEDY: f32 = 1.6;
+
+/// [`find_path_avoiding`] with the heuristic scaled by `h_weight`.
+///
+/// See [`H_ASTAR`]. A weight of 1.0 is the ordinary search; anything else trades
+/// optimality for a different-looking route, which is the point.
+pub fn find_path_tuned<S: NavSource + ?Sized>(
+    src: &S,
+    start: usize,
+    goal: usize,
+    penalty: &dyn Fn(usize) -> f32,
+    h_weight: f32,
+) -> Option<Vec<usize>> {
     let n = src.len();
     if start >= n || goal >= n {
         return None;
@@ -125,7 +162,7 @@ pub fn find_path_avoiding<S: NavSource + ?Sized>(
     let mut scratch: Vec<usize> = Vec::new();
 
     let goal_origin = src.origin(goal);
-    let h = |i: usize| dist(src.origin(i), goal_origin);
+    let h = |i: usize| dist(src.origin(i), goal_origin) * h_weight;
 
     g[start] = 0.0;
     open.push(Candidate { cost: h(start), node: start });
