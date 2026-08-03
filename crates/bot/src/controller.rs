@@ -69,6 +69,23 @@ pub const ARRIVE_RADIUS: f32 = 24.0;
 /// speed compared there is the resulting *velocity*, not the requested move.
 pub const WALK_SPEED: f32 = ESCORT_WALK_SPEED;
 
+/// How close an enemy has to be before the bomb carrier will stop for it.
+///
+/// **The carrier's job is the plant, not the duel.** A bot that trades with
+/// every counter-terrorist it sees dies in the open with the bomb, and the
+/// round is over before anyone reaches a site. Measured: ten bots, five a side,
+/// ten minutes, **zero plants** -- the carrier was killed first in every single
+/// round, while an unopposed one plants in about thirty-five seconds.
+///
+/// Inside this radius running is not an option and it fights like anyone else.
+/// Beyond it, it keeps going -- which is exactly what a human carrier does, and
+/// it is also why teammates exist to trade on its behalf.
+///
+/// **Chosen.** Roughly the distance a player crosses in a second and a half at
+/// full speed, so an enemy further away than this is one the carrier can
+/// realistically disengage from.
+pub const CARRIER_HOLDS_FIRE_BEYOND: f32 = 400.0;
+
 /// Speed below which a rifle is accurate.
 ///
 /// Every rifle picks its spread with `if (velocity.Length() > 140)` and the
@@ -371,7 +388,15 @@ impl Controller {
         self.objective.tick(world, nav.goal, dt);
 
         // --- 3) A visible enemy -------------------------------------------
-        if let Some(target) = select_target(world, &self.params).copied() {
+        //
+        // ...unless we are carrying the bomb and can still walk away from it.
+        // See CARRIER_HOLDS_FIRE_BEYOND: the carrier that stops to fight is the
+        // reason a contested round never reaches a bomb site.
+        let carrying = world.bomb.carried_by_me && !world.bomb.planted;
+        let threat = select_target(world, &self.params).copied().filter(|t| {
+            !carrying || distance2d(world.me.origin, t.origin) <= CARRIER_HOLDS_FIRE_BEYOND
+        });
+        if let Some(target) = threat {
             let eng = engage(world, &target, self.view, &self.params, &mut self.rng);
 
             // A new target is a new mistake: re-draw the aim error rather than
@@ -1456,6 +1481,55 @@ mod tests {
         assert!(crate::fire::accurate_speed(WeaponId::Ak47) > 100.0);
         assert!(crate::fire::accurate_speed(WeaponId::Deagle) < 50.0);
         assert!(crate::fire::accurate_speed(WeaponId::Scout) > 150.0);
+    }
+
+    /// The bomb carrier walks past a fight it can walk past.
+    ///
+    /// Ten bots, five a side, ten minutes: ZERO plants, the carrier killed
+    /// first in every round -- while an unopposed one plants in about
+    /// thirty-five seconds. A carrier that duels every CT it sees dies in the
+    /// open and the round ends before anyone reaches a site.
+    #[test]
+    fn the_bomb_carrier_keeps_going_past_a_distant_enemy_but_fights_a_close_one() {
+        let site: Vec3 = [3000.0, 0.0, 0.0];
+        let world = |enemy_at: Vec3, carrying: bool| WorldView {
+            me: SelfState {
+                can_shoot: true,
+                weapon: Some(WeaponState {
+                    id: WeaponId::Ak47,
+                    clip: 30,
+                    ..Default::default()
+                }),
+                ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
+            },
+            players: vec![PlayerView {
+                entity: 1,
+                origin: enemy_at,
+                team: Team::CounterTerrorist,
+                visible: true,
+                ..Default::default()
+            }],
+            bomb: BombState { carried_by_me: carrying, ..Default::default() },
+            ..Default::default()
+        };
+
+        let far = [CARRIER_HOLDS_FIRE_BEYOND + 200.0, 0.0, 0.0];
+        let near = [CARRIER_HOLDS_FIRE_BEYOND - 200.0, 0.0, 0.0];
+
+        // Not carrying: a distant enemy is still a fight.
+        let mut c = Controller::new(1, Difficulty::Normal);
+        c.think(&world(far, false), Some(site), 0.1);
+        assert_eq!(c.rung, "combat", "a normal bot engages at that range");
+
+        // Carrying, and it can walk away: it walks.
+        let mut c = Controller::new(1, Difficulty::Normal);
+        c.think(&world(far, true), Some(site), 0.1);
+        assert_ne!(c.rung, "combat", "the carrier stopped for a fight it could leave");
+
+        // Carrying, but the enemy is on top of it: running is not an option.
+        let mut c = Controller::new(1, Difficulty::Normal);
+        c.think(&world(near, true), Some(site), 0.1);
+        assert_eq!(c.rung, "combat", "the carrier ignored an enemy at close range");
     }
 
     /// Circling an opponent, but planting to shoot.
