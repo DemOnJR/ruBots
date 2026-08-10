@@ -35,7 +35,9 @@
 //! [`Difficulty::reaction_time`] before the trigger is available — and swapping
 //! to a different target restarts it.
 
-use crate::aim::{aim_error, compensate, predict_punch, turn_toward};
+use crate::aim::{
+    aim_error, compensate, predict_punch, COMBAT_GAINS, NAV_GAINS, SpringGains, ViewMotion,
+};
 use crate::combat::{engage, select_target, EngageParams};
 use crate::fire::FireControl;
 use crate::idle::AntiIdle;
@@ -155,12 +157,20 @@ pub struct Nav {
     /// The next point to steer at on the way there. `None` means steer
     /// straight at the goal, which is only correct in an open room.
     pub waypoint: Option<Vec3>,
+    /// Where to LOOK while walking -- a point further along the route than
+    /// [`Nav::waypoint`], because the head leads the body. `None` means look
+    /// at [`Nav::steer`] like the feet do.
+    ///
+    /// This is deliberately not the path's raw next node list: the caller's
+    /// navigation layer applies YaPB's visibility/radius ladder exactly once,
+    /// here, instead of the brain re-deriving graph state it does not own.
+    pub look: Option<Vec3>,
 }
 
 impl Nav {
     /// Head for `goal` with no route -- straight-line steering.
     pub fn to(goal: Vec3) -> Self {
-        Self { goal: Some(goal), waypoint: None }
+        Self { goal: Some(goal), waypoint: None, look: None }
     }
 
     /// No objective at all.
@@ -176,7 +186,7 @@ impl Nav {
 
 impl From<Option<Vec3>> for Nav {
     fn from(goal: Option<Vec3>) -> Self {
-        Self { goal, waypoint: None }
+        Self { goal, waypoint: None, look: None }
     }
 }
 
@@ -193,6 +203,10 @@ pub struct Controller {
     /// This is **where the bullets should go**, not what gets sent — see the
     /// module docs.
     pub view: Angles,
+    /// The view's angular momentum — the state of the spring that owns
+    /// [`Controller::view`]. Carried between ticks on purpose: a head is a
+    /// mass, and its momentum IS the human-looking part.
+    view_motion: ViewMotion,
     pub objective: ObjectiveState,
     pub plant: PlantMachine,
     pub defuse: DefuseMachine,
@@ -235,17 +249,18 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(seed: u64, difficulty: Difficulty) -> Self {
-        Self {
+        let this = Self {
             params: EngageParams::default(),
             difficulty,
             rng: Rng::new(seed),
             view: Angles::default(),
+            view_motion: ViewMotion::default(),
             objective: ObjectiveState::default(),
             plant: PlantMachine::default(),
             defuse: DefuseMachine::default(),
             escort: HostageEscort::default(),
             fire: FireControl::new(difficulty.fire_params()),
-            idle: AntiIdle::default(),
+            idle: AntiIdle::from_seed(seed),
             tracking: None,
             aim_offset: (Angles::default(), f32::INFINITY),
             last_weapon: WeaponId::None,
@@ -255,7 +270,40 @@ impl Controller {
             strafe: (1.0, 0.0),
             nav_goal: None,
             rung: "init",
-        }
+        };
+        // A mis-tuned per-seed drift is a loud failure here, not a bot quietly
+        // kicked twenty minutes in.
+        debug_assert!(this.idle.guarantees(), "the per-seed anti-idle must be provably safe");
+        this
+    }
+
+    /// Advance the view one spring step toward `desired`.
+    ///
+    /// Everything goes through the spring now -- the old `err * 0.45` ease
+    /// could not overshoot, could not ring, and always decelerated along the
+    /// same curve, which is a machine exactly. Combat uses the faster, more
+    /// underdamped gains: the overshoot IS the flick. Nav uses the stiff
+    /// damped pair: walking somewhere is a purpose, not a reflex.
+    fn aim_at(&mut self, desired: Angles, gains: SpringGains, dt: f32) {
+        self.view = self.view_motion.step(self.view, desired, gains, f64::from(dt));
+    }
+
+    /// Advance the view toward `desired` on a movement rung: guarded so a big
+    /// turn cannot swing through the back of the bot's own head.
+    ///
+    /// `travel_yaw` is the bearing of the point being walked to; when the
+    /// short way round would take the view behind the direction of travel the
+    /// spring is driven the long way around instead (YaPB's
+    /// `updateLookAngles`, `yapb/src/vision.cpp:172-195`).
+    fn aim_at_guarded(
+        &mut self,
+        desired: Angles,
+        gains: SpringGains,
+        dt: f32,
+        travel_yaw: f64,
+    ) {
+        self.view =
+            self.view_motion.step_guarded(self.view, desired, gains, f64::from(dt), travel_yaw);
     }
 
     /// The aim error to apply this tick, re-drawn periodically.
@@ -406,8 +454,6 @@ impl Controller {
             return Intent::hold(self.wire_view(world));
         }
 
-        let max_turn = self.difficulty.max_turn();
-
         // --- 2) Freeze period ---------------------------------------------
         // Movement is refused and weapons are locked; the only useful thing is
         // to shop. Note the flag's name is inverted — see `SelfState`.
@@ -447,7 +493,7 @@ impl Controller {
                     .clamp(-crate::aim::PITCH_LIMIT, crate::aim::PITCH_LIMIT),
                 yaw: norm_angle(f64::from(eng.aim.yaw + err.yaw)) as f32,
             };
-            self.view = turn_toward(self.view, intended, max_turn);
+            self.aim_at(intended, COMBAT_GAINS, dt);
 
             // Three independent gates, all of which must pass. The cone is
             // measured against where the bot *thinks* it should be pointing —
@@ -517,7 +563,7 @@ impl Controller {
         let defuse = self.defuse.tick(world, self.view, dt);
         if self.defuse.is_defusing() || defuse.use_action || defuse.move_to.is_some() {
             if let Some(look) = defuse.look_at {
-                self.view = turn_toward(self.view, aim_angles(world.me.origin, look), max_turn);
+                self.aim_at(aim_angles(world.me.origin, look), NAV_GAINS, dt);
             }
             self.rung = "defuse";
             let view = self.wire_view(world);
@@ -544,8 +590,19 @@ impl Controller {
                 // the route to it. Once arrived the route is irrelevant and the
                 // site itself is what to face.
                 let steer = if arrived { target } else { nav.steer().unwrap_or(target) };
-                self.view =
-                    turn_toward(self.view, aim_angles(world.me.origin, steer), max_turn);
+                // The head leads the body: on the walk in, look further along
+                // the route than the feet are aiming at. Once arrived (or with
+                // no route), the site itself is what to face -- and the plant
+                // machine's use cone is against it, so looking away would be
+                // sabotage.
+                let look = if arrived { target } else { nav.look.unwrap_or(steer) };
+                let look_angles = aim_angles(world.me.origin, look);
+                self.aim_at_guarded(
+                    look_angles,
+                    NAV_GAINS,
+                    dt,
+                    f64::from(aim_angles(world.me.origin, steer).yaw),
+                );
 
                 // Only start the plant once actually there. `in_bomb_zone` is
                 // the server's own permission bit, so it is tempting to let the
@@ -616,7 +673,7 @@ impl Controller {
             // Aim is the escort's business -- it looks at the point `PlayerUse`
             // measures its cone against, which is not what it is walking to.
             if let Some(look) = escort.look_at {
-                self.view = turn_toward(self.view, aim_angles(world.me.origin, look), max_turn);
+                self.aim_at(aim_angles(world.me.origin, look), NAV_GAINS, dt);
             }
 
             // Steering is the navigation layer's, and it is the route ALL the
@@ -667,7 +724,16 @@ impl Controller {
         if let Some(t) = self.objective.target.or(nav.goal) {
             let arrived = distance2d(world.me.origin, t) < ARRIVE_RADIUS;
             let steer = if arrived { t } else { nav.steer().unwrap_or(t) };
-            self.view = turn_toward(self.view, aim_angles(world.me.origin, steer), max_turn);
+            // Look ahead of the feet, with the back-swing guard: a head leads
+            // a body, and it never swings backwards through its own neck.
+            let look = if arrived { t } else { nav.look.unwrap_or(steer) };
+            let look_angles = aim_angles(world.me.origin, look);
+            self.aim_at_guarded(
+                look_angles,
+                NAV_GAINS,
+                dt,
+                f64::from(aim_angles(world.me.origin, steer).yaw),
+            );
             self.rung = if arrived { "arrived" } else { "goto" };
             let view = self.wire_view(world);
             let (forwardmove, sidemove) = if arrived {
@@ -949,7 +1015,7 @@ mod tests {
 
         // Right on top of the next waypoint, and 3000 units from the site.
         let waypoint: Vec3 = [40.0, 0.0, 0.0];
-        let nav = Nav { goal: Some(site), waypoint: Some(waypoint) };
+        let nav = Nav { goal: Some(site), waypoint: Some(waypoint), look: None };
         let intent = c.think(&world, nav, 0.1);
 
         assert!(intent.forwardmove > 0.0, "stopped 3000 units from the site");

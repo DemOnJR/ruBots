@@ -37,6 +37,65 @@ To see one: `mp_round_infinite "f"` (blocks `SCENARIO_BLOCK_TEAM_EXTERMINATION`,
 `scripts/defuse_scenario.sh` gates the CT launch on the planter's OWN decoded
 state -- do **not** gate it on the server log, see the traps below.
 
+## 2026-08-10: W7 wired end-to-end (spring view in the loop)
+
+Picked up the uncommitted `aim.rs` spring (`SpringGains`/`ViewMotion`, written
+but never wired) and finished the remaining W7 parts. **Builds clean, tests
+green** (`cargo test --workspace` with the MSVC toolchain; bot 210, client 184,
+nav 135 -- de_dust2-dependent tests need the bsp present). Nothing committed.
+
+What changed, by file:
+
+- `crates/bot/src/aim.rs` -- refactored `step` into `step_with_yaw_error`,
+  added `step_guarded` porting YaPB's back-swing guard verbatim
+  (`yapb/src/vision.cpp:172-195`), two tests (long-way-through-front; guard
+  inert when the short way is forward).
+- `crates/bot/src/controller.rs` -- `Controller` gained `view_motion:
+  ViewMotion`; all five view sites now go through `aim_at`/`aim_at_guarded`:
+  combat -> `COMBAT_GAINS`, defuse/hostage look -> `NAV_GAINS`, plant-walk and
+  goto -> `NAV_GAINS` + look-ahead + back-swing guard. `Nav` gained
+  `look: Option<Vec3>` (`None` = look at steer). `difficulty.max_turn()` is no
+  longer used by the controller (kept; tests still cover it).
+- `crates/client/src/navigate.rs` -- `PathFollower::look_target(grid, from)`:
+  two nodes ahead when both plain (no LADDER/CROUCH/NARROW), |z diff| < 8,
+  current radius >= `WIDE_RADIUS`, far point within 384u; else one node ahead;
+  `None` when the route is done. Test added.
+- `crates/client/src/session.rs` -- fills `Nav.look` from `look_target`.
+- `crates/bot/src/idle.rs` -- `AntiIdle::from_seed(seed)`: per-bot amplitude/
+  period/phase windows that provably satisfy `guarantees()` (yaw amp 0.9-1.4,
+  period 8-16; pitch amp 0.6-1.0, period 7-13). `Controller::new` uses it and
+  `debug_assert!(idle.guarantees())`. Test: 64 seeds -> >48 distinct drifts.
+- `crates/bot/src/lib.rs` -- exports `SpringGains`, `ViewMotion`, `NAV_GAINS`,
+  `COMBAT_GAINS`.
+- `scripts/swarm.sh` -- (pre-existing uncommitted) staggered bot lifetimes so
+  exits stay under ReAuthCheck's MaxDrop ban window.
+
+Gotchas learned this round (do not rediscover):
+
+- The back-swing guard only fires when current/desired straddle the travel
+  bearing with |c - t| >= 180 -- with travel exactly 0 YaPB's `fzero(forward)`
+  skips it (ported as `travel_yaw.abs() > 1e-4`). Test example: current 170,
+  desired -170, travel 0.5.
+- `navgrid::flags` has NO `JUMP` constant (jumps are `Move::Jump` links) --
+  compile error if you reference `flags::JUMP`.
+- `norm_angle` folds into [-180, 180).
+
+Next (in order):
+
+1. **M0 per-tick trace** (prerequisite for verifying W7): add a one-line-per-
+   tick view log behind an env var, or decode `captures/swarm/Bot<NN>.bin`
+   with `crates/client/examples/decode_sent.rs`. Fields needed: tick, view
+   yaw/pitch, desired yaw/pitch, fwd/side, buttons. Overshoot and peak turn
+   rate are undefined at the 2 s sample interval.
+2. **Live run**: 20-30 bot match on de_dust2 with `scripts/swarm.sh` (use the
+   staged `life=` pattern -- W3 has still never been measured live either),
+   then the section-1 table vs `docs/conga-baseline.md`. W7 targets: peak
+   |dyaw|/s in 400-900 deg/s on >= 60 deg flicks; overshoot 8-45 deg on >= 50 %
+   of combat flicks (was structurally 0); VIEW-1 median >= 6 deg (was 1.1);
+   VIEW-2 <= 15 % (was 42.7); 30 distinct anti-idle tuples.
+3. Then W5 (post-arrival task: `controller.rs` still `if arrived { (0, 0) }`),
+   W6 speed spread (only `pace` exists; per-hop dice not done), W8 last.
+
 ## Current work: humanization (`docs/humanize-plan.md`)
 
 The user's complaint, watching 30 bots: *"predictible moves in lines one behind

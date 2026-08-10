@@ -39,7 +39,10 @@ pub mod task;
 pub mod weapons;
 pub mod world;
 
-pub use aim::{aim_error, compensate, predict_punch, turn_toward};
+pub use aim::{
+    aim_error, compensate, predict_punch, turn_toward, COMBAT_GAINS, NAV_GAINS, SpringGains,
+    ViewMotion,
+};
 pub use combat::{engage, select_target, threat_score, EngageParams, Engagement};
 pub use controller::Controller;
 pub use fire::{FireAction, FireControl, FireParams, HoldFire, WeaponState};

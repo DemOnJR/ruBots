@@ -64,6 +64,159 @@ pub const PITCH_LIMIT: f32 = 89.0;
 /// One smoothing step toward `desired`.
 ///
 /// `max_turn` is the per-tick cap in degrees — lower is a "worse" bot.
+/// Spring-damper gains for the view.
+///
+/// `turn_toward` is `step = err * 0.45`, clamped. That is monotone: it can never
+/// overshoot, never rings, and decelerates along the same geometric curve
+/// whatever the distance. A head does not move like that. A head is a mass on a
+/// muscle -- it accelerates, it arrives with momentum, and on a fast swing it
+/// goes slightly past and comes back.
+///
+/// Integrated with **explicit Euler on purpose**:
+///
+/// ```text
+/// e      = norm_angle(desired - current)
+/// accel  = clamp(k*e - c*v, -a_max, +a_max)
+/// v     += dt * accel        // persists across ticks -- this is the momentum
+/// angle += dt * v
+/// ```
+///
+/// The acceleration clamp saturates above `e = a_max/k` (15 degrees for nav
+/// yaw, 10 for combat), so small corrections are a pure spring and big swings
+/// are bang-bang. That two-regime shape is why small corrections look precise
+/// and big swings look thrown.
+///
+/// **Do not "improve" this with RK4 or a semi-implicit step.** At combat-pitch
+/// gains `omega*dt` is about 0.82, and Euler's energy gain is a large part of
+/// the overshoot. The numerical artifact is the feature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpringGains {
+    pub k: f64,
+    pub c: f64,
+    pub a_max: f64,
+}
+
+/// Walking around: stiff enough to be purposeful, damped enough not to ring.
+pub const NAV_GAINS: SpringGains = SpringGains { k: 200.0, c: 25.0, a_max: 3000.0 };
+/// Fighting: faster, and deliberately underdamped so a hard flick overshoots.
+pub const COMBAT_GAINS: SpringGains = SpringGains { k: 300.0, c: 20.0, a_max: 3300.0 };
+
+/// Longest tick the integrator will accept, in seconds.
+///
+/// A stall must not be integrated as one enormous step: `dt` of half a second
+/// at these gains launches the view across the map. Clamping is the honest
+/// response -- the head simply did not move during the hitch.
+pub const MAX_DT: f64 = 1.0 / 25.0;
+
+/// Yaw snaps and stops inside this; pitch never does.
+///
+/// The asymmetry is deliberate. A permanently-excited, lightly-damped pitch
+/// axis -- driven by the eye height bobbing as the bot walks -- is what keeps
+/// the crosshair alive. Zeroing it would restore exactly the dead-still view
+/// this replaces: 42.7% of consecutive samples once shared an identical integer
+/// yaw.
+pub const YAW_DEADBAND: f64 = 1.0;
+
+/// The view's angular velocity, carried between ticks. This IS the momentum.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ViewMotion {
+    pub yaw_vel: f64,
+    pub pitch_vel: f64,
+}
+
+impl ViewMotion {
+    /// Advance the view one tick toward `desired`.
+    ///
+    /// Pitch uses `2k` with the same damping and clamp: the eye is quicker to
+    /// drop and lift than to swing, and the extra stiffness at unchanged `c` is
+    /// what leaves that axis under-damped enough to keep breathing.
+    pub fn step(
+        &mut self,
+        current: Angles,
+        desired: Angles,
+        gains: SpringGains,
+        dt: f64,
+    ) -> Angles {
+        self.step_with_yaw_error(current, desired, gains, dt, None)
+    }
+
+    /// One spring step with YaPB's back-swing guard
+    /// (`yapb/src/vision.cpp:172-195`) applied at the navigation rungs.
+    ///
+    /// `travel_yaw` is the bearing of the point being walked to, in degrees.
+    /// A head on a swivel passes behind itself on huge turns, wraps, and shows
+    /// the spectator the back of the skull for half a second -- and it is
+    /// exactly what a spring integrator does when current and desired straddle
+    /// the direction of travel with the short way round pointing behind it.
+    /// When that is the case the error is shifted by a full 360 (in the sign of
+    /// its short way) so the integrator swings round the front instead: on a
+    /// nav rung the head leads the body, it does not trail it.
+    ///
+    /// Condition and adjustment are YaPB's: with `c` and `t` the signed,
+    /// travel-relative yaws of current and desired, force the long way when
+    /// `c * t < 0` (they straddle the direction of travel) and
+    /// `|c - t| >= 180` (so the short arc is the one that goes behind).
+    pub fn step_guarded(
+        &mut self,
+        current: Angles,
+        desired: Angles,
+        gains: SpringGains,
+        dt: f64,
+        travel_yaw: f64,
+    ) -> Angles {
+        let ey = norm_angle(f64::from(desired.yaw) - f64::from(current.yaw));
+        if travel_yaw.abs() > 1e-4 {
+            let c = norm_angle(f64::from(current.yaw) - travel_yaw);
+            let t = norm_angle(f64::from(desired.yaw) - travel_yaw);
+            if c * t < 0.0 && (c - t).abs() >= 180.0 {
+                // The short way round goes through the back: take the long way
+                // through the front. The deadband then cannot snap the spring
+                // into a wrap either, because the error is no longer small.
+                let guarded = if ey > 0.0 { ey - 360.0 } else { ey + 360.0 };
+                return self.step_with_yaw_error(current, desired, gains, dt, Some(guarded));
+            }
+        }
+        self.step_with_yaw_error(current, desired, gains, dt, Some(ey))
+    }
+
+    /// The actual integration; `yaw_error` is None for the plain path and the
+    /// possibly-guarded error otherwise.
+    fn step_with_yaw_error(
+        &mut self,
+        current: Angles,
+        desired: Angles,
+        gains: SpringGains,
+        dt: f64,
+        yaw_error: Option<f64>,
+    ) -> Angles {
+        let dt = dt.clamp(1e-4, MAX_DT);
+
+        let ey = yaw_error.unwrap_or_else(|| {
+            norm_angle(f64::from(desired.yaw) - f64::from(current.yaw))
+        });
+        let yaw = if ey.abs() < YAW_DEADBAND {
+            // Close enough: stop, and kill the momentum so it cannot ring here.
+            self.yaw_vel = 0.0;
+            f64::from(desired.yaw)
+        } else {
+            let a = (gains.k * ey - gains.c * self.yaw_vel).clamp(-gains.a_max, gains.a_max);
+            self.yaw_vel += dt * a;
+            f64::from(current.yaw) + dt * self.yaw_vel
+        };
+
+        let ep = norm_angle(f64::from(desired.pitch) - f64::from(current.pitch));
+        let ap =
+            (2.0 * gains.k * ep - gains.c * self.pitch_vel).clamp(-gains.a_max, gains.a_max);
+        self.pitch_vel += dt * ap;
+        let pitch = f64::from(current.pitch) + dt * self.pitch_vel;
+
+        Angles {
+            pitch: (norm_angle(pitch) as f32).clamp(-PITCH_LIMIT, PITCH_LIMIT),
+            yaw: norm_angle(yaw) as f32,
+        }
+    }
+}
+
 pub fn turn_toward(current: Angles, desired: Angles, max_turn: f64) -> Angles {
     let max = max_turn.abs();
 
@@ -346,5 +499,184 @@ mod tests {
         let pred_err = aim_error(resolve_shot(predicted, real_at_fire), ang(0.0, 0.0));
         assert!(pred_err < naive_err, "prediction {pred_err} should beat naive {naive_err}");
         assert!(pred_err < 1e-3);
+    }
+
+    /// The spring must behave the way a head does, and the numbers are
+    /// predictions made before it was written -- so this is a check, not a
+    /// restatement of whatever the code happens to do.
+    ///
+    /// Navigation: a 90-degree turn accelerates hard, does NOT overshoot, and
+    /// settles in about half a second. Combat: faster, and deliberately
+    /// overshoots by a real margin before coming back -- that is the flick.
+    #[test]
+    fn the_view_accelerates_overshoots_in_combat_and_settles() {
+        let hz = 30.0;
+        let dt = 1.0 / hz;
+
+        // Returns (peak deg/s, overshoot deg, seconds to settle inside 1 deg).
+        let swing = |gains: SpringGains| {
+            let mut m = ViewMotion::default();
+            let mut cur = Angles { pitch: 0.0, yaw: 0.0 };
+            let target = Angles { pitch: 0.0, yaw: 90.0 };
+            let (mut peak, mut overshoot, mut settled) = (0.0f64, 0.0f64, None);
+            for i in 0..120 {
+                cur = m.step(cur, target, gains, dt);
+                peak = peak.max(m.yaw_vel.abs());
+                overshoot = overshoot.max(f64::from(cur.yaw) - 90.0);
+                if settled.is_none() && (f64::from(cur.yaw) - 90.0).abs() < 1.0 {
+                    settled = Some((i + 1) as f64 * dt);
+                }
+            }
+            (peak, overshoot, settled)
+        };
+
+        let (nav_peak, nav_over, nav_settle) = swing(NAV_GAINS);
+        let (cbt_peak, cbt_over, cbt_settle) = swing(COMBAT_GAINS);
+        eprintln!(
+            "nav:    peak {nav_peak:.0} deg/s  overshoot {nav_over:.1}  settle {:.2}s",
+            nav_settle.unwrap_or(f64::NAN)
+        );
+        eprintln!(
+            "combat: peak {cbt_peak:.0} deg/s  overshoot {cbt_over:.1}  settle {:.2}s",
+            cbt_settle.unwrap_or(f64::NAN)
+        );
+
+        // It accelerates: a head does not cross 90 degrees at a crawl.
+        assert!(nav_peak > 300.0, "nav peak only {nav_peak:.0} deg/s");
+        assert!(cbt_peak > nav_peak, "combat should be the faster swing");
+
+        // Navigation does not overshoot -- walking somewhere is not a flick.
+        assert!(nav_over < 1.0, "nav overshot by {nav_over:.1} deg");
+
+        // Combat does, and by an amount you could see.
+        assert!(
+            cbt_over > 5.0,
+            "combat overshoot only {cbt_over:.1} deg -- the flick is the point"
+        );
+
+        // Both arrive promptly. A view that takes a second to come round is not
+        // a human either.
+        assert!(nav_settle.unwrap() < 1.0, "nav settle {:?}", nav_settle);
+        assert!(cbt_settle.unwrap() < 1.0, "combat settle {:?}", cbt_settle);
+    }
+
+    /// A stall must not be integrated as one giant step.
+    #[test]
+    fn a_long_hitch_does_not_launch_the_view_across_the_map() {
+        let mut m = ViewMotion::default();
+        let cur = Angles { pitch: 0.0, yaw: 0.0 };
+        let target = Angles { pitch: 0.0, yaw: 90.0 };
+        // Half a second of stall, handed in as one tick.
+        let after = m.step(cur, target, NAV_GAINS, 0.5);
+        let moved = f64::from(after.yaw).abs();
+        assert!(
+            moved < 90.0,
+            "a 0.5 s hitch moved the view {moved:.0} deg -- dt must be clamped"
+        );
+    }
+
+    /// Pitch has no deadband; yaw does. That asymmetry is the whole point.
+    ///
+    /// Inside a degree, yaw SNAPS and zeroes its velocity -- a settled head does
+    /// not jitter left and right. Pitch never snaps, so the same sub-degree
+    /// error still produces motion, and the eye-height bob of walking keeps it
+    /// excited. Without that the crosshair goes dead, which is what 42.7% of
+    /// consecutive live samples sharing an identical integer yaw looked like.
+    ///
+    /// Note a static target is not the interesting case: a damped spring
+    /// settles, correctly. The claim under test is about the DEADBAND, so the
+    /// target here is inside it on both axes.
+    #[test]
+    fn yaw_snaps_inside_the_deadband_and_pitch_does_not() {
+        let mut m = ViewMotion::default();
+        let mut cur = Angles { pitch: 0.0, yaw: 0.0 };
+        // Both errors are under YAW_DEADBAND.
+        let target = Angles { pitch: 0.4, yaw: 0.4 };
+
+        let after = m.step(cur, target, NAV_GAINS, 1.0 / 30.0);
+        assert_eq!(m.yaw_vel, 0.0, "yaw kept momentum inside the deadband");
+        assert_eq!(after.yaw, target.yaw, "yaw should have snapped, not eased");
+        assert!(
+            after.pitch != cur.pitch && after.pitch != target.pitch,
+            "pitch snapped or stalled: {} -> {}",
+            cur.pitch,
+            after.pitch
+        );
+
+        // And under continuous excitation -- which is what walking supplies --
+        // the pitch axis keeps moving rather than going still.
+        cur = after;
+        let mut moves = 0;
+        let mut last = cur.pitch;
+        for i in 0..60 {
+            let bob = Angles { pitch: 0.4 + ((i as f32) * 0.5).sin() * 0.8, yaw: 0.4 };
+            cur = m.step(cur, bob, NAV_GAINS, 1.0 / 30.0);
+            if (cur.pitch - last).abs() > 1e-4 {
+                moves += 1;
+            }
+            last = cur.pitch;
+        }
+        assert!(moves > 50, "pitch went still under excitation after {moves} ticks");
+    }
+
+    /// Walking at 170 deg with the destination behind at -170: the short way
+    /// round swings through the back of the head (through 180, away from the
+    /// direction of travel). A human head leads the body, so the spring must
+    /// take the long way through the front -- the direction of travel.
+    ///
+    /// The travel bearing is a hair off due forward. That is not a corner
+    /// case, it is the correct ones: with travel exactly 0 the pair sits
+    /// smack on the travel axis and YaPB's `fzero(forward)` skips the guard --
+    /// there is no straddle to protect -- and moved further round the circle
+    /// the two angles stop straddling the travel direction. The guard fires
+    /// in a narrow band of bearings where heading, eyes and target conspire.
+    #[test]
+    fn the_back_swing_guard_forces_the_long_way_through_the_front() {
+        let travel = 0.5; // moving towards +x, a whisker off
+        let current = Angles { pitch: 0.0, yaw: 170.0 };
+        let desired = Angles { pitch: 0.0, yaw: -170.0 };
+        let dt = 1.0 / 30.0;
+
+        let mut plain = ViewMotion::default();
+        let mut guarded = ViewMotion::default();
+        let p = plain.step(current, desired, NAV_GAINS, dt);
+        let g = guarded.step_guarded(current, desired, NAV_GAINS, dt, travel);
+
+        // Plain: short way, yaw climbs toward the back (180) and the wrap.
+        assert!(f64::from(p.yaw) > 170.0, "plain took the back way: {p:?}");
+        // Guarded: yaw falls through 90 and 0 -- the front, at 0.5.
+        assert!(f64::from(g.yaw) < 170.0, "guard took the short way: {g:?}");
+        // And it did not teleport: the spring still moves one tick at a time.
+        assert!(f64::from(g.yaw) > 90.0, "guard jumped, not swung: {g:?}");
+
+        // Follow it through: it must actually pass through the front instead of
+        // being dragged round the back by the deadband or the wrap.
+        let mut cur = current;
+        let mut hit_front = false;
+        for _ in 0..600 {
+            cur = guarded.step_guarded(cur, desired, NAV_GAINS, dt, travel);
+            if (f64::from(cur.yaw) - travel).abs() < 5.0 {
+                hit_front = true;
+                break;
+            }
+        }
+        assert!(hit_front, "the long way round never crossed the front");
+    }
+
+    /// When current and desired do not straddle the direction of travel, the
+    /// guard must change nothing: a head that is already turning the right way
+    /// just keeps turning.
+    #[test]
+    fn the_guard_is_inert_when_the_short_way_is_forward() {
+        let travel = 90.0; // moving towards +y
+        let current = Angles { pitch: 0.0, yaw: 40.0 };
+        let desired = Angles { pitch: 0.0, yaw: 70.0 };
+        let dt = 1.0 / 30.0;
+
+        let mut plain = ViewMotion::default();
+        let mut guarded = ViewMotion::default();
+        let p = plain.step(current, desired, NAV_GAINS, dt);
+        let g = guarded.step_guarded(current, desired, NAV_GAINS, dt, travel);
+        assert_eq!(p, g, "guard moved a head that was already turning forward");
     }
 }

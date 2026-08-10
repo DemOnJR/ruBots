@@ -41,10 +41,25 @@ for i in $(seq 1 "$N"); do
     key=$(printf 'AIPLAYERBOT%04d' "$i")
     name=$(printf 'Bot%02d' "$i")
 
+    # Each bot runs a little longer than the one before, so the fleet LEAVES
+    # spread out as well as arriving spread out.
+    #
+    # ReAuthCheck bans an address for 60 minutes on MaxDropNum 7 disconnects
+    # within MaxDropTime 15 s, and that ban lands on every client behind the
+    # same address -- including the human. A 1.5 s start stagger alone gives
+    # exits 1.5 s apart: 10 per 15 s, comfortably over the limit. The extra
+    # 2.5 s per bot takes it to one exit per 4 s, under 4 per 15 s.
+    #
+    # Done on OUR side on purpose. The config's [List White IP] section claims
+    # to exempt CheckMaxDrop, 172.18.0.1 is in it and parses cleanly, and the
+    # ban still fires -- so the whitelist does not cover this path in
+    # ReAuthCheck 0.1.6. Do not rely on it.
+    life=$(( SECS + 5 * (i - 1) / 2 ))
+
     AIPLAYERS_NAME="$name" \
     AIPLAYERS_KEY="$key" \
     AIPLAYERS_TEAM="$team" \
-        "$EXE" "$ADDR" "$SECS" "$OUT/$name.bin" > "$OUT/bot$i.log" 2>&1 &
+        "$EXE" "$ADDR" "$life" "$OUT/$name.bin" > "$OUT/bot$i.log" 2>&1 &
     pids+=($!)
     echo "  $name  team $team  key $key  pid ${pids[-1]}"
     # Stagger the joins. Ten simultaneous signons is ten bzip2 blobs in one

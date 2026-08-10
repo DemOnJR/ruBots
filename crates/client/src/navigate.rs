@@ -530,6 +530,48 @@ impl PathFollower {
         }
     }
 
+    /// Where to LOOK while walking -- which is not where to walk.
+    ///
+    /// The head leads the body: YaPB's `setAimDirection` ladder
+    /// (`yapb/src/vision.cpp:365-640`) steers at the current waypoint but
+    /// looks one or two nodes further on, so the eyes arrive before the feet
+    /// and the bot reads as a person rounding a corner rather than a dot
+    /// tracking a dot. The ladder's conditions keep the eyes from doing
+    /// anything stupid at close range:
+    ///
+    /// * two nodes ahead only when both are plain -- no ladder, crouch, jump
+    ///   or narrow node between the eyes and the far point;
+    /// * the hop between the two nodes is flat (`|z diff| < 8`);
+    /// * the current node has room (`radius >= 16`, i.e. not a doorway);
+    /// * the far point is within 384 units, inside YaPB's `kMaxAimDistance`;
+    /// * otherwise one node ahead; with the route exhausted, `None`, so the
+    ///   caller falls back to the steering point (== the destination).
+    pub fn look_target(&self, grid: &NavGrid, from: [f32; 3]) -> Option<[f32; 3]> {
+        if self.path.is_empty() {
+            return None;
+        }
+        let i = self.at.min(self.path.len() - 1);
+        let node = self.path[i];
+        let origin = grid.origin(node);
+
+        if i + 1 < self.path.len() {
+            let far = self.path[i + 1];
+            let far_origin = grid.origin(far);
+            let plain = |n: usize| {
+                grid.flags(n) & (flags::LADDER | flags::CROUCH | flags::NARROW) == 0
+            };
+            if plain(node)
+                && plain(far)
+                && (far_origin[2] - origin[2]).abs() < 8.0
+                && grid.radius(node) >= WIDE_RADIUS
+                && dist2d(from, far_origin) < 384.0
+            {
+                return Some(far_origin);
+            }
+        }
+        Some(origin)
+    }
+
     /// Nodes currently being routed around, for tracing.
     pub fn blocked_nodes(&self) -> usize {
         self.blocked.len()
@@ -949,6 +991,51 @@ mod tests {
 
         let second = f.unstick().expect("still blocked").sidemove.signum();
         assert_ne!(first, second, "must try the other side after giving up");
+    }
+
+    /// The head leads the body: while walking, the look target is the current
+    /// waypoint or the one ahead -- never the destination itself, and never
+    /// something behind.
+    #[test]
+    fn the_look_target_leads_the_steer_point() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+        let mut f = PathFollower::with_seed(5);
+        f.next_waypoint(&map.grid, start, goal, 0.02)
+            .expect("a first waypoint");
+        assert!(
+            f.at + 1 < f.path.len(),
+            "the test needs a node ahead: at {} of {}",
+            f.at,
+            f.path.len()
+        );
+
+        let look = f.look_target(&map.grid, start).expect("a look target");
+        let cur = map.grid.origin(f.path[f.at]);
+        let far = map.grid.origin(f.path[f.at + 1]);
+        assert!(
+            look == cur || look == far,
+            "look {look:?} must be the current node {cur:?} or the next {far:?}"
+        );
+        if look != cur {
+            assert!(
+                dist2d(start, look) >= dist2d(start, cur),
+                "the look point is behind the current node"
+            );
+            assert!(
+                dist2d(start, look) < 784.0,
+                "look too far ahead: {} units",
+                dist2d(start, look)
+            );
+        }
+        // And the steer point came first: one waypoint call, a couple of nodes
+        // consumed at most (nodes close enough to fall inside the same arrive
+        // radius legitimately go together), never a jump to the goal.
+        assert!(f.at <= 2, "the route advanced {} nodes in one tick", f.at);
     }
 
     #[test]

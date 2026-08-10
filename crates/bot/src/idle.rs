@@ -115,6 +115,33 @@ impl Default for AntiIdle {
 }
 
 impl AntiIdle {
+    /// A drift that belongs to this bot and no other.
+    ///
+    /// The shared configuration is the reason thirty bots sweep the same
+    /// sawtooth in phase -- a tell on its own. Every parameter here is drawn
+    /// from the bot's seed, across windows that provably satisfy
+    /// [`AntiIdle::guarantees`]: amplitude floors chosen so even the slowest
+    /// period clears `IDLE_ANGLE_EPSILON` at `IDLE_CHECK_INTERVAL`, and
+    /// period ceilings chosen so a window can never hold two wraps.
+    ///
+    /// The RNG is a plain LCG on the seed; the values are parameters, not
+    /// security.
+    pub fn from_seed(seed: u64) -> Self {
+        let mut h = seed;
+        let next = |h: &mut u64| {
+            *h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*h >> 33) as f64 / (1u64 << 31) as f64) as f32
+        };
+        // Windows that satisfy `guarantees(): yaw amp >= 0.9, period <= 16 ->
+        // plain delta >= 0.28, wrapped >= 0.62; pitch amp >= 0.6, period <= 13
+        // -> plain >= 0.23, wrapped >= 0.37. All well above the 0.1 threshold.
+        Self {
+            yaw: Ramp { amplitude: 0.9 + next(&mut h) * 0.5, period: 8.0 + next(&mut h) * 8.0 },
+            pitch: Ramp { amplitude: 0.6 + next(&mut h) * 0.4, period: 7.0 + next(&mut h) * 6.0 },
+            phase: next(&mut h) * 8.0,
+        }
+    }
+
     pub fn advance(&mut self, dt: f32) {
         self.phase += dt;
         // Keep the accumulator small so f32 precision never erodes the ramp.
@@ -227,6 +254,31 @@ mod tests {
         assert!(
             worst_yaw >= IDLE_ANGLE_EPSILON && worst_pitch >= IDLE_ANGLE_EPSILON,
             "tightest margins: yaw {worst_yaw}, pitch {worst_pitch}"
+        );
+    }
+
+    #[test]
+    fn per_seed_drifts_stay_safe_and_differ() {
+        // The companion to W7: the fleet must not sweep the same sawtooth in
+        // phase. Every seed must produce a provably safe, deterministic drift,
+        // and 64 seeds must not collapse into a handful of configurations.
+        let mut tuples = std::collections::HashSet::new();
+        for seed in 0..64 {
+            let a = AntiIdle::from_seed(seed);
+            let b = AntiIdle::from_seed(seed);
+            assert!(a.guarantees(), "seed {seed}: a drift that is not provably safe");
+            assert_eq!(a, b, "seed {seed}: the drift must be deterministic");
+            tuples.insert((
+                (a.yaw.amplitude * 1000.0) as u32,
+                (a.yaw.period * 100.0) as u32,
+                (a.pitch.amplitude * 1000.0) as u32,
+                (a.pitch.period * 100.0) as u32,
+            ));
+        }
+        assert!(
+            tuples.len() > 48,
+            "64 seeds collapsed into {} distinct drifts",
+            tuples.len()
         );
     }
 

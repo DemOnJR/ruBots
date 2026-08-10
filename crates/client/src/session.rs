@@ -1407,7 +1407,14 @@ impl Session {
         // `rung plant`, with the real bomb site 3600 units away, holding the C4
         // and pressing nothing, because the server rightly said `bombzone
         // false`.
-        let nav = bot::controller::Nav { goal: self.site, waypoint: site };
+        // Where the HEAD is going: one or two nodes beyond the feet's target
+        // (`PathFollower::look_target`). `None` when the route is done and the
+        // brain should look wherever it would otherwise -- the destination.
+        let look = match (self.map.as_ref(), site) {
+            (Some(m), Some(_)) => self.follower.look_target(&m.grid, world.me.origin),
+            _ => None,
+        };
+        let nav = bot::controller::Nav { goal: self.site, waypoint: site, look };
         let mut intent = self.brain.as_mut()?.think(&world, nav, dt);
 
         // Blocked by geometry the route does not model: strafe, jump, and
