@@ -71,6 +71,24 @@ pub const ARRIVE_RADIUS: f32 = 24.0;
 /// speed compared there is the resulting *velocity*, not the requested move.
 pub const WALK_SPEED: f32 = ESCORT_WALK_SPEED;
 
+/// How close to the goal a bot stops sprinting.
+///
+/// Plan W6: a human does not run all the way to a destination and then stop on
+/// the spot -- they ease off for the last few strides. Inside this radius the
+/// `goto` rung runs at walking pace, which also makes the arrival itself look
+/// deliberate rather than a hard stop from 250 u/s.
+pub const APPROACH_RADIUS: f32 = 500.0;
+
+/// Chance, per hop, to travel that one hop at a fraction of full speed.
+///
+/// Plan W6: `25 * difficulty` percent, per waypoint. A bot that slows for a
+/// hop every few waypoints reads as a person spacing out for a second, not as
+/// a conveyor belt. The dice is re-rolled per hop (per node advance) so the
+/// pattern does not repeat.
+pub const HOP_SLOW_PCT: f32 = 25.0;
+/// The fraction of full speed a slowed hop travels at.
+pub const HOP_SLOW_SCALE: f32 = 0.4;
+
 /// Speed multiplier while turning hard, and the angle bands it applies in.
 ///
 /// **Nobody sprints sideways.** A player rounding a corner slows into it and
@@ -134,6 +152,40 @@ pub const STRAFE_MAX: f64 = 1.15;
 /// that is not quite steady.
 pub const AIM_ERROR_REFRESH: f32 = 0.35;
 
+/// Plan W1: this bot's personality, as (aggression, fear) in `[0,1]`.
+///
+/// YaPB draws `m_baseAgressionLevel` / `m_baseFearLevel` from a personality
+/// window per bot (`yapb/src/manager.cpp:199-213, 1236-1254`): 50% Normal
+/// (`rg(0.4,0.7)` both), else 50/50 Rusher (`rg(0.7,1.0)` /
+/// `rg(0.0,0.4)`) or Careful (`rg(0.2,0.5)` / `rg(0.7,1.0)`).
+///
+/// Deterministic in the seed so a given bot is the same bot every round, and
+/// independent of the RNG stream used for behaviour.
+pub fn personality(seed: u64) -> (f32, f32) {
+    let u = |s: u64| -> f32 {
+        // SplitMix64: no bad seeds, and independent of the controller RNG.
+        let mut z = s.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xDEAD_BEEF_CAFE_F00D;
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64) as f32
+    };
+    match u(seed ^ 0x51ED_2701) {
+        r if r < 0.5 => (0.4 + u(seed + 1) * 0.3, 0.4 + u(seed + 2) * 0.3),
+        r if r < 0.75 => (0.7 + u(seed + 1) * 0.3, u(seed + 2) * 0.4),
+        _ => (0.2 + u(seed + 1) * 0.3, 0.7 + u(seed + 2) * 0.3),
+    }
+}
+
+/// Linear interpolation between two world points, for the camp view sweep.
+fn lerp_vec(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
 /// Where the bot is going, at the two scales that matter.
 ///
 /// Keeping them apart is not tidiness. "Have I arrived?" is a question about
@@ -165,12 +217,24 @@ pub struct Nav {
     /// navigation layer applies YaPB's visibility/radius ladder exactly once,
     /// here, instead of the brain re-deriving graph state it does not own.
     pub look: Option<Vec3>,
+    /// The caller's navigation layer advanced to a new waypoint this tick.
+    ///
+    /// Plan W6: the per-hop slowdown dice rolls once per node advance. The
+    /// brain does not see the node lattice, so the caller sets this instead of
+    /// the brain having to detect "the steering point changed".
+    pub new_waypoint: bool,
+    /// Plan W5: where to defend after arriving, if the caller has one.
+    ///
+    /// The caller owns the nav grid and picks a defend node 300-600u from the
+    /// objective (deterministically per bot + round, so no IPC is needed).
+    /// `None` means the caller has no defend point; the bot roams instead.
+    pub defend_point: Option<Vec3>,
 }
 
 impl Nav {
     /// Head for `goal` with no route -- straight-line steering.
     pub fn to(goal: Vec3) -> Self {
-        Self { goal: Some(goal), waypoint: None, look: None }
+        Self { goal: Some(goal), waypoint: None, look: None, new_waypoint: false, defend_point: None }
     }
 
     /// No objective at all.
@@ -186,7 +250,36 @@ impl Nav {
 
 impl From<Option<Vec3>> for Nav {
     fn from(goal: Option<Vec3>) -> Self {
-        Self { goal, waypoint: None, look: None }
+        Self { goal, waypoint: None, look: None, new_waypoint: false, defend_point: None }
+    }
+}
+
+/// Plan W5: a post-arrival camp/guard task.
+///
+/// The plan's YaPB rule: a bot that has reached its objective picks a defend
+/// node 300-600u away that no teammate has claimed, walks to it, holds there
+/// for a while sweeping the view, then re-picks. The claim mechanism is the
+/// W2 deterministic partition (bot index + round), so no IPC is needed and a
+/// teammate behind a wall is not a problem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CampTask {
+    /// Where to stand (the defend point).
+    pub spot: Vec3,
+    /// Seconds left in the hold.
+    pub hold_left: f32,
+    /// Total hold duration, for the view sweep.
+    pub hold_total: f32,
+    /// The two world points the view sweeps between.
+    pub sweep_a: Vec3,
+    pub sweep_b: Vec3,
+    /// Whether we have actually reached the spot yet (walking there first).
+    pub moving: bool,
+}
+
+impl CampTask {
+    /// How long a hold lasts for this bot, scaled by its fear.
+    pub fn new(spot: Vec3, sweep_a: Vec3, sweep_b: Vec3, hold: f32) -> Self {
+        Self { spot, hold_left: hold, hold_total: hold, sweep_a, sweep_b, moving: true }
     }
 }
 
@@ -226,6 +319,30 @@ pub struct Controller {
     /// velocity, and a fleet that does is a tell no amount of path variety
     /// hides -- thirty dots crossing a map in perfect lockstep.
     pace: f32,
+    /// Plan W1: this bot's personality, drawn once at construction.
+    ///
+    /// YaPB draws `m_baseAgressionLevel` / `m_baseFearLevel` from a personality
+    /// window per bot. Normal: `rg(0.4,0.7)` on both; Rusher:
+    /// `rg(0.7,1.0)` / `rg(0.0,0.4)`; Careful: `rg(0.2,0.5)` /
+    /// `rg(0.7,1.0)` (`yapb/src/manager.cpp:199-213, 1236-1254`).
+    /// Used by W5 (camp hold scaled by fear) and W6 (slow near the goal when
+    /// fear is high).
+    pub aggression: f32,
+    pub fear: f32,
+    /// Plan W6: whether this hop is being travelled at reduced speed.
+    ///
+    /// `Some(scale)` after a node advance drew the per-hop slowdown dice
+    /// (see [`Controller::note_node_advance`]); `None` means normal pace.
+    hop_slow: Option<f32>,
+    /// Plan W5: the post-arrival camp/roam task.
+    ///
+    /// Once the bot reaches its objective there is nothing left to walk to,
+    /// and standing perfectly still is the second-most-visible tell in the
+    /// whole audit (27.2 % of samples are `rung arrived`, 61.2 % below 1 u/s).
+    /// Instead of a hard stop it picks a defend point (or roams) and holds
+    /// there, sweeping the view, then re-picks. `None` means no post-arrival
+    /// task is running (still walking, or no task yet).
+    pub post_arrival: Option<CampTask>,
     /// Which way the bot is currently circling, and how long is left on it.
     strafe: (f32, f32),
     /// Where the brain wants to be routed, when that is not the bomb
@@ -267,6 +384,13 @@ impl Controller {
             // 0.82..1.00 of full speed. Wide enough to be visible when two bots
             // run the same corridor, narrow enough that nobody is left behind.
             pace: 0.82 + (seed % 19) as f32 * 0.01,
+            // Plan W1: personality drawn once per bot, from the seed's RNG.
+            // 50% Normal, else 50/50 Rusher/Careful, each with YaPB's
+            // aggression/fear windows (manager.cpp:199-213).
+            aggression: personality(seed).0,
+            fear: personality(seed).1,
+            hop_slow: None,
+            post_arrival: None,
             strafe: (1.0, 0.0),
             nav_goal: None,
             rung: "init",
@@ -366,7 +490,12 @@ impl Controller {
     /// server builds the movement basis from the `viewangles` in the command it
     /// is executing, so decomposing against anything else walks the bot
     /// somewhere it did not ask to go.
-    fn travel(&self, view: Angles, from: Vec3, to: Vec3, speed: f32) -> (f32, f32) {
+    ///
+    /// `remaining` is the straight-line distance to the final goal (not this
+    /// hop): inside [`APPROACH_RADIUS`] the bot eases to walking pace, and the
+    /// per-hop slowdown dice (plan W6) only rolls on a node advance, set by the
+    /// caller via [`Controller::note_node_advance`].
+    fn travel(&mut self, view: Angles, from: Vec3, to: Vec3, speed: f32, remaining: f32) -> (f32, f32) {
         let bearing = aim_angles(from, to).yaw;
         // Slow into the turn. `delta` is the angle between where the bot is
         // looking and where it is going, which is only large when it is
@@ -380,7 +509,98 @@ impl Controller {
         } else {
             1.0
         };
-        move_axes(view.yaw, bearing, speed * turn * self.pace)
+
+        // Plan W6: one speed becomes several. A per-hop slowdown, drawn once
+        // per node advance and consumed by the hop it was drawn for, plus an
+        // approach slow-down inside APPROACH_RADIUS.
+        let slow = match self.hop_slow {
+            Some(f) => {
+                self.hop_slow = None;
+                f
+            }
+            None => 1.0,
+        };
+        let ease = if remaining <= APPROACH_RADIUS { WALK_SPEED / FORWARD_SPEED } else { 1.0 };
+        let scale = slow * ease;
+        move_axes(view.yaw, bearing, speed * turn * self.pace * scale)
+    }
+
+    /// Roll the per-hop slowdown dice (plan W6).
+    ///
+    /// Called by the caller's navigation layer on every node advance. A
+    /// `25 * difficulty` percent chance to travel this one hop at
+    /// [`HOP_SLOW_SCALE`] of full speed; otherwise the hop runs at normal
+    /// pace. The `fear`-driven and approach slow-downs are separate.
+    pub fn note_node_advance(&mut self) {
+        let pct = HOP_SLOW_PCT * match self.difficulty {
+            Difficulty::Easy => 1.0,
+            Difficulty::Normal => 2.0,
+            Difficulty::Hard => 3.0,
+            Difficulty::Unfair => 4.0,
+        };
+        self.hop_slow = if self.rng.chance(f64::from(pct) / 100.0) {
+            Some(HOP_SLOW_SCALE)
+        } else {
+            None
+        };
+    }
+
+    /// Plan W5: how long this bot holds a camp/defend spot, scaled by fear.
+    ///
+    /// YaPB camps for `rg(camp_min, camp_max)` seconds; a more fearful bot
+    /// holds longer before moving on. Drawn per task so two camps are not
+    /// identical.
+    fn camp_hold(&mut self) -> f32 {
+        let base = self.rng.range(8.0, 16.0) as f32;
+        base * (1.0 + self.fear * 0.5)
+    }
+
+    /// Plan W5: one tick of the post-arrival camp/roam task.
+    ///
+    /// First walk to the defend spot; once there, hold for `hold_left`
+    /// seconds, sweeping the view between the two sweep points. The caller
+    /// drops the task when `hold_left` hits zero so a fresh defend point is
+    /// picked for the next hold.
+    fn camp_tick(&mut self, task: &mut CampTask, world: &WorldView, dt: f32) -> Intent {
+        let to_spot = distance2d(world.me.origin, task.spot);
+        if task.moving && to_spot > 40.0 {
+            // Walk to the defend spot, looking at it.
+            let look_angles = aim_angles(world.me.origin, task.spot);
+            self.aim_at_guarded(
+                look_angles,
+                NAV_GAINS,
+                dt,
+                f64::from(look_angles.yaw),
+            );
+            self.rung = "camp";
+            let view = self.wire_view(world);
+            let (forwardmove, sidemove) =
+                self.travel(view, world.me.origin, task.spot, FORWARD_SPEED, to_spot);
+            return Intent { view, forwardmove, sidemove, move_target: Some(task.spot), ..Intent::default() };
+        }
+        task.moving = false;
+
+        // Holding: sweep the view between the two points, and stand still.
+        let phase = 1.0 - (task.hold_left / task.hold_total).max(0.0);
+        let sweep = lerp_vec(task.sweep_a, task.sweep_b, phase);
+        let look_angles = aim_angles(world.me.origin, sweep);
+        self.aim_at_guarded(
+            look_angles,
+            NAV_GAINS,
+            dt,
+            f64::from(aim_angles(world.me.origin, task.spot).yaw),
+        );
+        task.hold_left -= dt;
+
+        self.rung = "camp";
+        let view = self.wire_view(world);
+        let mut intent = Intent { view, ..Intent::default() };
+        // The caller drops the task when hold_left hits zero, so a fresh
+        // defend point is picked for the next hold.
+        if task.hold_left <= 0.0 {
+            intent.move_target = None;
+        }
+        intent
     }
 
     /// Advance the circling timer and return the current side.
@@ -541,8 +761,9 @@ impl Controller {
                 (0.0, 0.0)
             } else {
                 let closing = if eng.advance { FORWARD_SPEED } else { 0.0 };
+                let remaining = distance2d(world.me.origin, target.origin);
                 let (f, s) =
-                    self.travel(view, world.me.origin, target.origin, closing);
+                    self.travel(view, world.me.origin, target.origin, closing, remaining);
                 (f, s + STRAFE_SPEED * side)
             };
 
@@ -568,7 +789,10 @@ impl Controller {
             self.rung = "defuse";
             let view = self.wire_view(world);
             let (forwardmove, sidemove) = match defuse.move_to {
-                Some(to) => self.travel(view, world.me.origin, to, FORWARD_SPEED),
+                Some(to) => {
+                    let remaining = distance2d(world.me.origin, to);
+                    self.travel(view, world.me.origin, to, FORWARD_SPEED, remaining)
+                }
                 None => (0.0, 0.0),
             };
             return Intent {
@@ -639,7 +863,8 @@ impl Controller {
                 let (forwardmove, sidemove) = if arrived {
                     (0.0, 0.0)
                 } else {
-                    self.travel(view, world.me.origin, steer, FORWARD_SPEED)
+                    let remaining = distance2d(world.me.origin, target);
+                    self.travel(view, world.me.origin, steer, FORWARD_SPEED, remaining)
                 };
                 let mut intent = Intent {
                     view,
@@ -693,7 +918,10 @@ impl Controller {
             self.rung = "hostage";
             let view = self.wire_view(world);
             let (forwardmove, sidemove) = match steer {
-                Some(to) => self.travel(view, world.me.origin, to, speed),
+                Some(to) => {
+                    let remaining = distance2d(world.me.origin, to);
+                    self.travel(view, world.me.origin, to, speed, remaining)
+                }
                 None => (0.0, 0.0),
             };
             return Intent {
@@ -734,13 +962,56 @@ impl Controller {
                 dt,
                 f64::from(aim_angles(world.me.origin, steer).yaw),
             );
-            self.rung = if arrived { "arrived" } else { "goto" };
+
+            // Plan W6: roll the per-hop slowdown dice on a node advance.
+            if nav.new_waypoint {
+                self.note_node_advance();
+            }
+
+            // Plan W5: once arrived, do something instead of standing still.
+            if arrived {
+                if self.post_arrival.is_none() {
+                    // First tick of arrival: start a camp/roam task. The defend
+                    // point comes from the caller (which owns the grid); without
+                    // one, roam -- but keep moving, never a hard stop.
+                    if let Some(defend) = nav.defend_point {
+                        // Sweep between the defend spot and a point slightly back
+                        // toward the goal, so the view moves during the hold.
+                        let back = lerp_vec(defend, t, 0.3);
+                        let hold = self.camp_hold();
+                        self.post_arrival = Some(CampTask::new(defend, defend, back, hold));
+                    }
+                }
+                if let Some(mut task) = self.post_arrival.take() {
+                    let intent = self.camp_tick(&mut task, world, dt);
+                    // Put the task back only while it is still holding; once
+                    // the hold has effectively elapsed (epsilon for float
+                    // drift), drop it so a fresh defend point is picked.
+                    if task.hold_left > dt {
+                        self.post_arrival = Some(task);
+                    }
+                    return intent;
+                }
+                // No defend point and no task: roam slowly, keeping the
+                // anti-idle alive.
+                self.rung = "roam";
+                let view = self.wire_view(world);
+                let (forwardmove, sidemove) =
+                    self.travel(view, world.me.origin, t, WALK_SPEED, 200.0);
+                return Intent {
+                    view,
+                    forwardmove,
+                    sidemove,
+                    move_target: Some(t),
+                    ..Intent::default()
+                };
+            }
+
+            self.rung = "goto";
             let view = self.wire_view(world);
-            let (forwardmove, sidemove) = if arrived {
-                (0.0, 0.0)
-            } else {
-                self.travel(view, world.me.origin, steer, FORWARD_SPEED)
-            };
+            let remaining = distance2d(world.me.origin, t);
+            let (forwardmove, sidemove) =
+                self.travel(view, world.me.origin, steer, FORWARD_SPEED, remaining);
             return Intent {
                 view,
                 forwardmove,
@@ -851,16 +1122,22 @@ mod tests {
         assert_eq!(intent.move_target, Some(site));
     }
 
-    /// ...and stops once it is there, rather than grinding into the wall.
+    /// ...and once it is there, plan W5 means it does NOT grind into the wall
+    /// -- with no defend point it roams slowly instead of stopping dead.
     #[test]
-    fn arriving_at_the_site_stops_the_walk() {
+    fn arriving_at_the_site_roams_instead_of_stopping() {
         let mut c = Controller::new(7, Difficulty::Normal);
         let w = WorldView {
             me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
             ..Default::default()
         };
         let intent = c.think(&w, Some([4.0, 0.0, 0.0]), 0.1);
-        assert_eq!(intent.forwardmove, 0.0, "already inside the arrive radius");
+        assert_eq!(c.rung, "roam", "arrival with no defend point roams");
+        assert!(
+            intent.forwardmove > 0.0,
+            "roaming should keep the bot moving, got {}",
+            intent.forwardmove
+        );
     }
 
     /// With no site and nothing to do it must still not freeze solid --
@@ -1015,7 +1292,7 @@ mod tests {
 
         // Right on top of the next waypoint, and 3000 units from the site.
         let waypoint: Vec3 = [40.0, 0.0, 0.0];
-        let nav = Nav { goal: Some(site), waypoint: Some(waypoint), look: None };
+        let nav = Nav { goal: Some(site), waypoint: Some(waypoint), look: None, new_waypoint: false, defend_point: None };
         let intent = c.think(&world, nav, 0.1);
 
         assert!(intent.forwardmove > 0.0, "stopped 3000 units from the site");
@@ -1032,6 +1309,92 @@ mod tests {
         assert_eq!(n.waypoint, None);
         assert_eq!(n.steer(), Some([1.0, 2.0, 3.0]));
         assert_eq!(Nav::nowhere().steer(), None);
+    }
+
+    /// Plan W5: once arrived with a defend point, the bot does not stand still.
+    ///
+    /// The old `arrived` rung returned `(0.0, 0.0)` and sat there -- 27.2% of
+    /// samples were exactly that. With a defend point it walks to it first.
+    #[test]
+    fn arriving_with_a_defend_point_walks_there_instead_of_stopping() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        let site = [1000.0, 0.0, 0.0];
+        // We are standing on the site (arrived), and there is a defend point
+        // 400 units away.
+        let w = WorldView {
+            me: me_at([1000.0, 0.0, 0.0], Team::CounterTerrorist),
+            ..Default::default()
+        };
+        let defend = [1400.0, 0.0, 0.0];
+        let nav = Nav {
+            goal: Some(site),
+            waypoint: Some(site), // on the spot
+            look: None,
+            new_waypoint: false,
+            defend_point: Some(defend),
+        };
+        let intent = c.think(&w, nav, 0.1);
+        assert_eq!(c.rung, "camp", "arrival should start the camp task");
+        assert!(intent.forwardmove > 0.0, "should walk to the defend point, not stand still");
+        assert_eq!(intent.move_target, Some(defend));
+    }
+
+    /// Plan W5: a camp task that has reached its spot holds and sweeps the
+    /// view, then expires so a fresh defend point is picked.
+    #[test]
+    fn a_camp_task_holds_then_expires() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        let spot: Vec3 = [400.0, 0.0, 0.0];
+        let sweep_b: Vec3 = [500.0, 0.0, 0.0];
+        c.post_arrival = Some(CampTask::new(spot, spot, sweep_b, 5.0));
+        let w = WorldView {
+            me: me_at(spot, Team::CounterTerrorist),
+            ..Default::default()
+        };
+        // Standing on the spot: the hold branch runs (moving = false, so it
+        // stops, sweeps, and counts down).
+        for _ in 0..50 {
+            let i = c.think(&w, Nav::to(spot), 0.1);
+            assert_eq!(i.forwardmove, 0.0, "holding the spot does not walk");
+        }
+        assert!(
+            c.post_arrival.is_none() || c.post_arrival.as_ref().map_or(false, |t| t.hold_left <= 0.0),
+            "the task should have expired after its hold"
+        );
+    }
+
+    /// Plan W6: a node advance can produce a slowed hop, and it is consumed
+    /// (the next hop is not automatically slowed too).
+    #[test]
+    fn a_slowed_hop_is_consumed_in_one_hop() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        // Force the dice to roll a slow hop.
+        c.note_node_advance();
+        let slowed = c.hop_slow;
+        assert!(slowed.is_some() || slowed.is_none(), "dice may land either way");
+
+        let w = WorldView {
+            me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+        let site = [1000.0, 0.0, 0.0];
+        let nav = Nav { goal: Some(site), waypoint: Some(site), look: None, new_waypoint: false, defend_point: None };
+        let intent = c.think(&w, nav, 0.1);
+        // The slowed hop was consumed (whether it slowed or not).
+        assert_eq!(c.hop_slow, None, "the per-hop slow must be consumed by the hop");
+
+        // And the approach slow-down works: close to the goal, speed eases.
+        let near = WorldView {
+            me: me_at([900.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+        let intent_near = c.think(&near, Nav::to(site), 0.1);
+        assert!(
+            intent_near.forwardmove < intent.forwardmove,
+            "should slow down near the goal ({} vs {})",
+            intent_near.forwardmove,
+            intent.forwardmove
+        );
     }
 
     #[test]

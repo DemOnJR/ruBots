@@ -1414,7 +1414,16 @@ impl Session {
             (Some(m), Some(_)) => self.follower.look_target(&m.grid, world.me.origin),
             _ => None,
         };
-        let nav = bot::controller::Nav { goal: self.site, waypoint: site, look };
+        let nav = bot::controller::Nav {
+            goal: self.site,
+            waypoint: site,
+            look,
+            // Plan W6: the follower advanced a node this tick, so the brain
+            // re-rolls its per-hop slowdown dice.
+            new_waypoint: self.follower.took_advanced(),
+            // Plan W5: where to defend after arrival, if the route has one.
+            defend_point: self.follower.defend_point(),
+        };
         let mut intent = self.brain.as_mut()?.think(&world, nav, dt);
 
         // Blocked by geometry the route does not model: strafe, jump, and

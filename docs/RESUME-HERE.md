@@ -82,19 +82,33 @@ Gotchas learned this round (do not rediscover):
 
 Next (in order):
 
-1. **M0 per-tick trace** (prerequisite for verifying W7): add a one-line-per-
-   tick view log behind an env var, or decode `captures/swarm/Bot<NN>.bin`
-   with `crates/client/examples/decode_sent.rs`. Fields needed: tick, view
-   yaw/pitch, desired yaw/pitch, fwd/side, buttons. Overshoot and peak turn
-   rate are undefined at the 2 s sample interval.
+1. **M0 per-tick trace** (prerequisite for verifying W7): **done** --
+   `crates/client/examples/view_trace.rs` decodes every `clc_move` from
+   `captures/swarm/Bot<NN>.bin.sent` and reports per-tick yaw/pitch/fwd/side/
+   buttons with deltas, plus flick episodes (sustained >= 60 deg swings), peak
+   turn rate, and overshoot reversals. Run:
+   `cargo run -p client --example view_trace -- captures/swarm/Bot01.bin.sent`.
 2. **Live run**: 20-30 bot match on de_dust2 with `scripts/swarm.sh` (use the
    staged `life=` pattern -- W3 has still never been measured live either),
-   then the section-1 table vs `docs/conga-baseline.md`. W7 targets: peak
-   |dyaw|/s in 400-900 deg/s on >= 60 deg flicks; overshoot 8-45 deg on >= 50 %
-   of combat flicks (was structurally 0); VIEW-1 median >= 6 deg (was 1.1);
-   VIEW-2 <= 15 % (was 42.7); 30 distinct anti-idle tuples.
-3. Then W5 (post-arrival task: `controller.rs` still `if arrived { (0, 0) }`),
-   W6 speed spread (only `pace` exists; per-hop dice not done), W8 last.
+   then the section-1 table vs `docs/conga-baseline.md` with
+   `python scripts/metrics.py captures/swarm`. W7 targets: peak |dyaw|/s in
+   400-900 deg/s on >= 60 deg flicks; overshoot 8-45 deg on >= 50 % of combat
+   flicks (was structurally 0); VIEW-1 median >= 6 deg (was 1.1); VIEW-2 <= 15 %
+   (was 42.7); 30 distinct anti-idle tuples.
+3. **W5 (post-arrival task) -- DONE** (committed): `Controller::post_arrival:
+   CampTask`; on arrival with a defend point the bot walks to it and camps
+   (hold scaled by fear, view sweep), then re-picks; without one it roams at
+   walking speed instead of the old `if arrived { (0, 0) }` stop. `Nav`
+   carries `defend_point` and `new_waypoint`; the caller fills them from
+   `PathFollower` (defend point picked deterministically per seed+goal,
+   300-600u from the goal).
+4. **W6 speed spread -- DONE** (committed): `travel()` now takes `remaining`;
+   inside `APPROACH_RADIUS` (500u) the bot eases to walking pace; a per-hop
+   slowdown dice (`25 * difficulty` percent chance of `0.4 * maxspeed`) rolls
+   on each node advance via `Controller::note_node_advance`, consumed in one
+   hop. The W1 personality fields (`aggression`, `fear`) now exist and drive
+   the camp hold.
+5. **W8 last.**
 
 ## Current work: humanization (`docs/humanize-plan.md`)
 

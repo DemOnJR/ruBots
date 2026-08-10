@@ -110,6 +110,14 @@ pub struct PathFollower {
     /// currently leaning. See [`Unstick`].
     unstick_for: f32,
     unstick_dir: f32,
+    /// Plan W6: whether the last `next_waypoint` advanced to a new node.
+    ///
+    /// Set when `at` increments (or the route replans), consumed by the caller
+    /// to tell the brain the per-hop slowdown dice should re-roll.
+    pub advanced: bool,
+    /// Plan W5: the defend point for after arrival, picked when the route
+    /// started. Deterministic per (seed, goal), so no IPC is needed to claim.
+    defend: Option<[f32; 3]>,
 }
 
 /// What to add to the steering while blocked.
@@ -228,6 +236,19 @@ impl PathFollower {
 
     pub fn remaining(&self) -> usize {
         self.path.len().saturating_sub(self.at)
+    }
+
+    /// Plan W6: whether the last `next_waypoint` advanced to a new node
+    /// (consume by the caller each tick).
+    pub fn took_advanced(&mut self) -> bool {
+        let a = self.advanced;
+        self.advanced = false;
+        a
+    }
+
+    /// Plan W5: the defend point picked for after arrival, if any.
+    pub fn defend_point(&self) -> Option<[f32; 3]> {
+        self.defend
     }
 
     /// Abandon the current route; the next [`next_waypoint`](Self::next_waypoint)
@@ -381,6 +402,9 @@ impl PathFollower {
             if dist2d(from, point) <= arrive_radius(grid, node) {
                 self.at += 1;
                 self.steer = None;
+                // Plan W6: a node advance is a new hop, so the brain's
+                // per-hop slowdown dice re-rolls.
+                self.advanced = true;
             } else {
                 return Some(point);
             }
@@ -481,6 +505,8 @@ impl PathFollower {
         self.tracked = None;
         self.best_dist = f32::INFINITY;
         self.no_progress_for = 0.0;
+        // Plan W5: a new route is a new defend point for after arrival.
+        self.defend = self.pick_defend_point(grid, goal);
         let blocked = std::mem::take(&mut self.blocked);
         let raw = match (grid.nearest(from), grid.nearest(goal)) {
             (Some(a), Some(b)) => grid
@@ -501,6 +527,32 @@ impl PathFollower {
         // every step of one walks the staircase. Smoothing drops the nodes that
         // only exist because the grid cannot draw a diagonal.
         self.path = grid.smooth_path(&raw);
+    }
+
+    /// Plan W5: a defend point for after arrival, deterministically per bot.
+    ///
+    /// Picks a nav node 300-600u from the goal. The claim mechanism is the W2
+    /// deterministic partition: the node index is a hash of (bot seed, goal),
+    /// so two bots on the same team naturally spread without any IPC (and a
+    /// teammate behind a wall is not a problem -- we are not reading entities,
+    /// we are partitioning the node pool). Falls back to the goal itself when
+    /// no node is in range.
+    fn pick_defend_point(&mut self, grid: &NavGrid, goal: [f32; 3]) -> Option<[f32; 3]> {
+        let goal_node = grid.nearest(goal)?;
+        let candidates: Vec<usize> = (0..grid.nodes.len())
+            .filter(|&n| {
+                let d = dist2d(grid.origin(n), goal);
+                (300.0..=600.0).contains(&d) && grid.flags(n) & flags::NARROW == 0
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Some(goal);
+        }
+        let mut z = self.seed ^ (goal_node as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        z ^= z >> 33;
+        let node = candidates[(z % candidates.len() as u64) as usize];
+        Some(grid.origin(node))
     }
 
     /// Give up on the current waypoint.
