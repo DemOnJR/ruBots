@@ -116,27 +116,36 @@ The user's complaint, watching 30 bots: *"predictible moves in lines one behind
 another"*. The plan has 18 measured metrics and targets; `docs/conga-baseline.md`
 has the numbers.
 
-**Done and measured (W1, W4, W3):**
+**Measured live 2026-08-10 (30 bots, 15 min, de_dust2): 14 of 18 targets met.**
+Full table in `docs/humanization-after-w1-w7.md`. Highlights:
 
 | metric | baseline | now | target |
 |---|---|---|---|
-| CT pair-time within 200u | 52.8 % | **12.9 %** | <= 25 % |
-| CT median separation | 186u | **1603u** | >= 400u |
-| same-team route Jaccard | 0.62 | **0.17** | <= 0.30 |
+| CT pair-time within 200u | 52.8 % | **10.1 %** | <= 25 % |
+| CT median separation | 186u | **1327u** | >= 400u |
+| same-team route Jaccard | 0.62 | **0.190** | <= 0.30 |
+| STILL-1 (< 1 u/s) | 61.2 % | **7.9 %** | <= 35 % |
+| SPEED-1 (fwd == 250) | 79.6 % | **2.6 %** | <= 45 % |
+| RUNG-1 (arrived) | 27.2 % | **0.0 %** | <= 10 % |
+| VIEW-1 (median |yaw-bearing|) | 1.1 deg | **54.3 deg** | >= 6 deg |
 
-Cross-team Jaccard was 0.07 -- the "unrelated players" floor. 0.17 is near it.
+W7 view dynamics verified live via `view_trace`: flicks overshoot (reversed
+direction) on every combat flick measured, max 25-29 deg -- structurally
+impossible with the old 0.45 ease. Combat happened this time (1,102 combat
+samples; the baseline teams never met).
 
-W3 (node radius, destination jitter, radius arrival, A\* post-smoothing) is
-committed and green but has **not had a live run**: the numbers above were
-measured *without* it. First job tomorrow is a 20-30 bot match to see what it
-does to them.
+**Still missing (4 of 18):** CONGA-1/2 (68 % / 29 % vs <= 45 % / <= 12 %),
+ROUTE-2/3 (0.175 / 915 nodes vs <= 0.15 / >= 1400), PILE-2 max (12 vs <= 5).
+All one cause: 15 bots on one bomb site converge into a loose stream on the
+final approach. The plan's W2/W4 mechanisms are in but the per-bot goal-node
+spread is capped by de_dust2's 2 sites; ROUTE-3 implies more route diversity
+is available from the heuristic-weight/edge-jitter levers.
 
-**Not started, in plan order:** speed variation (79.6 % of walking samples are
-exactly `fwd 250.0`), view behaviour when not fighting (median |yaw - bearing|
-is 1.1 deg -- they stare straight at their destination; 42.7 % of consecutive
-samples share an identical integer yaw), and the combat/view metrics, which need
-a match where the teams actually **collide** -- in the baseline run they barely
-met, so those 611 combat samples cannot support any claim.
+
+**Not started, in plan order:** W8 (chat/radio), the last optional item, and
+the four misses above. W3+W7 are now measured live; the remaining work is the
+route-diversity levers (W2/W4 tuning) and a collision-heavy match if combat
+verification needs more samples.
 
 ## Traps that cost real time. Do not rediscover these.
 

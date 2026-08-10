@@ -40,6 +40,8 @@ pub struct Decision {
     pub waypoints_left: usize,
     pub reroutes: u32,
     pub stuck: bool,
+    /// The nav node the bot is currently steering at (plan ROUTE-3/4).
+    pub node: Option<usize>,
     /// `IN_ATTACK` this tick — also how a plant in progress shows up.
     pub attack: bool,
     /// `IN_USE` this tick — defusing, and hostages.
@@ -1462,6 +1464,7 @@ impl Session {
             alive: world.me.alive,
             in_game: world.me.freeze_period,
             site,
+            node: self.follower.current_node(),
             forwardmove: intent.forwardmove,
             sidemove: intent.sidemove,
             yaw: intent.view.yaw,

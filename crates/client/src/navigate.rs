@@ -633,6 +633,15 @@ impl PathFollower {
     pub fn path_nodes(&self, grid: &NavGrid) -> Vec<[f32; 3]> {
         self.path.iter().map(|&n| grid.origin(n)).collect()
     }
+
+    /// The nav node the bot is currently steering at, if the route has one.
+    ///
+    /// This is the node ID itself, not a position -- ROUTE-3/4 (plan W3) are
+    /// counts of *distinct nodes steered at*, which is only computable from
+    /// the ids.
+    pub fn current_node(&self) -> Option<usize> {
+        self.path.get(self.at).copied()
+    }
 }
 
 #[cfg(test)]

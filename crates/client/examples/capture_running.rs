@@ -374,10 +374,12 @@ fn main() {
                 );
                 if let Some(dec) = session.last_decision {
                     eprintln!(
-                        "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} reroutes {} stuck {}",
+                        "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} node {} reroutes {} stuck {}",
                         dec.alive, dec.in_game, dec.forwardmove, dec.sidemove, dec.yaw,
                         dec.site.map(|s| [s[0] as i32, s[1] as i32]),
-                        dec.waypoints_left, dec.reroutes, dec.stuck,
+                        dec.waypoints_left,
+                        dec.node.map_or(-1, |n| n as i64),
+                        dec.reroutes, dec.stuck,
                     );
                     eprintln!(
                         "      obj: rung {:<10} bomb {} arming {} attack {} use {} to_goal {:.0}                          | planted {} at {:?}",

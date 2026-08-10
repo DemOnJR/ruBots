@@ -49,9 +49,11 @@ ORIGIN_RE = re.compile(
 )
 BRAIN_RE = re.compile(
     r"brain: alive (\S+) frozen (\S+) fwd (-?\d+) side (-?\d+) yaw (-?\d+)"
-    r" site (Some\(\[[^\]]*\]\)|None) wp (\d+) reroutes (\d+) stuck (\S+)"
+    r" site (Some\(\[[^\]]*\]\)|None) wp (\d+) node (-?\d+) reroutes (\d+) stuck (\S+)"
 )
-OBJ_RE = re.compile(r"obj: rung (\S+) bomb (\S+) arming (\S+) attack (\S+) use (\S+) to_goal (-?\d+)")
+OBJ_RE = re.compile(
+    r"obj: rung (\S+)\s+bomb (\S+)\s+arming (\S+)\s+attack (\S+)\s+use (\S+)\s+to_goal (-?\d+)"
+)
 OBJECTIVE_RE = re.compile(r"objective: \[\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\]")
 
 
@@ -86,6 +88,7 @@ def parse_log(path, samples, objectives):
                 "side": None,
                 "yaw": None,
                 "wp": None,
+                "node": None,
                 "reroutes": None,
                 "rung": None,
                 "to_goal": None,
@@ -101,7 +104,8 @@ def parse_log(path, samples, objectives):
             cur["side"] = float(b.group(4))
             cur["yaw"] = float(b.group(5))
             cur["wp"] = int(b.group(7))
-            cur["reroutes"] = int(b.group(8))
+            cur["node"] = int(b.group(8))
+            cur["reroutes"] = int(b.group(9))
             continue
         o = OBJ_RE.search(line)
         if o:
@@ -241,22 +245,22 @@ def main():
         team_cells[s["team"]].add(cell(s["origin"], 128))
     r1 = len(team_cells["CT"] & team_cells["T"]) / max(1, len(team_cells["CT"] | team_cells["T"]))
 
-    # ROUTE-2: Jaccard of steered-waypoint sets. The log gives `wp` (count
-    # remaining), not the node ids, so this is an approximation: the set of
-    # (team, wp) values seen.
-    wp_sets = {"CT": set(), "T": set()}
+    # ROUTE-2: Jaccard of steered-waypoint sets. The log carries the actual
+    # node id (`node`), so this is exact: the set of (team, node) values seen.
+    node_sets = {"CT": set(), "T": set()}
     for s in live:
-        wp_sets[s["team"]].add(s["wp"])
-    r2 = len(wp_sets["CT"] & wp_sets["T"]) / max(1, len(wp_sets["CT"] | wp_sets["T"]))
+        if s["node"] is not None and s["node"] >= 0:
+            node_sets[s["team"]].add(s["node"])
+    r2 = len(node_sets["CT"] & node_sets["T"]) / max(1, len(node_sets["CT"] | node_sets["T"]))
 
-    # ROUTE-3/4: `wp` is the remaining count, so distinct counts of wp values
-    # is a proxy for distinct nodes steered at. ROUTE-4: share of samples
-    # absorbed by the top 20 wp values.
-    wp_counts = defaultdict(int)
+    # ROUTE-3: distinct nav nodes ever steered at (of 4715 on de_dust2).
+    # ROUTE-4: share of steering ticks absorbed by the top 20 nodes.
+    node_counts = defaultdict(int)
     for s in live:
-        wp_counts[s["wp"]] += 1
-    r3 = len(wp_counts)
-    top20 = sum(sorted(wp_counts.values(), reverse=True)[:20])
+        if s["node"] is not None and s["node"] >= 0:
+            node_counts[s["node"]] += 1
+    r3 = len(node_counts)
+    top20 = sum(sorted(node_counts.values(), reverse=True)[:20])
     r4 = top20 / n
 
     # --- STILL-1 / RUNG-1 / SPEED-1 -----------------------------------------
