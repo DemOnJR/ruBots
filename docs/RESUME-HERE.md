@@ -147,6 +147,21 @@ the four misses above. W3+W7 are now measured live; the remaining work is the
 route-diversity levers (W2/W4 tuning) and a collision-heavy match if combat
 verification needs more samples.
 
+## Debug radar GUI (2026-08-10, `debug-gui-radar.md`)
+
+- `crates/gui` (egui/eframe): live radar of all bots. Map silhouette is
+  auto-generated from the nav grid (accurate for ANY map, zero per-map art).
+  Team-colored dots (T yellow, CT blue, dead grey), **red ring on stuck bots**
+  (vel < 1 while requesting fwd for > 3 s), per-bot detail panel, and a
+  ~120 s replay scrubber to watch the T-spawn pile-up.
+- Telemetry bus: each bot broadcasts a fixed-layout UDP packet every 0.5 s to
+  127.0.0.1:27016 when `AIPLAYERS_TELEMETRY_PORT` is set (swarm.ps1 sets it).
+  `crates/client/src/telemetry.rs` has the packet + `field_str` helper.
+- Run: `scripts/swarm.ps1 -N 30 -Secs 900`, then `cargo run -p gui`.
+- Round-start stuck fix (committed `51f21f5`): post-freeze 2 s natural-walker
+  grace + teammate-aware unstick (checks same-team players within 60u on the
+  push side). First-60s stuck-while-requesting dropped to 2.9%.
+
 ## Traps that cost real time. Do not rediscover these.
 
 - **Never poll rcon in a loop, and never mass-kill bots casually.**
