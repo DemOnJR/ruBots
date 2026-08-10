@@ -122,6 +122,27 @@ pub fn move_axes(view_yaw: f32, travel_yaw: f32, speed: f32) -> (f32, f32) {
     ((speed * d.cos()) as f32, (-speed * d.sin()) as f32)
 }
 
+/// Decompose travel into a forward/strafe pair that keeps the body moving
+/// forward while the view turns (YaPB's `m_moveSpeed` + `m_strafeSpeed`
+/// model, `yapb/src/navigate.cpp:1065-1081`).
+///
+/// A pure `move_axes` at a hard corner drives `fwd -> 0` as `side -> max`,
+/// which reads as "stops and slides". A human instead keeps pressing forward
+/// and adds a strafe: `fwd` stays high, `side` carries the turn. `forward`
+/// and `strafe` are the desired axis magnitudes; the view-relative split is
+/// done here so a caller can mix a weave or a collision push into `strafe`
+/// without recomputing trigonometry.
+pub fn move_axes_strafe(view_yaw: f32, travel_yaw: f32, forward: f32, strafe: f32) -> (f32, f32) {
+    let d = norm_angle(f64::from(travel_yaw) - f64::from(view_yaw)).to_radians();
+    let (s, c) = d.sin_cos();
+    let f = f64::from(forward);
+    let st = f64::from(strafe);
+    (
+        (f * c - st * s) as f32,
+        (-f * s + st * c) as f32,
+    )
+}
+
 /// `cos` of the half-angle a `dot > threshold` test corresponds to.
 ///
 /// ReGameDLL states these as raw cosines: `VIEW_FIELD_NARROW 0.7` is commented
@@ -319,5 +340,38 @@ mod tests {
         let (fwd, side) = move_axes(90.0, 0.0, 250.0);
         assert!(fwd.abs() < 1e-3, "forward {fwd}");
         assert!(side > 200.0, "expected a right strafe, got {side}");
+    }
+
+    /// `move_axes_strafe` keeps the body moving forward while a strafe is
+    /// added -- the natural-walker decomposition (plan part A).
+    #[test]
+    fn move_axes_strafe_keeps_forward_and_carries_the_strafe() {
+        // Same view and travel: pure forward, weave ignored.
+        let (fwd, side) = move_axes_strafe(90.0, 90.0, 250.0, 30.0);
+        assert!((fwd - 250.0).abs() < 1e-3, "fwd {fwd}");
+        assert!((side - 30.0).abs() < 1e-3, "side {side}");
+
+        // Hard 90-degree corner: forward STAYS (a human keeps pressing W),
+        // and the strafe carries the turn.
+        let (fwd, side) = move_axes_strafe(90.0, 0.0, 250.0, 120.0);
+        assert!(fwd > 100.0, "forward collapsed to {fwd}, the body should keep moving");
+        assert!(side > 200.0, "expected the strafe to dominate, got {side}");
+
+        // The world-space vector still points at travel + the strafe offset.
+        let view = 45.0f32;
+        let travel = 10.0f32;
+        let (fwd, side) = move_axes_strafe(view, travel, 200.0, 40.0);
+        let y = f64::from(view).to_radians();
+        let (sy, cy) = y.sin_cos();
+        let vx = cy * f64::from(fwd) + sy * f64::from(side);
+        let vy = sy * f64::from(fwd) - cy * f64::from(side);
+        // With a strafe the resulting direction is *off* travel by the
+        // strafe/forward ratio -- that is the point (the body is pushed
+        // sideways), but it must still be within +-60 deg of travel.
+        let got = vy.atan2(vx).to_degrees();
+        let err = norm_angle(got - f64::from(travel)).abs();
+        assert!(err < 60.0, "walked {got:.1} vs travel {travel}: err {err:.1}");
+        // And it must never exceed engine-legal axis magnitudes.
+        assert!(fwd.abs() <= 250.0 && side.abs() <= 250.0);
     }
 }

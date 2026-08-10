@@ -1416,6 +1416,19 @@ impl Session {
             (Some(m), Some(_)) => self.follower.look_target(&m.grid, world.me.origin),
             _ => None,
         };
+        // Natural walker: the follower's weave and micro-pause (a corridor
+        // sidemove oscillation and a brief speed dip). Applied on walking
+        // rungs; combat/camp/defuse pass defaults. Suppressed entirely while
+        // the follower is struggling -- a weave pushing into the same wall is
+        // how a stuck bot stays stuck (measured: 49.6% of goto samples were
+        // still with vel < 1, most requesting movement).
+        let struggling = self.follower.is_struggling();
+        let (weave, speed_scale) = match (self.map.as_ref(), site) {
+            (Some(m), Some(_)) if !struggling => {
+                self.follower.natural_walk(&m.grid, world.me.origin, dt)
+            }
+            _ => (0.0, 1.0),
+        };
         let nav = bot::controller::Nav {
             goal: self.site,
             waypoint: site,
@@ -1425,6 +1438,8 @@ impl Session {
             new_waypoint: self.follower.took_advanced(),
             // Plan W5: where to defend after arrival, if the route has one.
             defend_point: self.follower.defend_point(),
+            weave,
+            speed_scale,
         };
         let mut intent = self.brain.as_mut()?.think(&world, nav, dt);
 

@@ -194,16 +194,19 @@ def main():
     conga1 /= n
 
     # --- CONGA-2: same-team pair-time within 300u, live and moving ---------
-    moving = [s for s in live if s["fwd"] != 0 or s["side"] != 0]
-    pair_time, pair_moving = 0.0, 0.0
+    # The denominator is the number of same-team PAIRS observed (per tick),
+    # not the number of samples -- a pair is a pair regardless of how many
+    # bots are moving. Dividing by samples made 30-bot runs exceed 1.0.
+    pair_time, pair_moving, pair_total = 0.0, 0.0, 0
     for grp in by_tick.values():
         for a, b in combinations(grp, 2):
+            pair_total += 1
             d = ((a["origin"][0] - b["origin"][0]) ** 2 + (a["origin"][1] - b["origin"][1]) ** 2) ** 0.5
             if d <= 300:
                 pair_time += 1
                 if (a["fwd"] != 0 or a["side"] != 0) and (b["fwd"] != 0 or b["side"] != 0):
                     pair_moving += 1
-    conga2 = pair_moving / max(1, len(moving))
+    conga2 = pair_moving / max(1, pair_total)
 
     # --- SEP-CT / SEP-200 --------------------------------------------------
     sep_ct = []

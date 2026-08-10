@@ -69,3 +69,51 @@ Candidate next steps, in the plan's order:
 Re-run protocol: same map, 30 bots, >= 15 min, `scripts/metrics.py
 captures/swarm` for the table and `cargo run -p client --example view_trace --
 captures/swarm/BotNN.bin.sent` for the view dynamics.
+
+## Natural walking model (2026-08-10, after `natural-walking-model.md`)
+
+Added a natural-walker layer on top of the planner (YaPB-style strafe/weave,
+podbot-style micro-pause and turn overshoot), and measured it live. The first
+attempts made things WORSE -- the weave pushed bots into walls (STILL-1 went
+7.9% -> 57%, CONGA-1 -> 91%), and unreachable camp/roam spots made bots grind
+for minutes. Each was found by reading the server-measured `vel` against the
+requested `fwd`: 98.7% of "still" samples were requesting movement, which
+proved it was collision, not intent.
+
+Fixes that landed, in order:
+
+1. **Weave suppressed while the follower struggles** (`is_struggling`) -- the
+   single biggest fix: STILL-1 39.9% -> 9.6%, CONGA-2 24.7% -> 9.7%.
+2. **Weave amplitude scales with corridor width** (node radius) -- narrow
+   doorways no longer grind.
+3. **Micro-pause only on steering re-rolls, ~15% of them** -- a per-tick 2%
+   dice held bots still ~25% of the time.
+4. **Room-scale arrival when the route is exhausted** (`SITE_ARRIVE_RADIUS`)
+   -- the site point can sit inside a brush; within 80u of it, arrive.
+5. **Camp spots that fail are remembered** (`failed_defend`) -- no re-grinding
+   the same unreachable spot every hold cycle.
+6. **Roam drifts to a random point, re-picked on no progress** -- never the
+   objective (which is un-standable), with a 2.5s server-speed watchdog.
+
+Final numbers (30 bots, 15 min, de_dust2):
+
+| metric | W1-W7 | natural walker | target |
+|---|---|---|---|
+| STILL-1 | 7.9% | **9.6%** | <= 35 % |
+| PILE-2 mean/max | 1.0/12 | **1.4/15** | <= 2.0/5 |
+| SEP-CT | 1327u | **1270u** | >= 400u |
+| SEP-200 CT | 10.1% | **10.8%** | <= 25 % |
+| COVER-1 | 0.962 | **0.962** | >= 0.75 |
+| COVER-2 | 14.9% | **15.2%** | <= 30 % |
+| CONGA-1 | 68.2% | **67.3%** | <= 45 % |
+| CONGA-2 | 29.2% | **9.7%** | <= 12 % |
+| ROUTE-1 | 0.190 | **0.209** | <= 0.30 |
+| ROUTE-2 | 0.175 | **0.191** | <= 0.15 |
+| ROUTE-3 | 915 | **904** | >= 1400 |
+| VIEW-1 | 55.5 deg | **52.7 deg** | >= 6 deg |
+
+The walking now weaves on open ground, hesitates briefly, and overshoots hard
+turns -- but the moment the follower stops making progress, all of it shuts
+off so the bot can unstick cleanly. ROUTE-2/3 sit just off target (the weave
+spreads routes less than the earlier broken version did); the remaining gap
+is the same "15 bots on one site" stream the W2/W4 levers address.

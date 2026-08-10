@@ -41,7 +41,7 @@ use crate::aim::{
 use crate::combat::{engage, select_target, EngageParams};
 use crate::fire::FireControl;
 use crate::idle::AntiIdle;
-use crate::math::{aim_angles, distance2d, move_axes, norm_angle, Angles, Vec3};
+use crate::math::{aim_angles, distance2d, move_axes_strafe, norm_angle, Angles, Vec3};
 
 // Re-exported so `bot::controller::Intent` keeps resolving for callers that
 // imported it from here before the type moved to its own module.
@@ -62,6 +62,15 @@ pub const FORWARD_SPEED: f32 = 250.0;
 /// How close (horizontally) counts as having reached a move target.
 /// **Conventional**, chosen to be under one player width.
 pub const ARRIVE_RADIUS: f32 = 24.0;
+
+/// How close to the *final* objective counts as arrived once the route is
+/// exhausted.
+///
+/// A bomb site is a room, not a point: the objective point may sit inside a
+/// brush the bot cannot stand on, so the last few units are un-walkable. With
+/// no waypoint left, arriving within this room-scale radius is correct --
+/// otherwise the bot grinds at the site edge forever (see the `goto` rung).
+pub const SITE_ARRIVE_RADIUS: f32 = 80.0;
 
 
 /// Speed at which the bot makes no footstep noise.
@@ -229,12 +238,28 @@ pub struct Nav {
     /// objective (deterministically per bot + round, so no IPC is needed).
     /// `None` means the caller has no defend point; the bot roams instead.
     pub defend_point: Option<Vec3>,
+    /// Natural-walker inputs from the caller (plan natural-walking-model.md).
+    ///
+    /// The caller's follower computes these each tick: `weave` is a small
+    /// sidemove offset (a per-bot corridor weave), `speed_scale` dips the
+    /// speed during a micro-pause or a slowed hop. The brain folds them into
+    /// [`Controller::travel`] rather than the caller doing raw axis math.
+    pub weave: f32,
+    pub speed_scale: f32,
 }
 
 impl Nav {
     /// Head for `goal` with no route -- straight-line steering.
     pub fn to(goal: Vec3) -> Self {
-        Self { goal: Some(goal), waypoint: None, look: None, new_waypoint: false, defend_point: None }
+        Self {
+            goal: Some(goal),
+            waypoint: None,
+            look: None,
+            new_waypoint: false,
+            defend_point: None,
+            weave: 0.0,
+            speed_scale: 1.0,
+        }
     }
 
     /// No objective at all.
@@ -250,7 +275,15 @@ impl Nav {
 
 impl From<Option<Vec3>> for Nav {
     fn from(goal: Option<Vec3>) -> Self {
-        Self { goal, waypoint: None, look: None, new_waypoint: false, defend_point: None }
+        Self {
+            goal,
+            waypoint: None,
+            look: None,
+            new_waypoint: false,
+            defend_point: None,
+            weave: 0.0,
+            speed_scale: 1.0,
+        }
     }
 }
 
@@ -274,12 +307,27 @@ pub struct CampTask {
     pub sweep_b: Vec3,
     /// Whether we have actually reached the spot yet (walking there first).
     pub moving: bool,
+    /// How long we have been trying to reach the spot without arriving.
+    ///
+    /// A defend point can be unreachable (on a ledge, inside a brush); a bot
+    /// that grinds toward it forever reads as stuck (measured: `fwd 60` in
+    /// camp, `vel 0`, for minutes). After this many seconds of no progress the
+    /// task gives up and holds in place instead.
+    pub give_up_after: f32,
 }
 
 impl CampTask {
     /// How long a hold lasts for this bot, scaled by its fear.
     pub fn new(spot: Vec3, sweep_a: Vec3, sweep_b: Vec3, hold: f32) -> Self {
-        Self { spot, hold_left: hold, hold_total: hold, sweep_a, sweep_b, moving: true }
+        Self {
+            spot,
+            hold_left: hold,
+            hold_total: hold,
+            sweep_a,
+            sweep_b,
+            moving: true,
+            give_up_after: 6.0,
+        }
     }
 }
 
@@ -329,6 +377,29 @@ pub struct Controller {
     /// fear is high).
     pub aggression: f32,
     pub fear: f32,
+    /// Natural-walker C: body-yaw turn overshoot state.
+    ///
+    /// Seconds left in the current overshoot swing, and its direction
+    /// (`0.0` = none). See [`Controller::turn_overshoot`].
+    over_time: f32,
+    over_dir: f32,
+    /// Plan W5: the last defend spot that proved unreachable.
+    ///
+    /// A deterministically-picked defend point can sit on a ledge or inside a
+    /// brush. Camping at it once and failing is fine; re-picking the same spot
+    /// forever is a bot grinding at a wall (measured: `fwd 60-105` in camp,
+    /// `vel 0`, for minutes). Remembered so the next arrival roams instead.
+    failed_defend: Option<Vec3>,
+    /// Plan W5: where the roam task is drifting to, and when to re-draw it.
+    ///
+    /// Roam picks a random point 120-320u away and walks to it for a few
+    /// seconds, then re-picks. Deliberately NOT the objective -- the site
+    /// point can be inside a brush, and walking at it forever is stuck.
+    roam_target: Vec3,
+    roam_timer: f32,
+    /// How long the roam has been stuck (server-measured speed ~ 0), after
+    /// which the target is re-picked instead of grinding through a wall.
+    roam_stuck_for: f32,
     /// Plan W6: whether this hop is being travelled at reduced speed.
     ///
     /// `Some(scale)` after a node advance drew the per-hop slowdown dice
@@ -389,6 +460,12 @@ impl Controller {
             // aggression/fear windows (manager.cpp:199-213).
             aggression: personality(seed).0,
             fear: personality(seed).1,
+            over_time: 0.0,
+            over_dir: 0.0,
+            failed_defend: None,
+            roam_target: [0.0, 0.0, 0.0],
+            roam_timer: 0.0,
+            roam_stuck_for: 0.0,
             hop_slow: None,
             post_arrival: None,
             strafe: (1.0, 0.0),
@@ -495,7 +572,21 @@ impl Controller {
     /// hop): inside [`APPROACH_RADIUS`] the bot eases to walking pace, and the
     /// per-hop slowdown dice (plan W6) only rolls on a node advance, set by the
     /// caller via [`Controller::note_node_advance`].
-    fn travel(&mut self, view: Angles, from: Vec3, to: Vec3, speed: f32, remaining: f32) -> (f32, f32) {
+    ///
+    /// `weave` and `speed_scale` come from the caller's natural walker
+    /// (plan natural-walking-model.md): a small corridor weave added to
+    /// sidemove, and a speed dip for a micro-pause or slowed hop.
+    fn travel(
+        &mut self,
+        view: Angles,
+        from: Vec3,
+        to: Vec3,
+        speed: f32,
+        remaining: f32,
+        weave: f32,
+        speed_scale: f32,
+        dt: f32,
+    ) -> (f32, f32) {
         let bearing = aim_angles(from, to).yaw;
         // Slow into the turn. `delta` is the angle between where the bot is
         // looking and where it is going, which is only large when it is
@@ -521,8 +612,44 @@ impl Controller {
             None => 1.0,
         };
         let ease = if remaining <= APPROACH_RADIUS { WALK_SPEED / FORWARD_SPEED } else { 1.0 };
-        let scale = slow * ease;
-        move_axes(view.yaw, bearing, speed * turn * self.pace * scale)
+        let scale = slow * ease * speed_scale;
+
+        // Natural-walker C: body-yaw turn overshoot. On a hard bearing change
+        // the bot swings a little wide (steers past the corner), then
+        // corrects -- a human's "whoops, missed it" tell. Bounded to +-12 deg
+        // so it can never aim into a wall.
+        let over = self.turn_overshoot(delta, dt);
+
+        let (f, s) = move_axes_strafe(view.yaw, bearing + over, speed * turn * self.pace * scale, weave);
+        // The weave must not push the total sidemove past the engine cap.
+        (f, s.clamp(-250.0, 250.0))
+    }
+
+    /// Body-yaw turn overshoot: a brief swing wide on hard corners.
+    ///
+    /// Plan natural-walking-model.md, part C. When the bearing changes by more
+    /// than [`TURN_SLOW_ANGLE`], the bot steers at `bearing + over` for a
+    /// short `over_time`, then corrects. `over` is drawn per bot in +-12 deg
+    /// and decays to zero. The result is the body swinging wide and coming
+    /// back, which is the one human tell the spring view (W7) cannot produce
+    /// on its own -- it is body motion, not view motion.
+    fn turn_overshoot(&mut self, delta: f64, dt: f32) -> f32 {
+        if delta > TURN_SLOW_ANGLE {
+            self.over_time = 0.12;
+            if self.over_dir == 0.0 {
+                self.over_dir = if self.rng.chance(0.5) { 1.0 } else { -1.0 };
+            }
+        }
+        if self.over_time > 0.0 {
+            self.over_time -= dt;
+            let amt = 12.0 * self.over_dir;
+            if self.over_time <= 0.0 {
+                self.over_dir = 0.0;
+            }
+            amt
+        } else {
+            0.0
+        }
     }
 
     /// Roll the per-hop slowdown dice (plan W6).
@@ -563,8 +690,10 @@ impl Controller {
     /// picked for the next hold.
     fn camp_tick(&mut self, task: &mut CampTask, world: &WorldView, dt: f32) -> Intent {
         let to_spot = distance2d(world.me.origin, task.spot);
-        if task.moving && to_spot > 40.0 {
-            // Walk to the defend spot, looking at it.
+        if task.moving && to_spot > 40.0 && task.give_up_after > 0.0 {
+            // Walk to the defend spot, looking at it. Slow and careful: this
+            // is a post-arrival reposition, not a route hop, so WALK_SPEED.
+            task.give_up_after -= dt;
             let look_angles = aim_angles(world.me.origin, task.spot);
             self.aim_at_guarded(
                 look_angles,
@@ -574,10 +703,23 @@ impl Controller {
             );
             self.rung = "camp";
             let view = self.wire_view(world);
-            let (forwardmove, sidemove) =
-                self.travel(view, world.me.origin, task.spot, FORWARD_SPEED, to_spot);
+            // Never walk backwards to a camp spot: if the spot is behind the
+            // current view (delta > 100 deg), just turn -- the view leads,
+            // then the walk resumes. Backing up read as a glitch (measured:
+            // `fwd -58` in camp while the server said velocity 0).
+            let delta = norm_angle(
+                f64::from(aim_angles(world.me.origin, task.spot).yaw) - f64::from(view.yaw),
+            )
+            .abs();
+            let (forwardmove, sidemove) = if delta > TURN_STOP_ANGLE {
+                (0.0, 0.0)
+            } else {
+                self.travel(view, world.me.origin, task.spot, WALK_SPEED, to_spot, 0.0, 1.0, dt)
+            };
             return Intent { view, forwardmove, sidemove, move_target: Some(task.spot), ..Intent::default() };
         }
+        // Give up on an unreachable spot: hold where we are instead of
+        // grinding toward geometry we cannot stand on.
         task.moving = false;
 
         // Holding: sweep the view between the two points, and stand still.
@@ -626,6 +768,7 @@ impl Controller {
         self.fire.reset();
         self.tracking = None;
         self.nav_goal = None;
+        self.failed_defend = None;
     }
 
     /// How long the current target has been visible, advancing the counter.
@@ -763,7 +906,7 @@ impl Controller {
                 let closing = if eng.advance { FORWARD_SPEED } else { 0.0 };
                 let remaining = distance2d(world.me.origin, target.origin);
                 let (f, s) =
-                    self.travel(view, world.me.origin, target.origin, closing, remaining);
+                    self.travel(view, world.me.origin, target.origin, closing, remaining, 0.0, 1.0, dt);
                 (f, s + STRAFE_SPEED * side)
             };
 
@@ -791,7 +934,7 @@ impl Controller {
             let (forwardmove, sidemove) = match defuse.move_to {
                 Some(to) => {
                     let remaining = distance2d(world.me.origin, to);
-                    self.travel(view, world.me.origin, to, FORWARD_SPEED, remaining)
+                    self.travel(view, world.me.origin, to, FORWARD_SPEED, remaining, 0.0, 1.0, dt)
                 }
                 None => (0.0, 0.0),
             };
@@ -864,7 +1007,16 @@ impl Controller {
                     (0.0, 0.0)
                 } else {
                     let remaining = distance2d(world.me.origin, target);
-                    self.travel(view, world.me.origin, steer, FORWARD_SPEED, remaining)
+                    self.travel(
+                        view,
+                        world.me.origin,
+                        steer,
+                        FORWARD_SPEED,
+                        remaining,
+                        nav.weave,
+                        nav.speed_scale,
+                        dt,
+                    )
                 };
                 let mut intent = Intent {
                     view,
@@ -920,7 +1072,7 @@ impl Controller {
             let (forwardmove, sidemove) = match steer {
                 Some(to) => {
                     let remaining = distance2d(world.me.origin, to);
-                    self.travel(view, world.me.origin, to, speed, remaining)
+                    self.travel(view, world.me.origin, to, speed, remaining, 0.0, 1.0, dt)
                 }
                 None => (0.0, 0.0),
             };
@@ -950,7 +1102,16 @@ impl Controller {
         // Going to the site is right whether or not there is an objective to
         // perform there -- it is where the round happens.
         if let Some(t) = self.objective.target.or(nav.goal) {
-            let arrived = distance2d(world.me.origin, t) < ARRIVE_RADIUS;
+            // A bomb site is a room, not a point. Once the route is exhausted
+            // (no waypoint left, steering straight at the goal) the goal point
+            // may sit inside a brush the bot cannot stand in -- so being
+            // within SITE_ARRIVE_RADIUS of it counts as arrived, or the bot
+            // grinds against the site edge forever requesting fwd while the
+            // server reports velocity 0 (measured: 98.7% of "still" samples
+            // were requesting movement with wp 0 / node -1).
+            let route_done = nav.waypoint.is_none();
+            let arrive_r = if route_done { SITE_ARRIVE_RADIUS } else { ARRIVE_RADIUS };
+            let arrived = distance2d(world.me.origin, t) < arrive_r;
             let steer = if arrived { t } else { nav.steer().unwrap_or(t) };
             // Look ahead of the feet, with the back-swing guard: a head leads
             // a body, and it never swings backwards through its own neck.
@@ -975,34 +1136,75 @@ impl Controller {
                     // point comes from the caller (which owns the grid); without
                     // one, roam -- but keep moving, never a hard stop.
                     if let Some(defend) = nav.defend_point {
-                        // Sweep between the defend spot and a point slightly back
-                        // toward the goal, so the view moves during the hold.
-                        let back = lerp_vec(defend, t, 0.3);
-                        let hold = self.camp_hold();
-                        self.post_arrival = Some(CampTask::new(defend, defend, back, hold));
+                        // If this exact spot already failed us (unreachable),
+                        // do not grind toward it again -- roam instead.
+                        if self.failed_defend.map_or(true, |f| distance2d(f, defend) > 40.0) {
+                            // Sweep between the defend spot and a point slightly
+                            // back toward the goal, so the view moves during the
+                            // hold.
+                            let back = lerp_vec(defend, t, 0.3);
+                            let hold = self.camp_hold();
+                            self.post_arrival = Some(CampTask::new(defend, defend, back, hold));
+                        }
                     }
                 }
                 if let Some(mut task) = self.post_arrival.take() {
                     let intent = self.camp_tick(&mut task, world, dt);
-                    // Put the task back only while it is still holding; once
-                    // the hold has effectively elapsed (epsilon for float
-                    // drift), drop it so a fresh defend point is picked.
-                    if task.hold_left > dt {
+                    if task.give_up_after <= 0.0 && task.moving {
+                        // The spot was unreachable: remember it so the next
+                        // arrival does not pick it again, and roam instead.
+                        self.failed_defend = Some(task.spot);
+                    } else if task.hold_left > dt {
+                        // Still holding: put the task back. Once the hold has
+                        // effectively elapsed (epsilon for float drift), drop
+                        // it so a fresh defend point is picked.
                         self.post_arrival = Some(task);
                     }
                     return intent;
                 }
                 // No defend point and no task: roam slowly, keeping the
-                // anti-idle alive.
+                // anti-idle alive. Roam to a random nearby drift point, NOT
+                // the objective -- the site point can be inside a brush the
+                // bot cannot stand on, and walking at it forever reads as
+                // stuck (measured: `fwd 59` in roam, `vel 0`, for minutes).
+                //
+                // A random point can also be across a wall: if we have made no
+                // progress for a few seconds (server-measured speed ~ 0), pick
+                // a new one instead of grinding.
+                if self.roam_timer <= 0.0 || (self.roam_stuck_for > 2.5 && world.me.speed < 10.0) {
+                    let a = self.rng.unit() * std::f64::consts::TAU;
+                    let r = self.rng.range(120.0, 320.0);
+                    self.roam_target = [
+                        world.me.origin[0] + (a.cos() * r) as f32,
+                        world.me.origin[1] + (a.sin() * r) as f32,
+                        world.me.origin[2],
+                    ];
+                    self.roam_timer = self.rng.range(3.0, 7.0) as f32;
+                    self.roam_stuck_for = 0.0;
+                }
+                self.roam_timer -= dt;
+                if world.me.speed < 10.0 {
+                    self.roam_stuck_for += dt;
+                } else {
+                    self.roam_stuck_for = 0.0;
+                }
                 self.rung = "roam";
                 let view = self.wire_view(world);
-                let (forwardmove, sidemove) =
-                    self.travel(view, world.me.origin, t, WALK_SPEED, 200.0);
+                let (forwardmove, sidemove) = self.travel(
+                    view,
+                    world.me.origin,
+                    self.roam_target,
+                    WALK_SPEED,
+                    200.0,
+                    nav.weave,
+                    nav.speed_scale,
+                    dt,
+                );
                 return Intent {
                     view,
                     forwardmove,
                     sidemove,
-                    move_target: Some(t),
+                    move_target: Some(self.roam_target),
                     ..Intent::default()
                 };
             }
@@ -1010,8 +1212,16 @@ impl Controller {
             self.rung = "goto";
             let view = self.wire_view(world);
             let remaining = distance2d(world.me.origin, t);
-            let (forwardmove, sidemove) =
-                self.travel(view, world.me.origin, steer, FORWARD_SPEED, remaining);
+            let (forwardmove, sidemove) = self.travel(
+                view,
+                world.me.origin,
+                steer,
+                FORWARD_SPEED,
+                remaining,
+                nav.weave,
+                nav.speed_scale,
+                dt,
+            );
             return Intent {
                 view,
                 forwardmove,
@@ -1292,7 +1502,7 @@ mod tests {
 
         // Right on top of the next waypoint, and 3000 units from the site.
         let waypoint: Vec3 = [40.0, 0.0, 0.0];
-        let nav = Nav { goal: Some(site), waypoint: Some(waypoint), look: None, new_waypoint: false, defend_point: None };
+        let nav = Nav { goal: Some(site), waypoint: Some(waypoint), look: None, new_waypoint: false, defend_point: None, weave: 0.0, speed_scale: 1.0 };
         let intent = c.think(&world, nav, 0.1);
 
         assert!(intent.forwardmove > 0.0, "stopped 3000 units from the site");
@@ -1332,6 +1542,8 @@ mod tests {
             look: None,
             new_waypoint: false,
             defend_point: Some(defend),
+            weave: 0.0,
+            speed_scale: 1.0,
         };
         let intent = c.think(&w, nav, 0.1);
         assert_eq!(c.rung, "camp", "arrival should start the camp task");
@@ -1378,7 +1590,7 @@ mod tests {
             ..Default::default()
         };
         let site = [1000.0, 0.0, 0.0];
-        let nav = Nav { goal: Some(site), waypoint: Some(site), look: None, new_waypoint: false, defend_point: None };
+        let nav = Nav { goal: Some(site), waypoint: Some(site), look: None, new_waypoint: false, defend_point: None, weave: 0.0, speed_scale: 1.0 };
         let intent = c.think(&w, nav, 0.1);
         // The slowed hop was consumed (whether it slowed or not).
         assert_eq!(c.hop_slow, None, "the per-hop slow must be consumed by the hop");
@@ -1395,6 +1607,52 @@ mod tests {
             intent_near.forwardmove,
             intent.forwardmove
         );
+    }
+
+    /// Natural-walker C: a hard bearing change fires a brief body-yaw
+    /// overshoot, and it decays to zero (never a permanent steering bias).
+    #[test]
+    fn a_hard_turn_fires_the_body_overshoot_and_it_decays() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        // Straight ahead: no overshoot.
+        assert_eq!(c.turn_overshoot(10.0, 0.02), 0.0, "no overshoot on a straight line");
+        // A > 45 deg bearing change fires it (direction is per-bot, so +-12).
+        let first = c.turn_overshoot(80.0, 0.02);
+        assert!(first.abs() > 0.0 && first.abs() <= 12.0, "overshoot {first}");
+        // It persists for a few ticks then decays (once the bearing settles).
+        let mut saw = first;
+        for _ in 0..10 {
+            saw = c.turn_overshoot(10.0, 0.02);
+        }
+        assert_eq!(saw, 0.0, "overshoot should have decayed, still {saw}");
+    }
+
+    /// The arrival-gap regression: with the route exhausted (no waypoint) and
+    /// the bot within SITE_ARRIVE_RADIUS of the goal, it must declare arrival
+    /// and start the camp/roam task -- not grind at the site edge requesting
+    /// fwd while the server reports velocity 0.
+    #[test]
+    fn an_exhausted_route_within_the_site_radius_is_arrival() {
+        let mut c = Controller::new(7, Difficulty::Normal);
+        let site = [1000.0, 0.0, 0.0];
+        // 60 units from the goal, route exhausted (no waypoint).
+        let w = WorldView {
+            me: me_at([940.0, 0.0, 0.0], Team::Terrorist),
+            ..Default::default()
+        };
+        let nav = Nav {
+            goal: Some(site),
+            waypoint: None, // route done
+            look: None,
+            new_waypoint: false,
+            defend_point: None,
+            weave: 0.0,
+            speed_scale: 1.0,
+        };
+        let intent = c.think(&w, nav, 0.1);
+        // Arrived -> roam (no defend point), NOT a grinding goto.
+        assert_eq!(c.rung, "roam", "should have left the goto rung at the site edge");
+        assert!(intent.forwardmove > 0.0, "roam keeps moving");
     }
 
     #[test]
@@ -1875,7 +2133,10 @@ mod tests {
 
         let want = bearing_to([0.0; 3], waypoint);
         let err = norm_angle(f64::from(travel_bearing(&intent) - want)).abs();
-        assert!(err < 1.0, "walking {err:.1} degrees off the waypoint");
+        // Natural-walker C adds a bounded +-12 deg body-yaw overshoot on a
+        // hard turn (the "swings wide" tell), so the first tick may be off
+        // the exact bearing by up to that much -- but never more.
+        assert!(err < 15.0, "walking {err:.1} degrees off the waypoint");
 
         // A hard turn is now DELIBERATELY slower -- nobody sprints sideways,
         // see TURN_SLOW_ANGLE. This is a 90-degree turn, so expect the hard
@@ -2146,7 +2407,9 @@ mod tests {
         assert!(WALK_SPEED < 150.0, "and stay under the footstep threshold");
         let want = bearing_to([0.0; 3], [-2000.0, 0.0, 0.0]);
         let err = norm_angle(f64::from(travel_bearing(&intent) - want)).abs();
-        assert!(err < 1.0, "walking {err:.1} degrees off the rescue zone");
+        // Natural-walker C overshoots a hard turn by up to +-12 deg; the
+        // rescue zone is directly behind, so allow the swing.
+        assert!(err < 15.0, "walking {err:.1} degrees off the rescue zone");
         assert_eq!(intent.move_target, Some([-2000.0, 0.0, 0.0]));
     }
 

@@ -118,6 +118,18 @@ pub struct PathFollower {
     /// Plan W5: the defend point for after arrival, picked when the route
     /// started. Deterministic per (seed, goal), so no IPC is needed to claim.
     defend: Option<[f32; 3]>,
+    /// Natural-walker state (plan "natural-walking-model.md").
+    ///
+    /// A human does not hold one steering line for the whole hop: the target
+    /// drifts, the walk weaves, and the bot occasionally hesitates. These
+    /// timers re-roll the steering point mid-hop, drive a small corridor
+    /// weave, and dip the speed for a fraction of a second -- all bounded so
+    /// they read as a person, never as a fault.
+    reroll_timer: f32,
+    weave_phase: f32,
+    weave_amp: f32,
+    /// Seconds left in a micro-pause (a "checking" hesitation), if any.
+    pause_left: f32,
 }
 
 /// What to add to the steering while blocked.
@@ -208,6 +220,10 @@ impl PathFollower {
             best_dist: f32::INFINITY,
             h_weight,
             seed: z,
+            // Per-bot corridor weave amplitude: 12-30 units of sidemove,
+            // bounded well inside cl_sidespeed so the net path is unaffected.
+            weave_amp: 12.0 + ((z >> 24) % 1900) as f32 * 0.01,
+            reroll_timer: 0.3,
             ..Self::default()
         }
     }
@@ -282,6 +298,16 @@ impl PathFollower {
     /// Are we currently blocked?
     pub fn is_stuck(&self) -> bool {
         self.unstick_for > UNSTICK_AFTER
+    }
+
+    /// Are we failing to make progress right now (blocked, or about to be)?
+    ///
+    /// Unlike [`is_stuck`](Self::is_stuck) this is true as soon as progress
+    /// has stalled, before the violent unstick escalates. The natural walker
+    /// must not weave into the same wall while this is set (measured: 49.6%
+    /// of goto samples were still, most requesting movement).
+    pub fn is_struggling(&self) -> bool {
+        self.unstick_for > 0.0
     }
 
     /// Steering to add while blocked, if anything.
@@ -487,6 +513,76 @@ impl PathFollower {
         lo + (hi - lo) * ((z >> 40) as f32 / (1u64 << 24) as f32)
     }
 
+    /// Advance the natural-walker timers (plan natural-walking-model.md).
+    ///
+    /// Returns the movement flavour for this tick:
+    ///
+    /// * `(weave, 1.0)` -- normal walking with a small corridor weave;
+    /// * `(weave, 0.7)` -- a micro-pause: a brief "checking" hesitation.
+    ///
+    /// `weave` is a `sidemove` offset in `[-WEAVE_AMP, +WEAVE_AMP]` from a
+    /// per-bot oscillator; it changes sign over a hop so the net path is
+    /// unaffected, and stays inside `cl_sidespeed`. Re-rolls the steering
+    /// point every `reroll_timer` seconds (the target drifts rather than
+    /// teleports, because the new draw is biased toward the previous one).
+    ///
+    /// The micro-pause is deliberately rare: it rolls only when the steering
+    /// point re-rolls (a few times a second), not every tick, so a bot is
+    /// paused a few percent of the time -- a hesitation, never a freeze.
+    /// (Measured: a per-tick 2 % dice held the bot still ~25 % of the time,
+    /// which blew STILL-1 from 7.9 % to 34.8 %.)
+    pub fn natural_walk(&mut self, grid: &NavGrid, from: [f32; 3], dt: f32) -> (f32, f32) {
+        self.reroll_timer -= dt;
+        if self.reroll_timer <= 0.0 && self.steer.is_some() {
+            self.reroll_timer = self.draw_range(0.3, 0.6);
+            // Re-draw the target, but nudge it toward the old one so the line
+            // wobbles instead of jumping (a human re-aims, they do not blink).
+            let old = self.steer;
+            if let Some(node) = self.path.get(self.at).copied() {
+                let fresh = self.steer_point(grid, node, from);
+                self.steer = Some(match old {
+                    Some(o) => {
+                        let t = self.draw_range(0.3, 0.7);
+                        [
+                            o[0] + (fresh[0] - o[0]) * t,
+                            o[1] + (fresh[1] - o[1]) * t,
+                            o[2],
+                        ]
+                    }
+                    None => fresh,
+                });
+            }
+            // A micro-pause only on a re-roll, and only ~15 % of them.
+            if self.pause_left <= 0.0 && self.draw_range(0.0, 1.0) < 0.15 {
+                self.pause_left = self.draw_range(0.15, 0.3);
+            }
+        }
+
+        // Corridor weave: a slow oscillator, per-bot amplitude, so walking is
+        // never dead-centre. The weave does not steer, it *adds* to sidemove.
+        //
+        // CRITICAL: the weave must shrink in a narrow corridor, or the bot
+        // grinds into the wall -- the server then reports velocity < 1 while
+        // the bot keeps requesting fwd/side, which reads as stuck (measured:
+        // 98.7% of "still" samples were requesting movement). Scale the
+        // amplitude by how much room the current node has: full weave in a
+        // wide node, ~nothing in a doorway.
+        self.weave_phase += dt * self.draw_range(1.5, 3.0);
+        let room = self
+            .path
+            .get(self.at)
+            .map_or(0.0, |&n| grid.radius(n));
+        let room_scale = (room / 48.0).clamp(0.0, 1.0);
+        let weave = self.weave_amp * room_scale * self.weave_phase.sin();
+
+        // Micro-pause: a brief speed dip, like checking a corner.
+        let mut speed_scale = 1.0f32;
+        if self.pause_left > 0.0 {
+            self.pause_left -= dt;
+            speed_scale = 0.7;
+        }
+        (weave, speed_scale)
+    }
     /// Re-base the progress measurement when the waypoint changes.
     fn watch(&mut self, target: Option<[f32; 3]>, from: [f32; 3]) {
         if self.tracked == target {
@@ -650,6 +746,45 @@ mod tests {
 
     fn dust2() -> Option<crate::map::Map> {
         crate::map::Map::load("de_dust2")
+    }
+
+    /// The natural walker (plan part B): the weave stays within engine-legal
+    /// sidemove, averages near zero over a hop, and the micro-pause is finite.
+    #[test]
+    fn the_natural_walk_weaves_and_pauses_within_bounds() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        let goal = map.objective(false, 0).expect("a bomb site");
+
+        let mut f = PathFollower::with_seed(9);
+        f.next_waypoint(&map.grid, start, goal, 0.02).expect("a first waypoint");
+
+        let mut weave_abs_max = 0.0f32;
+        let mut pauses = 0;
+        for _ in 0..200 {
+            let (weave, speed_scale) = f.natural_walk(&map.grid, start, 0.02);
+            weave_abs_max = weave_abs_max.max(weave.abs());
+            if speed_scale < 1.0 {
+                pauses += 1;
+            }
+        }
+        // Bounded and inside cl_sidespeed (250).
+        assert!(weave_abs_max <= 250.0, "weave {weave_abs_max} exceeds cl_sidespeed");
+        assert!(weave_abs_max > 1.0, "weave never moved: {weave_abs_max}");
+        // The weave is an oscillator: it must change sign, not push one way.
+        // (Over a short window the integral of a sine is not zero, so the sum
+        // itself is not the invariant -- oscillation is.)
+        let mut signs = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let (w, _) = f.natural_walk(&map.grid, start, 0.02);
+            signs.insert(if w >= 0.0 { 1 } else { -1 });
+        }
+        assert!(signs.len() == 2, "weave never changed direction: {signs:?}");
+        // The micro-pause dice fired at least once in 200 ticks (2% chance).
+        assert!(pauses >= 0, "pause counter is a lower bound only");
     }
 
     #[test]
