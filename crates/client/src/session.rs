@@ -155,6 +155,13 @@ pub struct Session {
     last_speed: f32,
     /// What the brain decided last frame, for diagnostics.
     pub last_decision: Option<Decision>,
+    /// Seconds since the last freeze period ended (round start grace).
+    ///
+    /// Bots spawn in a crowd and box each other in for the first moments of a
+    /// round. During this grace the natural walker (weave / micro-pause) is
+    /// suppressed so the follower's unstick can find a gap cleanly instead of
+    /// the weave grinding into a teammate.
+    pub post_freeze_grace: f32,
     last_think: Option<Instant>,
     /// Which round we last bought in, so a buy happens once per spawn rather
     /// than every frame we happen to be standing in the zone.
@@ -264,6 +271,7 @@ impl Session {
             last_origin: None,
             last_speed: 0.0,
             last_decision: None,
+            post_freeze_grace: 0.0,
             last_think: None,
             bought_at_reset: None,
             deployed_at_reset: None,
@@ -1421,8 +1429,15 @@ impl Session {
         // rungs; combat/camp/defuse pass defaults. Suppressed entirely while
         // the follower is struggling -- a weave pushing into the same wall is
         // how a stuck bot stays stuck (measured: 49.6% of goto samples were
-        // still with vel < 1, most requesting movement).
-        let struggling = self.follower.is_struggling();
+        // still with vel < 1, most requesting movement). Also suppressed for
+        // the first 2 s after a freeze (round-start crowd: bots box each other
+        // in; the weave would grind into a teammate).
+        if world.me.freeze_period {
+            self.post_freeze_grace = 2.0;
+        } else {
+            self.post_freeze_grace = (self.post_freeze_grace - dt).max(0.0);
+        }
+        let struggling = self.follower.is_struggling() || self.post_freeze_grace > 0.0;
         let (weave, speed_scale) = match (self.map.as_ref(), site) {
             (Some(m), Some(_)) if !struggling => {
                 self.follower.natural_walk(&m.grid, world.me.origin, dt)
@@ -1463,7 +1478,36 @@ impl Session {
             self.follower.hold();
         } else if let Some(u) = self.follower.unstick() {
             if intent.forwardmove != 0.0 || intent.sidemove != 0.0 {
-                intent.sidemove = u.sidemove;
+                // Crowd-unstick (round-start T-spawn pile-up): the follower
+                // alternates a fixed side, but in a spawn crowd that side may
+                // be a TEAMMATE. If the current unstick side is blocked by a
+                // same-team player within 60u, push the other way instead --
+                // the goal is to find a gap, not to grind into a friend.
+                let me = world.me.origin;
+                let dir = u.sidemove.signum();
+                let mut side_blocked = false;
+                for p in &world.players {
+                    if p.team == world.me.team && p.alive {
+                        let dx = p.origin[0] - me[0];
+                        let dy = p.origin[1] - me[1];
+                        let d = (dx * dx + dy * dy).sqrt();
+                        if d < 60.0 {
+                            // Is the teammate on the side we are pushing?
+                            // World-space: the view's RIGHT vector for yaw is
+                            // `(sin yaw, -cos yaw)` (same basis `move_axes`
+                            // decomposes against). Project the teammate offset
+                            // onto it.
+                            let yaw = f64::from(intent.view.yaw).to_radians();
+                            let (sy, cy) = yaw.sin_cos();
+                            let right_dot =
+                                dx * sy as f32 - dy * cy as f32;
+                            if right_dot * dir > 0.0 {
+                                side_blocked = true;
+                            }
+                        }
+                    }
+                }
+                intent.sidemove = if side_blocked { -u.sidemove } else { u.sidemove };
                 intent.jump |= u.jump;
                 intent.view.yaw =
                     bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
