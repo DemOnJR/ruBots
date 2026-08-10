@@ -22,6 +22,7 @@ pub mod session;
 pub mod signon;
 pub mod stream;
 pub mod svc;
+pub mod telemetry;
 
 pub use control::{intent_to_usercmd, MoveSender};
 pub use messages::{Reader, ServerInfo};

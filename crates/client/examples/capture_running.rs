@@ -15,9 +15,80 @@
 use std::env;
 use std::fs::File;
 use std::io::Write;
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
+use client::telemetry::{BotTelemetry, DEFAULT_PORT, PACKET_LEN};
 use client::{Identity, Session, Transport};
+
+/// Broadcasts this bot's position to the debug radar (plan
+/// `debug-gui-radar.md`), when `AIPLAYERS_TELEMETRY_PORT` is set.
+///
+/// A UDP packet every 0.5 s to loopback:27016. The GUI aggregates per-name;
+/// the bots themselves never read it, so 30 processes cannot interfere.
+struct TelemetrySender {
+    sock: UdpSocket,
+    dest: std::net::SocketAddr,
+    name: [u8; 16],
+    map: [u8; 32],
+    team: u8,
+    last: Instant,
+}
+
+impl TelemetrySender {
+    fn from_env() -> Option<Self> {
+        let port: u16 = env::var("AIPLAYERS_TELEMETRY_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PORT);
+        let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.set_nonblocking(true).ok()?;
+        let dest = format!("127.0.0.1:{port}").parse().ok()?;
+        let mut name = [0u8; 16];
+        let n = env::var("AIPLAYERS_NAME").unwrap_or_else(|_| "AIPlayer".into());
+        name[..n.len().min(16)].copy_from_slice(&n.as_bytes()[..n.len().min(16)]);
+        let mut map = [0u8; 32];
+        let m = env::var("AIPLAYERS_MAP").unwrap_or_else(|_| "de_dust2".into());
+        map[..m.len().min(32)].copy_from_slice(&m.as_bytes()[..m.len().min(32)]);
+        let team: u8 = env::var("AIPLAYERS_TEAM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        Some(Self { sock, dest, name, map, team, last: Instant::now() })
+    }
+
+    /// Send the current state if 0.5 s have elapsed since the last packet.
+    fn maybe_send(&mut self, cd: &client::world::ClientData, dec: &client::session::Decision) {
+        if self.last.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last = Instant::now();
+        let p = BotTelemetry {
+            name: self.name,
+            map: self.map,
+            origin: cd.origin(),
+            yaw: dec.yaw,
+            team: self.team,
+            alive: cd.alive(),
+            rung: {
+                let mut r = [0u8; 16];
+                let b = dec.rung.as_bytes();
+                r[..b.len().min(16)].copy_from_slice(&b[..b.len().min(16)]);
+                r
+            },
+            vel: cd.speed(),
+            fwd: dec.forwardmove,
+            side: dec.sidemove,
+            waypoints_left: dec.waypoints_left.min(u16::MAX as usize) as u16,
+            node: dec.node.map_or(-1, |n| n as i32),
+            stuck: dec.stuck,
+            to_goal: dec.to_goal,
+            t: self.last.elapsed().as_secs_f32(),
+        };
+        let buf: [u8; PACKET_LEN] = p.encode();
+        let _ = self.sock.send_to(&buf, self.dest);
+    }
+}
 
 /// Wraps a transport and records every datagram sent, so our own wire bytes
 /// can be diffed against a real client's capture.
@@ -197,6 +268,17 @@ fn main() {
             m.name, m.grid.len(), m.info.bomb_sites.len(), m.info.rescue_zones.len()
         ),
         None => eprintln!("  no map loaded -- the bot will not path"),
+    }
+    // Debug radar telemetry (plan `debug-gui-radar.md`): broadcast position
+    // every 0.5 s when AIPLAYERS_TELEMETRY_PORT is set. The map name for the
+    // packet comes from the loaded map so the GUI picks the right radar.
+    let mut telemetry = TelemetrySender::from_env();
+    if let (Some(t), Some(m)) = (telemetry.as_mut(), session.map.as_ref()) {
+        let b = m.name.as_bytes();
+        t.map[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+    }
+    if telemetry.is_some() {
+        eprintln!("  telemetry broadcasting on AIPLAYERS_TELEMETRY_PORT");
     }
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
@@ -393,6 +475,10 @@ fn main() {
                         dec.escort, dec.hostages, dec.hostages_led, dec.to_hostage,
                         dec.use_edges,
                     );
+                    // Debug radar: broadcast every 0.5 s.
+                    if let Some(t) = telemetry.as_mut() {
+                        t.maybe_send(cd, &dec);
+                    }
                 }
                 // A one-shot marker so a scenario script can wait for the bomb
                 // without touching the server. Polling the log for it is

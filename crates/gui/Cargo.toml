@@ -1,0 +1,9 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+client = { path = "../client" }
+nav = { path = "../nav" }
+eframe = "0.27"

@@ -37,6 +37,11 @@ for ($i = 1; $i -le $N; $i++) {
     $env:AIPLAYERS_NAME = $name
     $env:AIPLAYERS_KEY = $key
     $env:AIPLAYERS_TEAM = [string]$team
+    # Debug radar (plan debug-gui-radar.md): broadcast position to the GUI.
+    # Set to 0 to disable; the GUI listens on 27016.
+    if (-not $env:AIPLAYERS_TELEMETRY_PORT) {
+        $env:AIPLAYERS_TELEMETRY_PORT = "27016"
+    }
     # Start-Process redirects stderr (the telemetry) to the log file at spawn,
     # so it streams while the bot runs. stdout (quiet) goes nowhere useful.
     $p = Start-Process -FilePath $Exe -ArgumentList @($Addr, "$life", "`"$outFile`"") `
