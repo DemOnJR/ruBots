@@ -1392,12 +1392,22 @@ impl Session {
             .and_then(|b| b.nav_goal.or(b.objective.target))
             .or(self.site);
         let site = match (self.map.take(), route_goal) {
-            (Some(m), Some(goal)) => {
+            (Some(m), Some(goal)) if world.me.alive => {
                 let w = self
                     .follower
                     .next_waypoint(&m.grid, world.me.origin, goal, dt);
                 self.map = Some(m);
                 w
+            }
+            // Dead: no body to move, so no route to follow. Calling
+            // next_waypoint on a dead bot measures "no progress toward the
+            // waypoint" forever and re-plans every STUCK_SECONDS -- a dead bot
+            // on bot5 hit 164 reroutes in one match, all of them meaning
+            // nothing. Hold the last target instead.
+            (Some(m), Some(goal)) => {
+                self.map = Some(m);
+                self.follower.hold();
+                Some(goal)
             }
             (m, _) => {
                 self.map = m;
@@ -1508,6 +1518,16 @@ impl Session {
                     }
                 }
                 intent.sidemove = if side_blocked { -u.sidemove } else { u.sidemove };
+                // Never BACK UP while stuck: a human stuck at a door strafes
+                // sideways, they do not reverse into their own spawn. The
+                // unstick's yaw_bias swings the view, and the brain's travel
+                // then reads delta > TURN_STOP_ANGLE and emits negative
+                // forwardmove -- measured: `fwd -19 side -62 yaw -166`, a bot
+                // backing away from a doorway it was walking into. Zero the
+                // forward axis so the push is pure sideways.
+                if u.yaw_bias.abs() > 0.0 {
+                    intent.forwardmove = 0.0;
+                }
                 intent.jump |= u.jump;
                 intent.view.yaw =
                     bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;

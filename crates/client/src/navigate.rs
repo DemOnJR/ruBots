@@ -531,28 +531,22 @@ impl PathFollower {
     /// paused a few percent of the time -- a hesitation, never a freeze.
     /// (Measured: a per-tick 2 % dice held the bot still ~25 % of the time,
     /// which blew STILL-1 from 7.9 % to 34.8 %.)
-    pub fn natural_walk(&mut self, grid: &NavGrid, from: [f32; 3], dt: f32) -> (f32, f32) {
+    pub fn natural_walk(&mut self, grid: &NavGrid, _from: [f32; 3], dt: f32) -> (f32, f32) {
+        // NOTE: the steering point is deliberately NOT re-rolled mid-hop.
+        // The follower measures "no progress" against the exact point being
+        // steered at (next_waypoint -> watch -> best_dist), so moving that
+        // point every 0.3-0.6 s made the measured distance bounce a few units
+        // and fired false reroutes -- a bot walking at fwd 212 with visible
+        // progress re-planned every ~10 s (measured: 20-160 reroutes per bot
+        // in one match, nearly all of them meaningless). The per-bot steering
+        // point is already re-drawn on every node advance (steer_point), which
+        // gives the "new line each corner" feel without fighting the progress
+        // tracker. The weave below supplies the mid-hop human wobble instead.
+        //
+        // A micro-pause still rolls on its own timer.
         self.reroll_timer -= dt;
-        if self.reroll_timer <= 0.0 && self.steer.is_some() {
+        if self.reroll_timer <= 0.0 {
             self.reroll_timer = self.draw_range(0.3, 0.6);
-            // Re-draw the target, but nudge it toward the old one so the line
-            // wobbles instead of jumping (a human re-aims, they do not blink).
-            let old = self.steer;
-            if let Some(node) = self.path.get(self.at).copied() {
-                let fresh = self.steer_point(grid, node, from);
-                self.steer = Some(match old {
-                    Some(o) => {
-                        let t = self.draw_range(0.3, 0.7);
-                        [
-                            o[0] + (fresh[0] - o[0]) * t,
-                            o[1] + (fresh[1] - o[1]) * t,
-                            o[2],
-                        ]
-                    }
-                    None => fresh,
-                });
-            }
-            // A micro-pause only on a re-roll, and only ~15 % of them.
             if self.pause_left <= 0.0 && self.draw_range(0.0, 1.0) < 0.15 {
                 self.pause_left = self.draw_range(0.15, 0.3);
             }

@@ -1190,16 +1190,29 @@ impl Controller {
                 }
                 self.rung = "roam";
                 let view = self.wire_view(world);
-                let (forwardmove, sidemove) = self.travel(
-                    view,
-                    world.me.origin,
-                    self.roam_target,
-                    WALK_SPEED,
-                    200.0,
-                    nav.weave,
-                    nav.speed_scale,
-                    dt,
-                );
+                // Never back up to a roam point either (same tell as camp):
+                // if the target is behind the view, just turn -- the view
+                // leads, the walk resumes. Measured: `fwd -37 yaw -13` while
+                // roaming with site None.
+                let delta = norm_angle(
+                    f64::from(aim_angles(world.me.origin, self.roam_target).yaw)
+                        - f64::from(view.yaw),
+                )
+                .abs();
+                let (forwardmove, sidemove) = if delta > TURN_STOP_ANGLE {
+                    (0.0, 0.0)
+                } else {
+                    self.travel(
+                        view,
+                        world.me.origin,
+                        self.roam_target,
+                        WALK_SPEED,
+                        200.0,
+                        nav.weave,
+                        nav.speed_scale,
+                        dt,
+                    )
+                };
                 return Intent {
                     view,
                     forwardmove,
