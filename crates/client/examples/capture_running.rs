@@ -1,0 +1,844 @@
+//! Connect to a live server, reach the signon, then record the running-phase
+//! message stream to a file for offline analysis.
+//!
+//! This exists because the entity-update bit formats cannot be read reliably
+//! out of the disassembly (the BitReader calls are inlined) — the only sound
+//! way to get them is to look at what a real server actually sends.
+//!
+//! ```text
+//! cargo run -p client --example capture_running -- [addr] [seconds] [out]
+//! ```
+//!
+//! Output format: repeated `u32 length` + `length` bytes, each record being one
+//! fully-assembled, decompressed `svc_*` message stream.
+
+use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::net::UdpSocket;
+use std::time::{Duration, Instant};
+
+use client::telemetry::{
+    decode_site, site_code, BotTelemetry, TeamBus, TeamTelemetry, DEFAULT_PORT, PACKET_LEN,
+};
+use client::{Identity, Session, Transport};
+
+/// Broadcasts this bot's position to the debug radar (plan
+/// `debug-gui-radar.md`), when `AIPLAYERS_TELEMETRY_PORT` is set.
+///
+/// A UDP packet every 0.5 s to loopback:27016. The GUI aggregates per-name;
+/// the bots themselves never read it, so 30 processes cannot interfere.
+struct TelemetrySender {
+    sock: UdpSocket,
+    dest: std::net::SocketAddr,
+    name: [u8; 16],
+    map: [u8; 32],
+    team: u8,
+    last: Instant,
+}
+
+fn rub_env(key: &str) -> Result<String, env::VarError> {
+    env::var(format!("RUB_{key}"))
+        .or_else(|_| env::var(format!("RUBOTS_{key}")))
+        .or_else(|_| env::var(format!("REB_{key}")))
+        .or_else(|_| env::var(format!("REBOTS_{key}")))
+        .or_else(|_| env::var(format!("AIPLAYERS_{key}")))
+}
+
+impl TelemetrySender {
+    fn from_env() -> Option<Self> {
+        let port: u16 = rub_env("TELEMETRY_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PORT);
+        let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.set_nonblocking(true).ok()?;
+        let dest = format!("127.0.0.1:{port}").parse().ok()?;
+        let mut name = [0u8; 16];
+        let n = rub_env("NAME").unwrap_or_else(|_| "ruBot".into());
+        name[..n.len().min(16)].copy_from_slice(&n.as_bytes()[..n.len().min(16)]);
+        let mut map = [0u8; 32];
+        let m = rub_env("MAP").unwrap_or_else(|_| "de_dust2".into());
+        map[..m.len().min(32)].copy_from_slice(&m.as_bytes()[..m.len().min(32)]);
+        let team: u8 = rub_env("TEAM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        Some(Self {
+            sock,
+            dest,
+            name,
+            map,
+            team,
+            last: Instant::now(),
+        })
+    }
+
+    /// Send the current state if 0.5 s have elapsed since the last packet.
+    fn maybe_send(&mut self, cd: &client::world::ClientData, dec: &client::session::Decision) {
+        if self.last.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last = Instant::now();
+        let p = BotTelemetry {
+            name: self.name,
+            map: self.map,
+            origin: cd.origin(),
+            yaw: dec.yaw,
+            team: self.team,
+            alive: cd.alive(),
+            rung: {
+                let mut r = [0u8; 16];
+                let b = dec.rung.as_bytes();
+                r[..b.len().min(16)].copy_from_slice(&b[..b.len().min(16)]);
+                r
+            },
+            vel: cd.speed(),
+            fwd: dec.forwardmove,
+            side: dec.sidemove,
+            waypoints_left: dec.waypoints_left.min(u16::MAX as usize) as u16,
+            node: dec.node.map_or(-1, |n| n as i32),
+            stuck: dec.stuck,
+            to_goal: dec.to_goal,
+            t: self.last.elapsed().as_secs_f32(),
+        };
+        let buf: [u8; PACKET_LEN] = p.encode();
+        let _ = self.sock.send_to(&buf, self.dest);
+    }
+}
+
+/// Wraps a transport and records every datagram sent, so our own wire bytes
+/// can be diffed against a real client's capture.
+struct Logged<T: Transport> {
+    inner: T,
+    log: File,
+}
+
+impl<T: Transport> Transport for Logged<T> {
+    fn send(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.log.write_all(&(data.len() as u32).to_le_bytes())?;
+        self.log.write_all(data)?;
+        self.inner.send(data)
+    }
+    fn recv(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.recv()
+    }
+}
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:27015".into());
+    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let out_path = args.next().unwrap_or_else(|| "running.bin".into());
+
+    let inner = match client::UdpTransport::connect(addr.parse().expect("addr"), None) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("connect failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let sent_path = format!("{out_path}.sent");
+    let mut t = Logged {
+        inner,
+        log: File::create(&sent_path).expect("sent log"),
+    };
+    eprintln!("logging our outgoing packets to {sent_path}");
+
+    // Distinct name AND key per bot: Reunion's IDClientsLimit is 1, so two
+    // bots sharing a CD key are one identity and the second is refused.
+    let name = rub_env("NAME").unwrap_or_else(|_| "ruBot".into());
+
+    let key = rub_env("KEY").unwrap_or_else(|_| "RUBBOT000000000".into());
+
+    // Every bot used to be constructed with a literal seed and a literal
+    // difficulty, so thirty processes computed the same function of (map, team)
+    // and produced thirty copies of one answer walking in a line. Human variance
+    // is DIFFERENT INPUTS per bot, not noise sprinkled on a shared output.
+    //
+    // Defaults to a hash of the RevEmu key, which is already unique per bot, so
+    // the swarm gets a spread without having to pass anything extra -- and the
+    // same bot keeps the same personality across runs, which makes a
+    // reproduction reproducible.
+    let seed: usize = rub_env("SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            key.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3u64)
+            }) as usize
+        });
+    let difficulty = match rub_env("DIFFICULTY").as_deref() {
+        Ok("easy") => bot::Difficulty::Easy,
+        Ok("normal") => bot::Difficulty::Normal,
+        Ok("hard") => bot::Difficulty::Hard,
+        Ok("unfair") => bot::Difficulty::Unfair,
+        // A fleet of identically-skilled bots is itself a tell.
+        _ => match seed % 3 {
+            0 => bot::Difficulty::Easy,
+            1 => bot::Difficulty::Normal,
+            _ => bot::Difficulty::Hard,
+        },
+    };
+    eprintln!("  seed {seed} difficulty {difficulty:?}");
+    let mut session = Session::new(Identity {
+        name: name.clone(),
+        key: key.into_bytes(),
+        ..Default::default()
+    });
+    session.record_all = true;
+    match session.connect_and_signon(&mut t, Duration::from_secs(15)) {
+        Ok(signon) => eprintln!(
+            "signon reached: {} delta tables, map {}",
+            signon.registry.len(),
+            signon
+                .server_info
+                .as_ref()
+                .map(|si| si.map_name().to_string())
+                .unwrap_or_default()
+        ),
+        Err(e) => {
+            eprintln!("signon failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // The exact post-signon command sequence a real CS 1.6 client sends,
+    // recovered by decoding a genuine client's session. Note there is NO
+    // `spawn` and NO `begin` - protocol 48 does not use them.
+    // The real client asks for the resource list FIRST (~0.3s after `new`),
+    // then answers the allow_* stufftexts, and only reaches `sendents` ~1.4s
+    // later after uploading its consistency data.
+    // Clean entry sequence, with nothing queued ahead of it: a stuck reliable
+    // would block `sendents`, and `sendents` is the one command that makes the
+    // server consider us fully connected.
+    session.send_command(Session::SENDRES);
+    let res_until = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < res_until {
+        let _ = session.pump_idle(&mut t);
+    }
+
+    eprintln!("  uploading clc_resourcelist (fragmented)");
+    session.upload_resource_list();
+    let up_until = Instant::now() + Duration::from_millis(1000);
+    while Instant::now() < up_until {
+        let _ = session.pump_idle(&mut t);
+    }
+
+    let spawncount: u32 = rub_env("SPAWNCOUNT")
+        .ok()
+        .and_then(|v: String| v.parse().ok())
+        .or_else(|| session.resource_message.as_ref().map(|r| r.spawncount))
+        .or_else(|| {
+            session
+                .recorded
+                .iter()
+                .find_map(|m| Session::spawncount_from(m))
+        })
+        .unwrap_or(1);
+    match session.resource_message.as_ref() {
+        Some(rm) => {
+            eprintln!(
+                "  resource message: {} resources, spawncount {}, consistency {} ({} demands)",
+                rm.resources.len(),
+                rm.spawncount,
+                if rm.consistency.should_send {
+                    "REQUESTED"
+                } else {
+                    "not requested"
+                },
+                rm.consistency.indices.len(),
+            );
+            if rm.consistency.should_send {
+                let demands =
+                    proto::consistency::demands(&rm.resources, &rm.consistency, rm.spawncount);
+                let exact = demands
+                    .iter()
+                    .filter(|d| matches!(d, proto::consistency::Demand::ExactFile { .. }))
+                    .count();
+                eprintln!(
+                    "     {} bounds (answerable from the wire), {exact} exact-file (need local content)",
+                    demands.len() - exact,
+                );
+                for d in demands
+                    .iter()
+                    .filter(|d| matches!(d, proto::consistency::Demand::ExactFile { .. }))
+                    .take(12)
+                {
+                    eprintln!("       exact-file: {}", d.path());
+                }
+            }
+        }
+        None => eprintln!("  !!! no svc_resourcerequest seen -- sendres was not answered"),
+    }
+    if let Some(crc) = session.world_map_crc() {
+        // Cross-check this against the server's own log line:
+        //   Started map "<name>" (CRC "<n>")
+        eprintln!(
+            "  server map CRC: {crc}   (spawn argument: {})",
+            session.spawn_crc(spawncount)
+        );
+    }
+    session.start_decoding();
+    // Give the bot a brain unless we are capturing raw protocol.
+    if rub_env("NO_BRAIN").is_err() {
+        session.brain = Some(bot::Controller::new(seed as u64, difficulty));
+        eprintln!("  bot brain enabled");
+    }
+    session.set_seed(seed as u64);
+    session.load_map(seed);
+    match session.map.as_ref() {
+        Some(m) => eprintln!(
+            "  map {} loaded: {} nav nodes, {} bomb sites, {} rescue zones",
+            m.name,
+            m.grid.len(),
+            m.info.bomb_sites.len(),
+            m.info.rescue_zones.len()
+        ),
+        None => eprintln!("  no map loaded -- the bot will not path"),
+    }
+    // Debug radar telemetry (plan `debug-gui-radar.md`): broadcast position
+    // every 0.5 s when REB_TELEMETRY_PORT is set. The map name for the
+    // packet comes from the loaded map so the GUI picks the right radar.
+    let mut telemetry = TelemetrySender::from_env();
+    let mut team_bus = match TeamBus::from_env() {
+        Ok(bus) => bus,
+        Err(error) => {
+            eprintln!("  team bus disabled: {error}");
+            None
+        }
+    };
+    let bot_id = name
+        .strip_prefix("Bot")
+        .or_else(|| name.strip_prefix("ruBot"))
+        .or_else(|| name.strip_prefix("RUBBot"))
+        .or_else(|| name.strip_prefix("reBot"))
+        .or_else(|| name.strip_prefix("REBBot"))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    session.set_team_bot_id(bot_id);
+    if let (Some(t), Some(m)) = (telemetry.as_mut(), session.map.as_ref()) {
+        let b = m.name.as_bytes();
+        t.map[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+    }
+    if telemetry.is_some() {
+        eprintln!("  telemetry broadcasting on RUB_TELEMETRY_PORT");
+    }
+    if team_bus.is_some() {
+        eprintln!("  G0 team bus enabled on RUB_TEAM_PORT");
+    }
+    eprintln!("  entering game: spawn {spawncount} then sendents ...");
+    match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
+        Ok(true) => eprintln!("  *** SERVER IS STREAMING - we are fully connected ***"),
+        Ok(false) => eprintln!("  !!! server never started streaming"),
+        Err(e) => eprintln!("  enter_game error: {e}"),
+    }
+
+    if rub_env("NO_JOIN").is_ok() {
+        eprintln!("  BISECT: fully connected, sending nothing but moves");
+    } else {
+        // Let the entry burst drain before adding the join burst on top of it.
+        // The server copies the WHOLE of `netchan.message` into `reliable_buf`
+        // in one go and only when the previous reliable was acknowledged, so
+        // anything the game queues meanwhile piles up in that one buffer. A
+        // real client waits ~1.5 s between `sendents` (1.67 s) and `jointeam`
+        // (3.17 s); firing them back to back stacks two bursts and overflows.
+        let settle = Instant::now()
+            + Duration::from_millis(
+                rub_env("JOIN_DELAY_MS")
+                    .ok()
+                    .and_then(|v: String| v.parse().ok())
+                    .unwrap_or(2000),
+            );
+        while Instant::now() < settle {
+            let _ = session.pump_idle(&mut t);
+        }
+        eprintln!("  joining team, retrying until the server actually spawns us");
+        let team: u8 = rub_env("TEAM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Session::TEAM_TERRORIST);
+        match session.join_and_spawn(&mut t, team, Duration::from_secs(15)) {
+            Ok(true) => {
+                eprintln!("  *** TEAM ACCEPTED -- joined ***");
+                // Say our name again now that the edict is ours. If this slot
+                // was recycled from an earlier bot, the name in the connect
+                // userinfo was quietly reverted to that bot's by ReGameDLL --
+                // see Identity::setinfo_name_command for the whole chain.
+                session.reassert_name();
+                eprintln!("  re-asserted name {:?}", session.name());
+                session.refresh_objective(seed);
+                if let Some(site) = session.site {
+                    let role = session.role.map_or("none", |r| r.as_str());
+                    let plant = session
+                        .plant_spot
+                        .map(|p| format!("[{:.0} {:.0} {:.0}]", p[0], p[1], p[2]))
+                        .unwrap_or_else(|| "none".into());
+                    eprintln!(
+                        "  objective: [{:.0} {:.0} {:.0}]  role {role}  plant {plant}",
+                        site[0], site[1], site[2]
+                    );
+                }
+            }
+            Ok(false) => eprintln!("  !!! team was never accepted"),
+            Err(e) => eprintln!("  join error: {e}"),
+        }
+    }
+
+    let mut f = File::create(&out_path).expect("create output");
+    let mut records = 0usize;
+    let mut bytes = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut last_keep = Instant::now();
+
+    let mut settled_logged = false;
+    let mut announced_plant = false;
+    let start = Instant::now();
+    // Walk a square, turning every 3 s. Movement has to be *observable* to be
+    // verifiable, and `svc_clientdata` gives us the server's own opinion of
+    // where we ended up -- which is the only opinion that counts.
+    let mut first_origin: Option<[f32; 3]> = None;
+    let mut max_travel = 0.0f32;
+    let mut max_speed = 0.0f32;
+    let mut last_state = Instant::now();
+    while Instant::now() < deadline {
+        // Pump continuously: every pump both consumes what arrived and sends
+        // our acknowledgement, which is what keeps the server's reliable
+        // buffer draining.
+        // Send a real clc_move every tick, exactly as a playing client does.
+        let secs = start.elapsed().as_secs_f32();
+        let intent = bot::Intent {
+            view: bot::Angles {
+                pitch: 0.0,
+                // A slow constant yaw sweep also satisfies ReGameDLL's
+                // anti-idle check, which needs BOTH yaw and pitch to move by
+                // >= 0.1 degrees across a 5 s sample (CSPlayer.cpp:530-540).
+                yaw: (secs * 24.0) % 360.0,
+            },
+            forwardmove: 250.0,
+            ..Default::default()
+        };
+        // Manual drive: ignore the brain entirely and send a fixed command, to
+        // separate "the movement layer is broken" from "the bot decided not to
+        // move". Jumping is the sharpest probe -- a blocked player can still
+        // rise, so a changing Z proves usercmds are being applied.
+        if let Ok(mode) = env::var("AIPLAYERS_DRIVE") {
+            let t0 = start.elapsed().as_secs_f32();
+            let mut manual = bot::Intent::default();
+            manual.view = bot::Angles {
+                pitch: 0.0,
+                yaw: (t0 * 20.0) % 360.0,
+            };
+            match mode.as_str() {
+                "jump" => manual.jump = (t0 as u32) % 2 == 0,
+                "fwd" => manual.forwardmove = 250.0,
+                _ => {
+                    manual.forwardmove = 250.0;
+                    manual.jump = (t0 as u32) % 2 == 0;
+                }
+            }
+            session.brain = None;
+            let step = session.frame(&mut t, &manual);
+            if let Ok(msgs) = step {
+                for msg in msgs {
+                    f.write_all(&(msg.len() as u32).to_le_bytes()).unwrap();
+                    f.write_all(&msg).unwrap();
+                    records += 1;
+                    bytes += msg.len();
+                }
+            }
+            if let Some(cd) = session.clientdata.as_ref() {
+                let o = cd.origin();
+                let base = *first_origin.get_or_insert(o);
+                max_travel =
+                    max_travel.max(((o[0] - base[0]).powi(2) + (o[1] - base[1]).powi(2)).sqrt());
+                if last_state.elapsed() >= Duration::from_millis(700) {
+                    eprintln!(
+                        "  DRIVE t+{:>4.0}s origin [{:>6.0} {:>6.0} {:>6.1}] on_ground {} hp {:.0}",
+                        t0,
+                        o[0],
+                        o[1],
+                        o[2],
+                        cd.on_ground(),
+                        cd.health()
+                    );
+                    last_state = Instant::now();
+                }
+            }
+            continue;
+        }
+        let step = if env::var("AIPLAYERS_NO_MOVES").is_ok() {
+            session.pump(&mut t, &[netchan::clc::NOP])
+        } else {
+            // Real-time paced: `frame` blocks until the next command is due, so
+            // the msec we claim tracks the wall clock. Sending a fixed msec from
+            // a tight loop is what got every movement command discarded by
+            // ReHLDS's speedhack accounting.
+            session.frame(&mut t, &intent)
+        };
+        if let Some(cd) = session.clientdata.as_ref() {
+            let o = cd.origin();
+            let base = *first_origin.get_or_insert(o);
+            let d = ((o[0] - base[0]).powi(2) + (o[1] - base[1]).powi(2)).sqrt();
+            max_travel = max_travel.max(d);
+            max_speed = max_speed.max(cd.speed());
+            if last_state.elapsed() >= Duration::from_secs(2) {
+                eprintln!(
+                    "  t+{:>4.0}s origin [{:>6.0} {:>6.0} {:>5.0}] vel {:>5.0} hp {:>3.0} \
+                     maxspeed {:>4.0} alive {} weapons {}",
+                    secs,
+                    o[0],
+                    o[1],
+                    o[2],
+                    cd.speed(),
+                    cd.health(),
+                    cd.maxspeed(),
+                    cd.alive(),
+                    cd.weapons.len(),
+                );
+                eprintln!(
+                    "      phys: on_ground {} can_shoot {} frozen {} bombzone {} iuser3 {:#04x} flags {:#x}",
+                    cd.on_ground(), cd.can_shoot(), cd.freeze_period(),
+                    cd.in_bomb_zone(), cd.iuser3(), cd.flags(),
+                );
+                // The server tags a dead player's chat "(dead)" in the log
+                // (`util.cpp` Host_Say). That is a direct, one-bit answer to
+                // "is this bot actually alive?" -- unlike maxspeed or
+                // ResetHUD, both of which lie.
+                if std::env::var("AIPLAYERS_ALIVE_PROBE").is_ok() {
+                    session.console.say(format!("probe{}", (secs as u32) / 4));
+                }
+                let queued = session.console.len();
+                eprintln!(
+                    "      console: {queued} queued, {} sent, settled {} (in_flight {} netq {}), head {:?}",
+                    session.console.sent,
+                    session.reliables_settled(),
+                    session.chan.reliable_in_flight(),
+                    session.chan.queued_count(),
+                    session.console.peek(),
+                );
+                if let Some(dec) = session.last_decision {
+                    eprintln!(
+                        "      brain: alive {} frozen {} fwd {:.0} side {:.0} yaw {:.0} site {:?} wp {} node {} reroutes {} stuck {}",
+                        dec.alive, dec.in_game, dec.forwardmove, dec.sidemove, dec.yaw,
+                        dec.site.map(|s| [s[0] as i32, s[1] as i32]),
+                        dec.waypoints_left,
+                        dec.node.map_or(-1, |n| n as i64),
+                        dec.reroutes, dec.stuck,
+                    );
+                    eprintln!(
+                        "      obj: rung {:<10} role {:<8} bomb {} arming {} attack {} use {} to_goal {:.0} | planted {} at {:?} | rotate {} site {:?}",
+                        dec.rung, dec.role, dec.carrying_bomb, dec.arming, dec.attack, dec.use_action,
+                        dec.to_goal,
+                        dec.bomb_planted,
+                        dec.bomb_known_at.map(|b| [b[0] as i32, b[1] as i32]),
+                        dec.rotate_events,
+                        dec.rotate_site,
+                    );
+                    eprintln!(
+                        "      hostage: escort {:<9} seen {} led {} to_hostage {:.0} edges {}",
+                        dec.escort, dec.hostages, dec.hostages_led, dec.to_hostage, dec.use_edges,
+                    );
+                    // Debug radar: broadcast every 0.5 s.
+                    if let Some(t) = telemetry.as_mut() {
+                        t.maybe_send(cd, &dec);
+                    }
+                }
+                // A one-shot marker so a scenario script can wait for the bomb
+                // without touching the server. Polling the log for it is
+                // self-defeating: forcing a flush with `log off` ROTATES the
+                // file, so a plant recorded before the poll lands in a file the
+                // next poll no longer looks at.
+                if session
+                    .decoder
+                    .as_ref()
+                    .is_some_and(|d| d.game.bomb_planted)
+                    && !announced_plant
+                {
+                    announced_plant = true;
+                    eprintln!("*** BOMB PLANTED (as decoded by this client) ***");
+                }
+                if let Some(d) = session.decoder.as_ref() {
+                    eprintln!(
+                        "      game: team {:?} money ${} hp {} weapon {} clip {} buyzone {} round {}s resets {} queued {}",
+                        d.game.my_team(), d.game.money, d.game.health,
+                        d.game.weapon_id, d.game.weapon_clip, d.game.in_buy_zone,
+                        d.game.round_time, d.game.hud_resets, queued,
+                    );
+                    let players = d.players();
+                    eprintln!(
+                        "      world: {} entities, {} players | ok={} ents={} nocd={} tail={} errs={} stop={:?}",
+                        d.entities.len(), players.len(),
+                        d.stats.ok, d.stats.with_entities, d.stats.no_clientdata, d.stats.partial,
+                        d.stats.entity_errors, d.stats.last_stop,
+                    );
+                    if let Some(e) = d.stats.last_entity_error {
+                        eprintln!("      entity decode: {e}");
+                    }
+                    // Who we think is on which side, for every slot the server
+                    // has spoken about -- the whole roster, not the four
+                    // players that happen to be in the PVS. A friendly-fire
+                    // kill is a claim about this line, so it has to be in the
+                    // log to be checkable after the fact.
+                    let roster: Vec<String> = (1..=d.game.max_clients)
+                        .filter_map(|slot| d.game.player(slot).map(|p| (slot, p)))
+                        .filter(|(_, p)| p.seen || p.userid.is_some())
+                        .map(|(slot, p)| {
+                            format!(
+                                "{slot}:{}{}",
+                                match p.team {
+                                    client::usermsg::Team::Terrorist => "T",
+                                    client::usermsg::Team::CounterTerrorist => "CT",
+                                    client::usermsg::Team::Spectator => "SPEC",
+                                    client::usermsg::Team::Unassigned => "?",
+                                },
+                                if p.dead { "*" } else { "" },
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "      teams: [{}] | implausible {} ({}) occupants {}",
+                        roster.join(" "),
+                        d.game.implausible_team_updates,
+                        d.game
+                            .last_implausible_team_update
+                            .as_deref()
+                            .unwrap_or("-"),
+                        d.game.occupant_changes,
+                    );
+                    for p in players.iter().take(4) {
+                        eprintln!(
+                            "        player #{} {:?} at [{:.0} {:.0} {:.0}] yaw {:.0}{}",
+                            p.entity,
+                            p.team,
+                            p.origin[0],
+                            p.origin[1],
+                            p.origin[2],
+                            p.angles[1],
+                            if p.ducking { " (ducking)" } else { "" },
+                        );
+                    }
+                }
+                if std::env::var("AIPLAYERS_FIELDS").is_ok() {
+                    let mut k: Vec<&str> = cd.fields.keys().map(|s| s.as_str()).collect();
+                    k.sort_unstable();
+                    eprintln!("      fields({}): {}", k.len(), k.join(" "));
+                }
+                last_state = Instant::now();
+            }
+        }
+        if let Some(bus) = team_bus.as_ref() {
+            let mut wire_reports = Vec::new();
+            bus.poll(&mut wire_reports);
+            let reports: Vec<bot::TeamReport> = wire_reports
+                .into_iter()
+                .map(|report| bot::TeamReport {
+                    bot_id: report.bot_id,
+                    team: match report.team {
+                        1 => bot::Team::Terrorist,
+                        2 => bot::Team::CounterTerrorist,
+                        _ => bot::Team::Unassigned,
+                    },
+                    alive: report.alive,
+                    origin: report.origin,
+                    assigned_site: decode_site(report.assigned_site),
+                    contact_site: decode_site(report.contact_site),
+                    contact_at: (report.contact_at >= 0.0).then_some(report.contact_at),
+                    bomb_carrier: report.bomb_carrier,
+                    bomb_planted: report.bomb_planted,
+                    bomb_origin: report.bomb_origin,
+                    observed_at: report.observed_at,
+                    role: report.role,
+                    rung: report.rung,
+                })
+                .collect();
+            session.ingest_team_reports(&reports);
+        }
+        if let (Some(bus), Some(report)) = (team_bus.as_mut(), session.latest_team_report) {
+            bus.publish(TeamTelemetry {
+                bot_id: report.bot_id,
+                team: match report.team {
+                    bot::Team::Terrorist => 1,
+                    bot::Team::CounterTerrorist => 2,
+                    _ => 0,
+                },
+                alive: report.alive,
+                origin: report.origin,
+                assigned_site: site_code(report.assigned_site),
+                contact_site: site_code(report.contact_site),
+                contact_at: report.contact_at.unwrap_or(-1.0),
+                bomb_carrier: report.bomb_carrier,
+                bomb_planted: report.bomb_planted,
+                bomb_origin: report.bomb_origin,
+                observed_at: report.observed_at,
+                role: report.role,
+                rung: report.rung,
+            });
+        }
+        match step {
+            Ok(msgs) => {
+                for msg in msgs {
+                    f.write_all(&(msg.len() as u32).to_le_bytes()).unwrap();
+                    f.write_all(&msg).unwrap();
+                    records += 1;
+                    bytes += msg.len();
+                }
+            }
+            Err(e) => {
+                eprintln!("pump error: {e}");
+                break;
+            }
+        }
+        if !settled_logged && session.reliables_settled() {
+            eprintln!("all reliable commands acknowledged by the server");
+            settled_logged = true;
+        }
+        // Channel telemetry: is our acknowledgement actually advancing?
+        if std::env::var("AIPLAYERS_TRACE").is_ok()
+            && last_keep.elapsed() >= Duration::from_millis(500)
+        {
+            eprintln!(
+                "  t+{:>5}ms  in_seq={:<6} out_seq={:<6} in_rel={} out_rel={} \
+                 rel_inflight={} queued={} records={} stale={}
+            dgram={} split={}/{} frag={}/{} plain={} rejected={} resyncs={} LOST={}",
+                start.elapsed().as_millis(),
+                session.chan.incoming_sequence,
+                session.chan.outgoing_sequence,
+                session.chan.incoming_reliable,
+                session.chan.outgoing_reliable,
+                session.chan.reliable_in_flight(),
+                session.chan.queued_count(),
+                records,
+                session.chan.dropped_stale,
+                session.stats.datagrams,
+                session.stats.split_completed,
+                session.stats.split_seen,
+                session.stats.frag_completed,
+                session.stats.frag_seen,
+                session.stats.plain,
+                session.stats.read_rejected,
+                session.resyncs(),
+                session.chan.lost_packets,
+            );
+            last_keep = Instant::now();
+        }
+    }
+
+    // Exact decode of every message, using the registered user-message sizes.
+    let table = client::collect_user_messages(&session.recorded);
+    eprintln!("  user messages registered: {}", table.len());
+    let mut totals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut halted: std::collections::BTreeMap<u8, usize> = Default::default();
+    for msg in &session.recorded {
+        let w = client::walk_stream(msg, &table);
+        for it in &w.items {
+            if let client::Item::User { name, payload, .. } = it {
+                *totals.entry(name.clone()).or_default() += 1;
+                if matches!(
+                    name.as_str(),
+                    "TeamInfo" | "TextMsg" | "StatusIcon" | "CurWeapon" | "Money"
+                ) {
+                    let txt: String = payload
+                        .iter()
+                        .map(|&c| {
+                            if (32..127).contains(&c) {
+                                c as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    eprintln!("     {name}: {txt}");
+                }
+            }
+        }
+        if let Some(op) = w.stopped_on {
+            *halted.entry(op).or_default() += 1;
+        }
+    }
+    eprintln!("  ALL user messages decoded: {totals:?}");
+    eprintln!("  walks halted on opcode: {halted:?}");
+
+    // Report every svc_stufftext the server sent us, at any phase: these are
+    // commands a real client echoes straight back.
+    let mut stuff = Vec::new();
+    for msg in &session.recorded {
+        let mut i = 0usize;
+        while i < msg.len() {
+            if msg[i] == client::svc::SVC_STUFFTEXT {
+                if let Some(end) = msg[i + 1..].iter().position(|&b| b == 0) {
+                    let text = String::from_utf8_lossy(&msg[i + 1..i + 1 + end]).to_string();
+                    let printable = text
+                        .chars()
+                        .all(|c| c.is_ascii_graphic() || c == ' ' || c == '\n');
+                    if !text.is_empty() && printable {
+                        stuff.push(text);
+                    }
+                    i += 1 + end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    // What userinfo does the SERVER think we have? It echoes it back in
+    // svc_updateuserinfo; cl_updaterate there drives next_messageinterval.
+    for msg in &session.recorded {
+        if let Some(pos) = msg.windows(9).position(|w| w == b"updaterat") {
+            let start = pos.saturating_sub(80);
+            let end = (pos + 160).min(msg.len());
+            let txt: String = msg[start..end]
+                .iter()
+                .map(|&c| {
+                    if (32..127).contains(&c) {
+                        c as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            eprintln!("  SERVER-SIDE USERINFO: {txt}");
+            break;
+        }
+    }
+    eprintln!(
+        "recorded {} messages; stufftext candidates:",
+        session.recorded.len()
+    );
+    for t in stuff.iter().take(30) {
+        eprintln!("   STUFFTEXT {t:?}");
+    }
+
+    // The verdict. `svc_clientdata` is the server's own account of where we
+    // are, so this is not our client marking its own homework.
+    match session.clientdata.as_ref() {
+        Some(cd) => {
+            let o = cd.origin();
+            eprintln!(
+                "  SERVER-SIDE STATE: origin [{:.0} {:.0} {:.0}] health {:.0} maxspeed {:.0} alive {}",
+                o[0], o[1], o[2], cd.health(), cd.maxspeed(), cd.alive()
+            );
+            eprintln!("  MOVEMENT: travelled {max_travel:.0} units, peak speed {max_speed:.0} u/s");
+            if max_travel < 32.0 {
+                eprintln!(
+                    "  !!! the bot did not move -- commands are being discarded or it is dead"
+                );
+            }
+        }
+        None => eprintln!("  !!! no svc_clientdata decoded -- not receiving datagrams"),
+    }
+    eprintln!(
+        "wrote {records} message records, {bytes} bytes to {out_path} \
+         (reliables settled: {})",
+        session.reliables_settled()
+    );
+
+    // Say goodbye. Exiting without this leaves the slot `connected` for the
+    // whole sv_timeout (120 s), still holding our name and our edict -- and the
+    // next bot to connect from this address is treated as our reconnect and
+    // inherits that name. See Client::DISCONNECT_COMMAND.
+    match session.disconnect(&mut t, Duration::from_secs(2)) {
+        Ok(()) => eprintln!("disconnected cleanly (slot released)"),
+        Err(e) => eprintln!("disconnect failed: {e}"),
+    }
+}

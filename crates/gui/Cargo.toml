@@ -1,0 +1,10 @@
+[package]
+name = "gui"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+client = { path = "../client" }
+nav = { path = "../nav" }
+eframe = "0.27"

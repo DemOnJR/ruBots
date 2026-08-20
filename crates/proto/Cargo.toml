@@ -1,0 +1,8 @@
+[package]
+name = "proto"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+md-5 = "0.10"

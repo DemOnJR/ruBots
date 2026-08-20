@@ -1,0 +1,13 @@
+[package]
+name = "client"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+proto = { path = "../proto" }
+netchan = { path = "../netchan" }
+auth = { path = "../auth" }
+bot = { path = "../bot" }
+nav = { path = "../nav" }
+socket2 = "0.5"

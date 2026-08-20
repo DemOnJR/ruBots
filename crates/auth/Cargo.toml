@@ -1,0 +1,15 @@
+[package]
+name = "auth"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+md-5 = "0.10"
+
+[dev-dependencies]
+proto = { path = "../proto" }
+# Live tests only, and only to send one `clc_stringcmd "dropclient"` so a test
+# does not squat on a client slot for sv_timeout -- see `release_slot` in
+# tests/live_connect.rs.
+netchan = { path = "../netchan" }

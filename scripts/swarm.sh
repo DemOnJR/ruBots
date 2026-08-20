@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Launch N bots against the test server, half on each team.
+#
+# Runs the already-built example directly rather than through `cargo run`:
+# several `cargo` processes share one target directory and serialise on its
+# lock, so the second bot would not connect until the first exited.
+#
+# Each bot needs its OWN key. Reunion is configured with `IDClientsLimit = 1`,
+# so two connections presenting the same RevEmu key are one connection --- the
+# second kicks the first, which reads as "the bots keep dropping".
+#
+#   scripts/swarm.sh 10 180        # 10 bots, 5v5, for 180 seconds
+#   scripts/swarm.sh 2 120 27015   # a T and a CT, to watch them fight
+#
+# Logs land in captures/swarm/bot<N>.log; the server's own log is the thing to
+# believe about kills and plants.
+set -u
+
+N=${1:-2}
+SECS=${2:-120}
+ADDR=${3:-127.0.0.1:27015}
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EXE="$ROOT/target/debug/examples/capture_running.exe"
+[ -x "$EXE" ] || EXE="$ROOT/target/debug/examples/capture_running"
+if [ ! -x "$EXE" ]; then
+    echo "build it first:  cargo build -p client --example capture_running" >&2
+    exit 1
+fi
+
+OUT="$ROOT/captures/swarm"
+mkdir -p "$OUT"
+rm -f "$OUT"/bot*.log
+
+pids=()
+for i in $(seq 1 "$N"); do
+    # Alternate teams so the halves fill evenly: 1 = TERRORIST, 2 = CT.
+    if [ $((i % 2)) -eq 1 ]; then team=1; else team=2; fi
+    # 15 characters, unique per bot, stable across runs so the server sees the
+    # same SteamID for "the same" bot each time.
+    key=$(printf 'RUBBOT%04d' "$i")
+    name=$(printf 'ruBot%02d' "$i")
+
+    # Each bot runs a little longer than the one before, so the fleet LEAVES
+    # spread out as well as arriving spread out.
+    #
+    # ReAuthCheck bans an address for 60 minutes on MaxDropNum 7 disconnects
+    # within MaxDropTime 15 s, and that ban lands on every client behind the
+    # same address -- including the human. A 1.5 s start stagger alone gives
+    # exits 1.5 s apart: 10 per 15 s, comfortably over the limit. The extra
+    # 2.5 s per bot takes it to one exit per 4 s, under 4 per 15 s.
+    #
+    # Done on OUR side on purpose. The config's [List White IP] section claims
+    # to exempt CheckMaxDrop, 172.18.0.1 is in it and parses cleanly, and the
+    # ban still fires -- so the whitelist does not cover this path in
+    # ReAuthCheck 0.1.6. Do not rely on it.
+    life=$(( SECS + 5 * (i - 1) / 2 ))
+
+    RUB_NAME="$name" REB_NAME="$name" AIPLAYERS_NAME="$name" \
+    RUB_KEY="$key" REB_KEY="$key" AIPLAYERS_KEY="$key" \
+    RUB_TEAM="$team" REB_TEAM="$team" AIPLAYERS_TEAM="$team" \
+        "$EXE" "$ADDR" "$life" "$OUT/$name.bin" > "$OUT/bot$i.log" 2>&1 &
+    pids+=($!)
+    echo "  $name  team $team  key $key  pid ${pids[-1]}"
+    # Stagger the joins. Ten simultaneous signons is ten bzip2 blobs in one
+    # frame, and it is also not what a filling server looks like.
+    sleep 1.5
+done
+
+echo "waiting for $N bots (${SECS}s)..."
+for p in "${pids[@]}"; do wait "$p"; done
+echo "done -- logs in $OUT"

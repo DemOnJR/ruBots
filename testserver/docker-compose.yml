@@ -1,0 +1,34 @@
+# Bound to 127.0.0.1 only -- this server is for local protocol tests and must
+# not be reachable from the network.
+services:
+  cs16:
+    build: .
+    container_name: rubots-cs16
+    ports:
+      - "127.0.0.1:27015:27015/udp"
+      - "127.0.0.1:27015:27015/tcp"
+    volumes:
+      # Config is mounted as a DIRECTORY and copied into place by the
+      # entrypoint, so an edit takes effect on `docker compose restart` with no
+      # rebuild. Two traps this shape avoids, both of which have already cost
+      # this project time:
+      #
+      #  1. An earlier revision mounted at /hlds/cstrike/, which does not exist
+      #     (the Dockerfile installs to /home/steam/hlds/). Docker silently
+      #     created an empty directory and every config edit was a no-op.
+      #  2. Mounting the .cfg files individually DOES resolve to the right path
+      #     but breaks HLDS: filesystem_stdio cannot stat a single-file bind
+      #     mount under Docker Desktop, so the engine logs
+      #     "_stat on file ... which appeared to exist failed" plus
+      #     "exec: not enough space for server.cfg" and then runs with no
+      #     config at all -- without treating it as an error.
+      #
+      # `harness doctor` reads the live cvars back over rcon regardless: a
+      # config that is present is still not proof of a config that was applied.
+      - ./cfg:/cfg:ro
+      # Log_Printf writes here (sv_log.cpp:117-168), one file per map load.
+      # The harness snapshots and diffs it as a secondary truth channel.
+      - ./logs:/home/steam/hlds/cstrike/logs
+    stdin_open: true
+    tty: true
+    restart: "no"
