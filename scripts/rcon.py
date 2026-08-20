@@ -28,7 +28,7 @@ import socket
 import sys
 
 ADDR = ("127.0.0.1", 27015)
-PASSWORD = "rebots_local"
+PASSWORD = "rubots_local"
 TIMEOUT = 3.0
 
 

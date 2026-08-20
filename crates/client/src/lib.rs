@@ -190,7 +190,7 @@ pub struct Identity {
 impl Default for Identity {
     fn default() -> Self {
         Self {
-            name: "reBot".into(),
+            name: "ruBot".into(),
             key: auth::DEFAULT_KEY.to_vec(),
             // A real client negotiates a high rate; a low one makes the
             // server's `Netchan_CanPacket` rate limiter (cleartime) stall it
@@ -705,8 +705,8 @@ mod tests {
         }
         assert_eq!(seen.len(), names.len());
         // And the default is only ever used when nobody asked for a name --
-        // "(1)reBot" in a server log means a bot fell back to it.
-        assert_eq!(Identity::default().name, "reBot");
+        // "(1)ruBot" in a server log means a bot fell back to it.
+        assert_eq!(Identity::default().name, "ruBot");
     }
 
     /// `MAX_NAME` is 31 usable bytes (`rehlds/engine/server.h:35`), and the

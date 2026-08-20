@@ -1,4 +1,4 @@
-# reBots (REB)
+# ruBots (RUB)
 
 High-performance Rust-based AI player client and visualizer suite for Counter-Strike 1.6 / GoldSrc engine.
 
@@ -20,113 +20,217 @@ The project is structured as a Cargo workspace with several modular crates under
 
 ---
 
-## Prerequisites
+## Prerequisites & Installation
 
-- **Rust**: 1.85+ (Edition 2024)
-- Installed via [rustup](https://rustup.rs/):
+### 1. Install Rust (Compiler & Cargo)
+
+- **Windows** (PowerShell):
+  ```powershell
+  winget install Rustlang.Rustup
+  # Restart PowerShell, then ensure you are on the stable channel:
+  rustup update stable
+  ```
+- **macOS / Linux**:
   ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   rustup update stable
   ```
 
+### 2. Install Docker Desktop (Local CS 1.6 Server)
+
+- **Windows**:
+  1. Install via Windows Package Manager:
+     ```powershell
+     winget install Docker.DockerDesktop
+     ```
+     Or download the installer from [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/).
+  2. During installation, ensure the **WSL 2 Backend** option is enabled (recommended).
+  3. Start Docker Desktop from the Start menu and wait for the status icon to turn green (*Engine running*).
+- **Linux (Ubuntu/Debian)**:
+  ```bash
+  sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2
+  sudo usermod -aG docker $USER
+  newgrp docker
+  ```
+- **macOS**:
+  ```bash
+  brew install --cask docker
+  ```
+
 ---
 
-## Building
+## 🚀 Step-by-Step Tutorial: From Zero to Running Bots & Radar GUI
 
-### 1. Build the Entire Workspace (All Crates & Examples)
+Follow this end-to-end tutorial to set up the dedicated test server, compile the workspace, launch the live radar visualizer, and deploy bots.
+
+### Step 1: Install & Start the Local CS 1.6 Dedicated Server
+
+The repository comes with a pre-configured ReHLDS + ReGameDLL + Reunion server container under `testserver/`.
+
+1. Open PowerShell and navigate to the `testserver/` directory:
+   ```powershell
+   cd testserver
+   ```
+2. Build and start the container in detached mode:
+   ```powershell
+   docker compose up -d --build
+   ```
+   > **Note**: On the first run, SteamCMD automatically downloads the clean GoldSrc base (`app_set_config 90`) and overlays the ReHLDS binary stack. This takes 1–2 minutes.
+3. Verify that the server is up and listening on UDP port `27015`:
+   ```powershell
+   docker compose logs -f
+   ```
+   *(Press `Ctrl+C` to exit the log view)*
+4. Return to the project root folder:
+   ```powershell
+   cd ..
+   ```
+
+### Step 2: Compile ruBots & the GUI Visualizer
+
+Compile the entire workspace (all crates, examples, and tools):
 
 ```powershell
-# Debug build
+# Option A: Debug build (faster compilation for development)
 cargo build --workspace --all-targets
 
-# Optimized release build
+# Option B: Optimized release build (maximum tickrate & raycast performance)
 cargo build --workspace --all-targets --release
 ```
 
-### 2. Build Specific Components
+Key build outputs:
+- **`target/debug/gui.exe`**: Live `egui`-based tactical radar visualizer.
+- **`target/debug/examples/capture_running.exe`**: Bot client session runner.
 
-- **reBots Radar Visualizer (`gui`)**:
-  ```powershell
-  cargo build -p gui
-  # Output: target/debug/gui.exe
-  ```
+### Step 3: Start the Live Radar GUI Visualizer
 
-- **reBots Client Runner (`capture_running`)**:
-  ```powershell
-  cargo build -p client --example capture_running
-  # Output: target/debug/examples/capture_running.exe
-  ```
+Launch the tactical visualizer to monitor real-time bot navigation, raycasting, weapon state, and combat decisions on `de_dust2`:
 
-- **Core Libraries Only**:
-  ```powershell
-  cargo build -p proto -p auth -p nav -p bot
-  ```
-
----
-
-## Running
-
-### 1. Launch Live Radar GUI
-
-You can start the visualizer directly or using the detached PowerShell helper script:
-
-- **Via Cargo**:
+- **Launch directly via Cargo**:
   ```powershell
   cargo run -p gui
   ```
-
-- **Via Helper Script** (detached background process, recommended on Windows):
+- **Or launch via the detached Windows helper script** (runs in background with auto-restart watchdog):
   ```powershell
-  powershell -File scripts/start-gui.ps1
-  # With watchdog auto-restart:
   powershell -File scripts/start-gui.ps1 -Watchdog
   ```
+  *(The GUI automatically binds to UDP port `27016` to receive telemetry from active bots).*
 
-### 2. Launch a Bot Swarm
+### Step 4: Start the App / Launch Bots
 
-Deploy a fleet of reBots against a local or remote server:
+Once the server and Radar GUI are running, deploy the bots against the server:
 
-```powershell
-# 1. Build the runner example
-cargo build -p client --example capture_running
+- **Option A — Launch a Bot Swarm (Match Simulation)**:
+  Deploy multiple bots split evenly between Terrorists and Counter-Terrorists (e.g. 10 bots for 300 seconds):
+  ```powershell
+  powershell -File scripts/swarm.ps1 -N 10 -Secs 300 -Addr "127.0.0.1:27015"
+  ```
+- **Option B — Launch a Single Bot Runner**:
+  ```powershell
+  cargo run -p client --example capture_running -- 127.0.0.1:27015 120 captures/test.bin
+  ```
 
-# 2. Launch bots (e.g., 2 bots for 120s against 127.0.0.1:27015)
-powershell -File scripts/swarm.ps1 -N 2 -Secs 120 -Addr "127.0.0.1:27015"
-```
+Look at the **ruBots Radar** window: you will see the bots connect, authenticate via RevEmu tickets, spawn, buy weapons, calculate path lattice routes, and engage each other!
 
-### 3. Launch a Single Bot
+### Step 5: Stopping Services
 
-```powershell
-cargo run -p client --example capture_running -- 127.0.0.1:27015 120 captures/test.bin
-```
+- **Stop bots**: Press `Ctrl+C` in the terminal or wait for the swarm duration timer to expire.
+- **Stop Radar GUI**: Close the GUI window or run:
+  ```powershell
+  Stop-Process -Name gui -Force
+  ```
+- **Stop Docker Server**:
+  ```powershell
+  cd testserver
+  docker compose down
+  cd ..
+  ```
 
 ---
 
-## Environment Variables (`REB_` / `AIPLAYERS_`)
+## Environment Variables (`RUB_` / `REB_` / `AIPLAYERS_`)
 
-All configuration variables support the new `REB_` prefix (with fallback to `AIPLAYERS_`):
+All configuration variables support the new `RUB_` prefix (with fallback to `REB_` and `AIPLAYERS_`):
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `REB_NAME` | Bot player name | `reBot` |
-| `REB_KEY` | RevEmu CD key | `REBBOT000000001` |
-| `REB_TEAM` | Team assignment (`1` = Terrorist, `2` = Counter-Terrorist) | `1` |
-| `REB_TELEMETRY_PORT` | UDP port for sending/receiving GUI radar telemetry | `27016` |
-| `REB_TEAM_PORT` | UDP port for G0 team multicast bus | `27017` |
-| `REB_MAP` | Map name | `de_dust2` |
-| `REB_SEED` | PRNG seed for personality and movement | Hash of CD key |
-| `REB_DIFFICULTY` | Bot skill (`easy`, `normal`, `hard`, `unfair`) | Derived from seed |
-| `REB_MAPS_DIR` | Directory containing `.bsp` map files | `testserver/cstrike/maps` |
-| `REB_CSTRIKE_DIR` | Directory containing game resources for consistency checks | `testserver/cstrike` |
+| `RUB_NAME` | Bot player name | `ruBot` |
+| `RUB_KEY` | RevEmu CD key | `RUBBOT000000001` |
+| `RUB_TEAM` | Team assignment (`1` = Terrorist, `2` = Counter-Terrorist) | `1` |
+| `RUB_TELEMETRY_PORT` | UDP port for sending/receiving GUI radar telemetry | `27016` |
+| `RUB_TEAM_PORT` | UDP port for G0 team multicast bus | `27017` |
+| `RUB_MAP` | Map name | `de_dust2` |
+| `RUB_SEED` | PRNG seed for personality and movement | Hash of CD key |
+| `RUB_DIFFICULTY` | Bot skill (`easy`, `normal`, `hard`, `unfair`) | Derived from seed |
+| `RUB_MAPS_DIR` | Directory containing `.bsp` map files | `testserver/cstrike/maps` |
+| `RUB_CSTRIKE_DIR` | Directory containing game resources for consistency checks | `testserver/cstrike` |
 
 ---
 
 ## Running Tests
 
-Run all unit and integration tests across all workspace crates:
+### 1. Unit & Offline Tests
+
+Run all unit and offline integration tests across all workspace crates (does not require Docker):
 
 ```powershell
 cargo test --workspace
 ```
+
+### 2. Live Server Integration Tests (Requires Docker Desktop)
+
+Integration tests against a real HLDS / ReHLDS server (`crates/proto/tests/live_server.rs`, `crates/auth/tests/live_connect.rs`, `crates/client/tests/live_signon.rs`) require a running local test server.
+
+1. **Start the local Docker testserver**:
+   ```powershell
+   cd testserver
+   docker compose up -d
+   cd ..
+   ```
+
+2. **Run the integration suite**:
+   ```powershell
+   cargo test --workspace
+   ```
+
+   *(Optional)* Enforce that live server tests fail if the testserver is unreachable:
+   ```powershell
+   $env:AIPLAYERS_REQUIRE_SERVER="1"
+   cargo test --workspace
+   ```
+
+3. **Stop the testserver**:
+   ```powershell
+   cd testserver
+   docker compose down
+   cd ..
+   ```
+
+---
+
+## Verified Server Compatibility Matrix
+
+ruBots has been tested and verified across both local Docker stacks and remote dedicated Linux/Windows servers running the modern ReHLDS stack:
+
+| Target / Server | Engine / Build | GameDLL | Auth Layer | AMX Mod X / Addons | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Local Docker Testserver**<br>`127.0.0.1:27015` | **ReHLDS** `3.14.0.849`<br>(Protocol 48 / Stdio 4419) | **ReGameDLL_CS** `5.26.0.668` | **Reunion** `0.2.0.13`<br>(`cid_RevEmu = 1`) | **Metamod-r** `1.3.0.149`<br>**AMX Mod X** `1.10.0.5474` | Verified (Signon, Swarm, Buy, Combat, Defuse) |
+| **Remote Live Server**<br>*(Live Dedicated Host - Non-local)* | **ReHLDS** `3.14.x`<br>(Protocol 48 / Stdio Linux) | **ReGameDLL_CS** | **Reunion**<br>(`cid_RevEmu = 1`) | **AMX Mod X** `1.9` / `1.10`<br>VoiceTranscoder | Verified (Remote Signon, `clc_fileconsistency`, Team Join, Live Navigation) |
+
+> **Note on Auth Requirements**: Because bots connect over standard UDP as emulated clients, the server must support RevEmu / emulator tickets (e.g. via **Reunion** configured with `cid_RevEmu = 1`).
+
+---
+
+## Known Issues & Limitations
+
+* **Planar vs Full 3D Vertical Height Awareness (Obstacle Jump Limits)**:
+  * The path navigation system uses a 2D lattice representation with floor-height snapping and hull collision traces. In complex multi-level geometry, bots do not fully compute the vertical clearance trajectory before jumping, which can cause them to attempt jumps against obstacles or ledges that exceed the maximum engine jump height (~45–64 units).
+* **PVS Network Visibility Limits**:
+  * As genuine network clients, bots receive entity positions only when delivered in the server's PVS (Potential Visible Set) frames. Teammates or enemies blocked behind dense walls or outside PVS are not tracked until updated by the engine.
+* **Ledge Drop-Down Traversal**:
+  * On steep vertical drops without stairs or ladders, bots may hesitate and trigger unstuck re-evaluations before committing to the fall.
+* **Anti-Flood / Fast Reconnect Rate Limits**:
+  * Rapid mass connection/disconnection of bots from a single IP address can trigger server-side rate limiters or firewall protection (such as ReAuthCheck / ReChecker threshold rules). Staggered connect delays (`scripts/swarm.ps1`) are recommended.
 
 ---
 

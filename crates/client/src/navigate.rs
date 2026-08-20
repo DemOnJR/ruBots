@@ -146,7 +146,7 @@ pub struct PathFollower {
     /// currently leaning. See [`Unstick`].
     unstick_for: f32,
     unstick_dir: f32,
-    /// XFP-style origin stuck monitor (absolute position, not waypoint dist).
+    /// Origin stuck monitor (absolute position, not waypoint dist).
     origin_stuck_timer: f32,
     origin_stuck_at: Option<[f32; 3]>,
     origin_stuck_warns: u32,
@@ -611,7 +611,7 @@ impl PathFollower {
         }
         // Three consecutive "didn't move" samples (~1.5 s of scraping).
         if self.origin_tried_unstuck {
-            // Second cycle: replan (XFP ResetObjectiveMovement).
+            // Second cycle: replan route.
             self.reroutes += 1;
             if let Some(&node) = self.path.get(self.at) {
                 *self.blocked.entry(node).or_insert(0) += 2;
@@ -622,7 +622,7 @@ impl PathFollower {
             self.unstick_for = 0.0;
             self.no_progress_for = 0.0;
         } else {
-            // First cycle: force jump phase (XFP DuckJump). Do not flip
+            // First cycle: force jump phase. Do not flip
             // unstick_dir here — the waypoint-stuck path owns that, and flipping
             // twice would cancel (test: giving_up switches evade direction).
             self.origin_tried_unstuck = true;

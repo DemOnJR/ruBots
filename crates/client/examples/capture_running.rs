@@ -37,15 +37,17 @@ struct TelemetrySender {
     last: Instant,
 }
 
-fn reb_env(key: &str) -> Result<String, env::VarError> {
-    env::var(format!("REB_{key}"))
+fn rub_env(key: &str) -> Result<String, env::VarError> {
+    env::var(format!("RUB_{key}"))
+        .or_else(|_| env::var(format!("RUBOTS_{key}")))
+        .or_else(|_| env::var(format!("REB_{key}")))
         .or_else(|_| env::var(format!("REBOTS_{key}")))
         .or_else(|_| env::var(format!("AIPLAYERS_{key}")))
 }
 
 impl TelemetrySender {
     fn from_env() -> Option<Self> {
-        let port: u16 = reb_env("TELEMETRY_PORT")
+        let port: u16 = rub_env("TELEMETRY_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_PORT);
@@ -53,12 +55,12 @@ impl TelemetrySender {
         sock.set_nonblocking(true).ok()?;
         let dest = format!("127.0.0.1:{port}").parse().ok()?;
         let mut name = [0u8; 16];
-        let n = reb_env("NAME").unwrap_or_else(|_| "reBot".into());
+        let n = rub_env("NAME").unwrap_or_else(|_| "ruBot".into());
         name[..n.len().min(16)].copy_from_slice(&n.as_bytes()[..n.len().min(16)]);
         let mut map = [0u8; 32];
-        let m = reb_env("MAP").unwrap_or_else(|_| "de_dust2".into());
+        let m = rub_env("MAP").unwrap_or_else(|_| "de_dust2".into());
         map[..m.len().min(32)].copy_from_slice(&m.as_bytes()[..m.len().min(32)]);
-        let team: u8 = reb_env("TEAM")
+        let team: u8 = rub_env("TEAM")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
@@ -145,9 +147,9 @@ fn main() {
 
     // Distinct name AND key per bot: Reunion's IDClientsLimit is 1, so two
     // bots sharing a CD key are one identity and the second is refused.
-    let name = reb_env("NAME").unwrap_or_else(|_| "reBot".into());
+    let name = rub_env("NAME").unwrap_or_else(|_| "ruBot".into());
 
-    let key = reb_env("KEY").unwrap_or_else(|_| "REBBOT000000000".into());
+    let key = rub_env("KEY").unwrap_or_else(|_| "RUBBOT000000000".into());
 
     // Every bot used to be constructed with a literal seed and a literal
     // difficulty, so thirty processes computed the same function of (map, team)
@@ -158,7 +160,7 @@ fn main() {
     // the swarm gets a spread without having to pass anything extra -- and the
     // same bot keeps the same personality across runs, which makes a
     // reproduction reproducible.
-    let seed: usize = reb_env("SEED")
+    let seed: usize = rub_env("SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
@@ -166,7 +168,7 @@ fn main() {
                 (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3u64)
             }) as usize
         });
-    let difficulty = match reb_env("DIFFICULTY").as_deref() {
+    let difficulty = match rub_env("DIFFICULTY").as_deref() {
         Ok("easy") => bot::Difficulty::Easy,
         Ok("normal") => bot::Difficulty::Normal,
         Ok("hard") => bot::Difficulty::Hard,
@@ -223,9 +225,9 @@ fn main() {
         let _ = session.pump_idle(&mut t);
     }
 
-    let spawncount: u32 = reb_env("SPAWNCOUNT")
+    let spawncount: u32 = rub_env("SPAWNCOUNT")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v: String| v.parse().ok())
         .or_else(|| session.resource_message.as_ref().map(|r| r.spawncount))
         .or_else(|| {
             session
@@ -279,7 +281,7 @@ fn main() {
     }
     session.start_decoding();
     // Give the bot a brain unless we are capturing raw protocol.
-    if reb_env("NO_BRAIN").is_err() {
+    if rub_env("NO_BRAIN").is_err() {
         session.brain = Some(bot::Controller::new(seed as u64, difficulty));
         eprintln!("  bot brain enabled");
     }
@@ -308,6 +310,8 @@ fn main() {
     };
     let bot_id = name
         .strip_prefix("Bot")
+        .or_else(|| name.strip_prefix("ruBot"))
+        .or_else(|| name.strip_prefix("RUBBot"))
         .or_else(|| name.strip_prefix("reBot"))
         .or_else(|| name.strip_prefix("REBBot"))
         .and_then(|value| value.parse::<u16>().ok())
@@ -318,10 +322,10 @@ fn main() {
         t.map[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
     }
     if telemetry.is_some() {
-        eprintln!("  telemetry broadcasting on REB_TELEMETRY_PORT");
+        eprintln!("  telemetry broadcasting on RUB_TELEMETRY_PORT");
     }
     if team_bus.is_some() {
-        eprintln!("  G0 team bus enabled on REB_TEAM_PORT");
+        eprintln!("  G0 team bus enabled on RUB_TEAM_PORT");
     }
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
@@ -330,7 +334,7 @@ fn main() {
         Err(e) => eprintln!("  enter_game error: {e}"),
     }
 
-    if reb_env("NO_JOIN").is_ok() {
+    if rub_env("NO_JOIN").is_ok() {
         eprintln!("  BISECT: fully connected, sending nothing but moves");
     } else {
         // Let the entry burst drain before adding the join burst on top of it.
@@ -341,16 +345,16 @@ fn main() {
         // (3.17 s); firing them back to back stacks two bursts and overflows.
         let settle = Instant::now()
             + Duration::from_millis(
-                reb_env("JOIN_DELAY_MS")
+                rub_env("JOIN_DELAY_MS")
                     .ok()
-                    .and_then(|v| v.parse().ok())
+                    .and_then(|v: String| v.parse().ok())
                     .unwrap_or(2000),
             );
         while Instant::now() < settle {
             let _ = session.pump_idle(&mut t);
         }
         eprintln!("  joining team, retrying until the server actually spawns us");
-        let team: u8 = env::var("AIPLAYERS_TEAM")
+        let team: u8 = rub_env("TEAM")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(Session::TEAM_TERRORIST);

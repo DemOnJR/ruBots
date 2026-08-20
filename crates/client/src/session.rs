@@ -533,7 +533,9 @@ impl Session {
                     let end = (cursor + info.size as usize).min(body.len());
                     let chunk = &body[cursor..end];
                     cursor = end;
-                    if std::env::var_os("REB_FRAGTRACE").is_some()
+                    if std::env::var_os("RUB_FRAGTRACE").is_some()
+                        || std::env::var_os("RUBOTS_FRAGTRACE").is_some()
+                        || std::env::var_os("REB_FRAGTRACE").is_some()
                         || std::env::var_os("REBOTS_FRAGTRACE").is_some()
                         || std::env::var_os("AIPLAYERS_FRAGTRACE").is_some()
                     {
@@ -908,7 +910,9 @@ impl Session {
             // the only place its demands are visible -- and a command we do not
             // recognise is silently dropped, which is indistinguishable from a
             // server that never asked for anything.
-            if std::env::var_os("REB_TRACE_STUFF").is_some()
+            if std::env::var_os("RUB_TRACE_STUFF").is_some()
+                || std::env::var_os("RUBOTS_TRACE_STUFF").is_some()
+                || std::env::var_os("REB_TRACE_STUFF").is_some()
                 || std::env::var_os("REBOTS_TRACE_STUFF").is_some()
                 || std::env::var_os("AIPLAYERS_TRACE_STUFF").is_some()
             {

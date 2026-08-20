@@ -52,7 +52,7 @@ The consequence for the plan: **human variance is different inputs per bot, not 
 ## 3. Work items
 
 ### W1. Give every bot its own seed and its own difficulty
-- Seed taken from identity (`REB_SEED` / `REB_KEY`).
+- Seed taken from identity (`RUB_SEED` / `RUB_KEY`).
 - Difficulty spread drawn per bot uniformly from {Easy, Normal, Hard}.
 - Personality profiles: aggression and fear drawn per bot from its seed.
 

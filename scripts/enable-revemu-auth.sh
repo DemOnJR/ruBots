@@ -6,8 +6,8 @@
 #
 #   bash enable-revemu-auth.sh /path/to/hlds
 #
-# Then restart the server process and re-test bots from Windows:
-#   capture_running.exe 85.215.153.249:27015 60 captures/remote/r1.bin
+# Then restart the server process and then from this PC:
+#   capture_running.exe <remote_server_ip>:27015 60 captures/remote/r1.bin
 #
 set -euo pipefail
 

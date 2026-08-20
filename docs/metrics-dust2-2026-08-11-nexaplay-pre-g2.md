@@ -1,6 +1,6 @@
-# de_dust2 Nexaplay 20-bot (pre G2 / A2g)
+# de_dust2 Remote Live 20-bot (pre G2 / A2g)
 
-**When:** 2026-08-11, remote `85.215.153.249:27015`, N=20, ~10 min  
+**When:** 2026-08-11, remote dedicated server, N=20, ~10 min  
 **Binary:** post-fileconsistency netchan fix; **before** A2f revert + G2 rotate  
 **Logs:** `captures/swarm/bot*.log` (live sample 1702)
 

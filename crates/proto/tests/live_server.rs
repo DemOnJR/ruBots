@@ -40,7 +40,9 @@ fn round_trip(request: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn skip_or_panic(what: &str) {
-    if std::env::var("REB_REQUIRE_SERVER").is_ok()
+    if std::env::var("RUB_REQUIRE_SERVER").is_ok()
+        || std::env::var("RUBOTS_REQUIRE_SERVER").is_ok()
+        || std::env::var("REB_REQUIRE_SERVER").is_ok()
         || std::env::var("REBOTS_REQUIRE_SERVER").is_ok()
         || std::env::var("AIPLAYERS_REQUIRE_SERVER").is_ok()
     {

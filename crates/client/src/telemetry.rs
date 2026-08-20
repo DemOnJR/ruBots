@@ -142,7 +142,9 @@ pub struct TeamBus {
 impl TeamBus {
     /// Bind a reusable localhost receiver and broadcast reports to the same port.
     pub fn from_env() -> io::Result<Option<Self>> {
-        let Some(port) = std::env::var("REB_TEAM_PORT")
+        let Some(port) = std::env::var("RUB_TEAM_PORT")
+            .or_else(|_| std::env::var("RUBOTS_TEAM_PORT"))
+            .or_else(|_| std::env::var("REB_TEAM_PORT"))
             .or_else(|_| std::env::var("REBOTS_TEAM_PORT"))
             .or_else(|_| std::env::var("AIPLAYERS_TEAM_PORT"))
             .ok()

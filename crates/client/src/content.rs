@@ -25,7 +25,9 @@ pub struct GameContent {
 impl GameContent {
     /// Locate a content directory, if there is one.
     pub fn discover() -> Option<Self> {
-        let candidates = std::env::var("REB_CSTRIKE_DIR")
+        let candidates = std::env::var("RUB_CSTRIKE_DIR")
+            .or_else(|_| std::env::var("RUBOTS_CSTRIKE_DIR"))
+            .or_else(|_| std::env::var("REB_CSTRIKE_DIR"))
             .or_else(|_| std::env::var("REBOTS_CSTRIKE_DIR"))
             .or_else(|_| std::env::var("AIPLAYERS_CSTRIKE_DIR"))
             .ok()

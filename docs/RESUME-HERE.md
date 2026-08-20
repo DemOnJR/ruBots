@@ -2,7 +2,7 @@
 
 ## 2026-08-11: Remote join + fileconsistency (done)
 
-Nexaplay `85.215.153.249:27015`: RevEmu auth OK; bot streams, joins team, moves.
+Remote Dedicated Server (non-local): RevEmu auth OK; bot streams, joins team, moves.
 Drop `Reason: Invalid length` / `opcode clc_fileconsistency` was a **netchan
 idle leak**, not a consistency bit-pack bug. Documented in
 **`docs/remote-join.md`**. Do not “fix” consistency framing first if that
@@ -18,7 +18,7 @@ log line returns — decode `.sent` for bare `07` on non-fragment packets.
 - **Delay preserved:** delay buckets (seed%10 ∈ {0,3}) held the quiet site under light pressure; Bot16 (B assault) never rotated.
 - **A2g non-regressive:** CONGA-1 **0.548** (best since A2d), CONGA-2 0.055, ROUTE-2 0.108, STILL-1 0.195 all in target. Remaining misses are the pre-existing humanization gaps (CONGA-1, ROUTE-3, PILE-2 max 10).
 
-After U2d+A2f CONGA-1 **0.627** miss and Nexaplay 20-bot pre snapshot CONGA-1
+After U2d+A2f CONGA-1 **0.627** miss and remote live 20-bot pre snapshot CONGA-1
 **0.579** (`docs/metrics-dust2-2026-08-11-nexaplay-pre-g2.md`):
 
 | Change | Detail |

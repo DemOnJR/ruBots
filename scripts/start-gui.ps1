@@ -48,9 +48,10 @@ Start-Sleep -Milliseconds 500
 function Start-Radar {
     # Fully detach: `start` with empty title + UseShellExecute so the agent
     # shell's closed pipes cannot produce 0x800700E8 or kill the window.
+    $env:RUB_TELEMETRY_PORT = "$Port"
     $env:REB_TELEMETRY_PORT = "$Port"
     $env:AIPLAYERS_TELEMETRY_PORT = "$Port"
-    $arg = "/c set REB_TELEMETRY_PORT=$Port&& set AIPLAYERS_TELEMETRY_PORT=$Port&& start `"reBots Radar`" /D `"$Root`" `"$Exe`""
+    $arg = "/c set RUB_TELEMETRY_PORT=$Port&& set REB_TELEMETRY_PORT=$Port&& set AIPLAYERS_TELEMETRY_PORT=$Port&& start `"ruBots Radar`" /D `"$Root`" `"$Exe`""
     $p = Start-Process -FilePath "cmd.exe" -ArgumentList $arg -WindowStyle Hidden -PassThru
     # cmd /c returns quickly; wait for gui.exe to appear.
     $gui = $null
@@ -62,9 +63,9 @@ function Start-Radar {
         if ($gui) { break }
     }
     if ($gui) {
-        Write-Host "reBots Radar started  pid=$($gui.Id)  port=$Port"
+        Write-Host "ruBots Radar started  pid=$($gui.Id)  port=$Port"
     } else {
-        Write-Host "reBots Radar launch issued (cmd pid=$($p.Id)) but gui.exe not seen yet"
+        Write-Host "ruBots Radar launch issued (cmd pid=$($p.Id)) but gui.exe not seen yet"
         Write-Host "  check: $(Join-Path (Split-Path $Exe) 'gui.log')"
     }
     Write-Host "  log file: $(Join-Path (Split-Path $Exe) 'gui.log')"

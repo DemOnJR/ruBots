@@ -109,7 +109,9 @@ fn main() -> eframe::Result<()> {
     }));
     log_line("gui starting");
 
-    let port: u16 = std::env::var("REB_TELEMETRY_PORT")
+    let port: u16 = std::env::var("RUB_TELEMETRY_PORT")
+        .or_else(|_| std::env::var("RUBOTS_TELEMETRY_PORT"))
+        .or_else(|_| std::env::var("REB_TELEMETRY_PORT"))
         .or_else(|_| std::env::var("REBOTS_TELEMETRY_PORT"))
         .or_else(|_| std::env::var("AIPLAYERS_TELEMETRY_PORT"))
         .ok()
@@ -124,7 +126,7 @@ fn main() -> eframe::Result<()> {
             log_line(&format!("FATAL bind {addr}: {e}"));
             // Still open a window so the user sees an error instead of "nothing".
             return eframe::run_native(
-                "reBots Radar (no telemetry)",
+                "ruBots Radar (no telemetry)",
                 eframe::NativeOptions {
                     viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 200.0]),
                     ..Default::default()
@@ -175,11 +177,11 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_title("reBots Radar"),
+            .with_title("ruBots Radar"),
         ..Default::default()
     };
     let result = eframe::run_native(
-        "reBots Radar",
+        "ruBots Radar",
         options,
         Box::new(move |_cc| {
             let app = RadarApp {
@@ -693,7 +695,7 @@ impl eframe::App for RadarApp {
         self.drain();
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("reBots (REB) Debug Radar");
+                ui.heading("ruBots (RUB) Debug Radar");
                 ui.separator();
                 if ui.button("reset view").clicked() {
                     self.radar_w = 900.0;

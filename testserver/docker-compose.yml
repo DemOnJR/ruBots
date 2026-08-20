@@ -3,7 +3,7 @@
 services:
   cs16:
     build: .
-    container_name: rebots-cs16
+    container_name: rubots-cs16
     ports:
       - "127.0.0.1:27015:27015/udp"
       - "127.0.0.1:27015:27015/tcp"

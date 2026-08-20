@@ -8,23 +8,22 @@ Bots authenticate with a **RevEmu** (Steam emulator) certificate
 - Local Docker stack (`testserver/` + Reunion / ReHLDS plugins)
 - Public non-Steam / emulator-friendly servers (Reunion, dproto, old nonsteam)
 
-## Live test: `85.215.153.249:27015` (Nexaplay CS 1.6)
+## Live test: Remote Dedicated Server (Non-local)
 
-**Status 2026-08-11 (after netchan fix):** one bot joins, spawns, moves, fights.
+**Status:** bot joins, spawns, moves, fights.
 
 | Check | Result |
 |-------|--------|
 | Host reachable (UDP) | **yes** |
 | RevEmu / STEAM_2 auth | **yes** (Reunion with `cid_RevEmu=1`) |
 | Signon + resource list | **yes** |
-| `clc_fileconsistency` + spawn | **yes** (was broken — see below) |
+| `clc_fileconsistency` + spawn | **yes** |
 | Team join + streaming | **yes** — `*** SERVER IS STREAMING ***` |
 | In-game movement | **yes** — thousands of units on de_dust2 |
 
 Probe capture: `captures/remote/r4` / `r4.log`.
 
-**SSH from this machine:** no working key (publickey denied). Server-side
-Reunion changes go through **Nexaplay panel** or your own SSH session.
+Reunion changes go through server control panel or SSH session.
 
 ---
 
@@ -114,9 +113,9 @@ Pick one:
 
 ### A) Emulator auth (recommended for AI bots)
 
-#### Via Nexaplay panel (this host)
+#### Via Server Control Panel
 
-1. Open the **Nexaplay CS 1.6** instance.
+1. Open the game server control panel.
 2. **Add-ons / CSB stack** → install/enable **Reunion** (same as local testserver).
 3. Metamod `plugins.ini` must load (uncommented):  
    `linux addons/reunion/reunion_mm_i386.so`
@@ -133,7 +132,6 @@ IDClientsLimit = 8
 
    If `cid_RevEmu = 5`, bots get exactly `STEAM validation rejected`.
 5. **Restart** the game server in the panel.
-6. Reply **“restarted”** — join is re-tested from this PC.
 
 #### Via SSH (your session)
 
@@ -153,13 +151,13 @@ cd D:\Downloads\app\aiplayers-rs
 cargo build -p client --example capture_running
 
 # one probe bot
-$env:AIPLAYERS_NAME="RemoteBot01"
-$env:AIPLAYERS_KEY="AIPLAYERBOT0001"
-$env:AIPLAYERS_TEAM="1"
-.\target\debug\examples\capture_running.exe 85.215.153.249:27015 120 captures\remote\r1.bin
+$env:RUB_NAME="RemoteBot01"
+$env:RUB_KEY="RUBBOT0001"
+$env:RUB_TEAM="1"
+.\target\debug\examples\capture_running.exe <remote_server_ip>:27015 120 captures\remote\r1.bin
 
 # or a small swarm
-powershell -File scripts\swarm.ps1 -N 4 -Secs 300 -Addr "85.215.153.249:27015"
+powershell -File scripts\swarm.ps1 -N 4 -Secs 300 -Addr "<remote_server_ip>:27015"
 ```
 
 ### B) Real Steam tickets

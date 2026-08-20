@@ -324,8 +324,10 @@ impl Log {
     }
 }
 
-fn reb_env(key: &str) -> Result<String, env::VarError> {
-    env::var(format!("REB_{key}"))
+fn rub_env(key: &str) -> Result<String, env::VarError> {
+    env::var(format!("RUB_{key}"))
+        .or_else(|_| env::var(format!("RUBOTS_{key}")))
+        .or_else(|_| env::var(format!("REB_{key}")))
         .or_else(|_| env::var(format!("REBOTS_{key}")))
         .or_else(|_| env::var(format!("AIPLAYERS_{key}")))
 }
@@ -334,7 +336,7 @@ fn main() {
     let mut args = env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:27015".into());
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
-    let idle_ms: u64 = reb_env("IDLE_MS")
+    let idle_ms: u64 = rub_env("IDLE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
@@ -349,8 +351,8 @@ fn main() {
     };
     let mut t = Tap { inner, start: log.start };
 
-    let name = reb_env("NAME").unwrap_or_else(|_| "Probe".into());
-    let key = reb_env("KEY").unwrap_or_else(|_| "REBPROBE00000001".into());
+    let name = rub_env("NAME").unwrap_or_else(|_| "Probe".into());
+    let key = rub_env("KEY").unwrap_or_else(|_| "RUBPROBE00000001".into());
     println!("tracing {addr} as name={name:?} key={key:?}");
 
     let mut s = Session::new(Identity {
@@ -398,7 +400,7 @@ fn main() {
     // server-side timer; one that only appears once a particular message has
     // gone out is a reaction to that message. Nothing in the packets we send
     // can distinguish those two on its own, which is why this knob exists.
-    let stop_after = reb_env("TRACE_STOP").unwrap_or_default();
+    let stop_after = rub_env("TRACE_STOP").unwrap_or_default();
     if stop_after == "signon" {
         return idle_until_drop(&mut s, &mut t, &mut log, secs);
     }
@@ -499,7 +501,7 @@ fn main() {
                 "[{:7.3}] *** stufftext `reconnect` -- re-running the signon",
                 log.start.elapsed().as_secs_f32()
             );
-            if let Ok(path) = reb_env("DUMP_RECONNECT") {
+            if let Ok(path) = rub_env("DUMP_RECONNECT") {
                 if let Some(m) = s
                     .recorded
                     .iter()
