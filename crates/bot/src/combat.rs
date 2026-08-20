@@ -88,8 +88,11 @@ impl Default for EngageParams {
         Self {
             // 1200 is the largest distance-like constant in engage's pool.
             max_engage_distance: 1200.0,
-            fire_cone_degrees: 7.0,
-            fire_chance: 0.75,
+            // Tighter cone: 7° was loose enough to dump into walls next to a
+            // partially covered enemy (looked like wallbangs).
+            fire_cone_degrees: 4.5,
+            // Not full auto spam: chance per ready tick after burst gates.
+            fire_chance: 0.65,
             close_quarters_distance: 150.0,
             aiming_at_me_cone_degrees: 20.0,
             aiming_at_me_factor: 0.5,
@@ -200,7 +203,10 @@ mod tests {
 
     fn world_with(players: Vec<PlayerView>) -> WorldView {
         WorldView {
-            me: SelfState { team: Team::Terrorist, ..Default::default() },
+            me: SelfState {
+                team: Team::Terrorist,
+                ..Default::default()
+            },
             players,
             ..Default::default()
         }
@@ -254,11 +260,23 @@ mod tests {
     fn firing_requires_the_aim_to_be_on_target_already() {
         let w = world_with(vec![enemy(1, 500.0, 100.0)]);
         let t = *select_target(&w, &EngageParams::default()).unwrap();
-        let params = EngageParams { fire_chance: 1.0, ..Default::default() };
+        let params = EngageParams {
+            fire_chance: 1.0,
+            ..Default::default()
+        };
         let mut rng = Rng::new(1);
 
         // Looking the wrong way entirely.
-        let e = engage(&w, &t, Angles { pitch: 0.0, yaw: 180.0 }, &params, &mut rng);
+        let e = engage(
+            &w,
+            &t,
+            Angles {
+                pitch: 0.0,
+                yaw: 180.0,
+            },
+            &params,
+            &mut rng,
+        );
         assert!(!e.fire, "must not fire while facing away");
 
         // Looking straight at them.
@@ -272,7 +290,10 @@ mod tests {
         let w = world_with(vec![enemy(1, 500.0, 100.0)]);
         let t = *select_target(&w, &EngageParams::default()).unwrap();
         let on = desired_angles(&w, &t);
-        let params = EngageParams { fire_chance: 0.5, ..Default::default() };
+        let params = EngageParams {
+            fire_chance: 0.5,
+            ..Default::default()
+        };
         let mut rng = Rng::new(42);
 
         let shots = (0..400)
@@ -288,18 +309,30 @@ mod tests {
     fn an_enemy_already_aiming_at_us_is_dealt_with_first() {
         // Same range, but one of them has us in their sights.
         let mut aiming = enemy(1, 400.0, 100.0);
-        aiming.angles = Some(Angles { pitch: 0.0, yaw: 180.0 }); // looking back at us
+        aiming.angles = Some(Angles {
+            pitch: 0.0,
+            yaw: 180.0,
+        }); // looking back at us
         let mut oblivious = enemy(2, 380.0, 100.0);
-        oblivious.angles = Some(Angles { pitch: 0.0, yaw: 90.0 }); // looking away
+        oblivious.angles = Some(Angles {
+            pitch: 0.0,
+            yaw: 90.0,
+        }); // looking away
         let w = world_with(vec![aiming, oblivious]);
         let t = select_target(&w, &EngageParams::default()).unwrap();
-        assert_eq!(t.entity, 1, "the one pointing at us, even though slightly further");
+        assert_eq!(
+            t.entity, 1,
+            "the one pointing at us, even though slightly further"
+        );
     }
 
     #[test]
     fn aiming_at_us_still_cannot_beat_a_much_closer_enemy() {
         let mut far_aiming = enemy(1, 900.0, 100.0);
-        far_aiming.angles = Some(Angles { pitch: 0.0, yaw: 180.0 });
+        far_aiming.angles = Some(Angles {
+            pitch: 0.0,
+            yaw: 180.0,
+        });
         let close = enemy(2, 100.0, 100.0);
         let w = world_with(vec![far_aiming, close]);
         let t = select_target(&w, &EngageParams::default()).unwrap();
@@ -315,7 +348,10 @@ mod tests {
         let t = select_target(&w, &params).unwrap();
         assert_eq!(t.entity, 2, "falls back to plain distance");
         for p in &w.players {
-            assert_eq!(threat_score(&w, p, &params), distance(w.me.origin, p.origin));
+            assert_eq!(
+                threat_score(&w, p, &params),
+                distance(w.me.origin, p.origin)
+            );
         }
     }
 
@@ -338,6 +374,9 @@ mod tests {
     fn recovered_constants_are_recorded_in_ascending_order() {
         let c = RECOVERED_ENGAGE_CONSTANTS;
         assert!(c.windows(2).all(|w| w[0] < w[1]));
-        assert!(c.contains(&340.0), "the five-way threshold must be recorded");
+        assert!(
+            c.contains(&340.0),
+            "the five-way threshold must be recorded"
+        );
     }
 }

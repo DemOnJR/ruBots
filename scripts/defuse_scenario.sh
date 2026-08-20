@@ -44,7 +44,7 @@ done
 rcon "sv_restartround 1"
 sleep 3
 
-AIPLAYERS_NAME=Tplanter AIPLAYERS_KEY=AIDK00000000001 AIPLAYERS_TEAM=1 \
+REB_NAME=Tplanter AIPLAYERS_NAME=Tplanter REB_KEY=REBDK0000000001 AIPLAYERS_KEY=REBDK0000000001 REB_TEAM=1 AIPLAYERS_TEAM=1 \
     "$EXE" 127.0.0.1:27015 420 "$OUT/Tplanter.bin" > "$OUT/Tplanter.log" 2>&1 &
 echo "terrorist away, unopposed; waiting for the bomb"
 
@@ -64,10 +64,10 @@ if [ "$planted" = no ]; then
     echo "!!! no plant within ${MAX_WAIT}s; sending the CTs anyway so the run still says something"
 fi
 
-for spec in "CTx:AIDK00000000002" "CTy:AIDK00000000003" "CTz:AIDK00000000004"; do
+for spec in "CTx:REBDK0000000002" "CTy:REBDK0000000003" "CTz:REBDK0000000004"; do
     n=${spec%%:*}
     k=${spec##*:}
-    AIPLAYERS_NAME="$n" AIPLAYERS_KEY="$k" AIPLAYERS_TEAM=2 \
+    REB_NAME="$n" AIPLAYERS_NAME="$n" REB_KEY="$k" AIPLAYERS_KEY="$k" REB_TEAM=2 AIPLAYERS_TEAM=2 \
         "$EXE" 127.0.0.1:27015 200 "$OUT/$n.bin" > "$OUT/$n.log" 2>&1 &
     sleep 2
 done

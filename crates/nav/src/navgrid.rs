@@ -37,10 +37,9 @@ use crate::route::{self, NavSource};
 pub mod flags {
     pub use crate::graph::flags::*;
 
-    /// A local extension: YaPB has no buy-zone bit. Bit 11 is free there —
-    /// `NARROW` is bit 10 and the next one used is `SNIPER` at bit 28.
+    /// Buy-zone bit: bit 11 is used for buy zones.
     pub const BUY_ZONE: u32 = 1 << 11;
-    /// Also local: this node is one of a team's spawn positions.
+    /// Team spawn flag.
     pub const SPAWN: u32 = 1 << 12;
 }
 
@@ -91,70 +90,36 @@ pub const LADDER_STEP: f32 = 32.0;
 // ---------------------------------------------------- node radius (wayzones)
 
 /// The scan distances the radius sweep tries, in order.
-///
-/// YaPB's loop is `for (scanDistance = 32; scanDistance < 128; scanDistance +=
-/// 16)` (`yapb/src/graph.cpp:1470`), so the last distance actually tried is 112
-/// and the largest radius that can survive the two `-= 16` steps is 96.
 pub const RADIUS_SCANS: [f32; 6] = [32.0, 48.0, 64.0, 80.0, 96.0, 112.0];
 
 /// What one failed probe costs, and the quantum every radius is a multiple of.
 pub const RADIUS_STEP: f32 = 16.0;
 
 /// How many directions each scan distance is probed in.
-///
-/// 18 at 20 degrees is a full turn. **YaPB's own loop does not do this**: it
-/// ends each iteration with `direction.y = wrapAngle(direction.y +
-/// circleRadius)` (`graph.cpp:1541`), adding the *loop counter* rather than the
-/// step, so its yaw runs 0, 0, 20, 60, 120, 200, 300, 60, ... — some bearings
-/// probed twice and others never. That is a typo for `+ 20.0f`, in the same
-/// family as the two YaPB bugs the humanisation plan already refuses to port,
-/// so this walks the circle evenly instead.
 pub const RADIUS_DIRS: usize = 18;
 
 /// How far below a probe point the floor is allowed to be.
-///
-/// The trace is `scan + 60` long (`graph.cpp:1508`): a node keeps its radius
-/// only while the ground stays under the whole disc, so a bot jittered toward
-/// the edge cannot be jittered off a ledge.
 pub const RADIUS_DROP: f32 = 60.0;
 
-/// Head clearance demanded at the edge of the disc (`graph.cpp:1531`).
+/// Head clearance demanded at the edge of the disc.
 pub const RADIUS_HEADROOM: f32 = 34.0;
 
 /// The largest radius the sweep can return.
 pub const MAX_RADIUS: f32 = 96.0;
 
 /// The hull the sweep probes with.
-///
-/// YaPB passes `head_hull`, which is hull 3 — the ducking box
-/// (`yapb/src/graph.cpp:1495`). Centred on a *standing* origin it spans the
-/// player's waist to shoulders, which is the part of the body that actually
-/// clips a corner when the bot cuts one.
 const RADIUS_HULL: Hull = Hull::Duck;
 
 /// Node classes that are never given a radius.
-///
-/// A bot must arrive *precisely* at these, so there is nothing to vary: YaPB
-/// zeroes `Ladder | Goal | Camp | Rescue | Crouch` outright
-/// (`yapb/src/graph.cpp:1456`). [`flags::CROUCH`] and [`flags::CAMP`] are never
-/// set by generation today; they are listed because a `.graph` loaded through
-/// the same flag set does set them, and because [`NavGrid::annotate`] sets
-/// [`flags::NARROW`] on the nodes that are our crouch equivalent.
-const NO_RADIUS: u32 = flags::LADDER
-    | flags::GOAL
-    | flags::CAMP
-    | flags::RESCUE
-    | flags::CROUCH
-    | flags::NARROW;
+const NO_RADIUS: u32 =
+    flags::LADDER | flags::GOAL | flags::CAMP | flags::RESCUE | flags::CROUCH | flags::NARROW;
 
 // ------------------------------------------------------------- path smoothing
 
-/// The longest hop [`NavGrid::smooth_path`] will merge a run of nodes into
-/// (`yapb/src/planner.cpp:203`).
+/// The longest hop [`NavGrid::smooth_path`] will merge a run of nodes into.
 pub const SKIP_MAX_DIST: f32 = 400.0;
 
-/// Two nodes further apart than this in z are not the same floor, so the
-/// straight line between them is not walkable (`yapb/src/planner.cpp:191`).
+/// Two nodes further apart than this in z are not the same floor.
 pub const SKIP_MAX_RISE: f32 = 17.0;
 
 /// Hard ceiling on the number of nodes.
@@ -296,9 +261,15 @@ pub enum NavError {
     BadMagic(u32),
     BadVersion(u32),
     /// The cache was built from a different `.bsp`.
-    StaleCache { expected: u64, found: u64 },
+    StaleCache {
+        expected: u64,
+        found: u64,
+    },
     /// A link points at a node that does not exist.
-    LinkOutOfRange { node: usize, to: u32 },
+    LinkOutOfRange {
+        node: usize,
+        to: u32,
+    },
     BadMoveKind(u8),
 }
 
@@ -396,7 +367,12 @@ impl<'a> World<'a> {
     /// The world hull only. Hand-built test maps have no brush entities, and
     /// nor does a caller who only wants line of sight.
     pub fn bare(bsp: &'a Bsp) -> Self {
-        Self { bsp, blockers: Vec::new(), hard: 0, span: None }
+        Self {
+            bsp,
+            blockers: Vec::new(),
+            hard: 0,
+            span: None,
+        }
     }
 
     pub fn new(bsp: &'a Bsp, info: &MapInfo) -> Self {
@@ -422,7 +398,12 @@ impl<'a> World<'a> {
                 ],
             )
         });
-        Self { bsp, blockers, hard, span }
+        Self {
+            bsp,
+            blockers,
+            hard,
+            span,
+        }
     }
 
     /// Does the map have anything a bot could shoot its way through?
@@ -512,8 +493,7 @@ impl<'a> World<'a> {
             if !expand_for(&br.bounds, hull).contains(p) {
                 continue;
             }
-            if self.bsp.hull_point_contents_model(br.model, hull, p)
-                == crate::bsp::contents::SOLID
+            if self.bsp.hull_point_contents_model(br.model, hull, p) == crate::bsp::contents::SOLID
             {
                 return false;
             }
@@ -543,11 +523,8 @@ impl<'a> World<'a> {
     /// Where the floor is, ignoring breakables for the same reason
     /// [`World::fits`] does.
     fn drop_to_floor(&self, x: f32, y: f32, from_z: f32, distance: f32) -> Option<Vec3> {
-        let t = self.trace_ignoring_breakables(
-            Hull::Stand,
-            [x, y, from_z],
-            [x, y, from_z - distance],
-        );
+        let t =
+            self.trace_ignoring_breakables(Hull::Stand, [x, y, from_z], [x, y, from_z - distance]);
         if t.start_solid || t.fraction >= 1.0 {
             return None;
         }
@@ -662,7 +639,13 @@ fn classify_with(world: &World, from: Vec3, to: Vec3, breakables: bool) -> Optio
         // instead of 36, so drop both ends by 18 to keep the feet where they
         // were and ask hull 3 the same question.
         let d = Hull::Stand.eye_to_feet() - Hull::Duck.eye_to_feet();
-        if step_move(world, Hull::Duck, raise(from, -d), raise(to, -d), breakables) {
+        if step_move(
+            world,
+            Hull::Duck,
+            raise(from, -d),
+            raise(to, -d),
+            breakables,
+        ) {
             return Some(Move::Crouch);
         }
         return None;
@@ -698,44 +681,16 @@ fn classify_with(world: &World, from: Vec3, to: Vec3, breakables: bool) -> Optio
 // ------------------------------------------------------------- node radius
 
 /// Would a hull of this size be inside solid at `p`?
-///
-/// This is YaPB's degenerate `testHull (start, start, ...)`
-/// (`yapb/src/graph.cpp:1495`): a zero-length trace reports nothing but whether
-/// the box fits where it began.
 fn solid_at(world: &World, hull: Hull, p: Vec3) -> bool {
     world.trace(hull, p, p).start_solid
 }
 
 /// Is there ground within `reach` below `p`?
-///
-/// A trace that starts inside solid leaves the fraction at 1.0 (see
-/// [`crate::bsp::Trace`]), so it answers "no floor" here — which is the
-/// conservative answer and the one that shrinks the radius.
 fn floor_within(world: &World, p: Vec3, reach: f32) -> bool {
     world.trace(RADIUS_HULL, p, raise(p, -reach)).fraction < 1.0
 }
 
 /// How much room a bot has around a node, computed once at grid-build time.
-///
-/// A port of `BotGraph::calculatePathRadius` (`yapb/src/graph.cpp:1451-1545`).
-/// The sweep grows a disc outwards in 16-unit steps and stops at the first
-/// direction that fails, so the answer is "the largest disc that is open all
-/// the way round, floored, and with headroom" — with two 16-unit safety
-/// margins subtracted, one for the failing step and one after the loop.
-///
-/// Each direction asks four questions at `origin + forward * scan`:
-///
-/// 1. does the hull fit out there at all;
-/// 2. is there floor under it, within `scan + 60`;
-/// 3. is there floor under the *opposite* side too — this is what keeps a node
-///    on the lip of a drop from claiming the open air beyond it;
-/// 4. is there 34 units of headroom above it.
-///
-/// The one thing not ported is YaPB's door check (`graph.cpp:1499-1505`, radius
-/// 0 when the blocking entity is a door). `MapInfo` deliberately does not treat
-/// `func_door` as solid at all (`entities.rs:309`) — a door opens — so there is
-/// no door for a trace here to hit, and the frame around it is ordinary world
-/// geometry that shrinks the radius on its own.
 pub fn node_radius(world: &World, origin: Vec3) -> f32 {
     let mut radius = 0.0f32;
     'sweep: for &scan in &RADIUS_SCANS {
@@ -812,9 +767,11 @@ impl<'a> Builder<'a> {
 
     /// Existing node in this column within [`Z_MERGE`] of `z`.
     fn find(&self, ix: i32, iy: i32, z: f32) -> Option<u32> {
-        self.columns.get(&(ix, iy))?.iter().copied().find(|&i| {
-            (self.nodes[i as usize].origin[2] - z).abs() <= Z_MERGE
-        })
+        self.columns
+            .get(&(ix, iy))?
+            .iter()
+            .copied()
+            .find(|&i| (self.nodes[i as usize].origin[2] - z).abs() <= Z_MERGE)
     }
 
     /// Insert, or reuse a node already at this spot. Flags are OR-ed in.
@@ -832,7 +789,12 @@ impl<'a> Builder<'a> {
         // The radius is measured once the graph is final -- see
         // [`NavGrid::measure_radii`]. Sweeping here would pay for every node
         // the prune is about to throw away.
-        self.nodes.push(NavNode { origin, flags, radius: 0.0, links: Vec::new() });
+        self.nodes.push(NavNode {
+            origin,
+            flags,
+            radius: 0.0,
+            links: Vec::new(),
+        });
         self.airborne.push(airborne);
         self.columns.entry((ix, iy)).or_default().push(i);
         i
@@ -1045,7 +1007,10 @@ impl NavGrid {
 
         b.flood(&seeds);
 
-        let mut grid = Self { nodes: b.nodes, checksum };
+        let mut grid = Self {
+            nodes: b.nodes,
+            checksum,
+        };
         grid.annotate(info);
 
         // Reachability is measured from the spawns: those are the only places a
@@ -1090,11 +1055,6 @@ impl NavGrid {
             if info.buy_zones.iter().any(|z| player.intersects(z)) {
                 n.flags |= flags::BUY_ZONE;
             }
-            // Our stand-in for YaPB's hand-placed `NodeFlag::Crouch` /
-            // `NodeFlag::Narrow`. A node you can only leave by ducking is the
-            // mouth of a gap a player barely fits through, which is exactly
-            // where a bot must not be handed a jittered target or allowed to
-            // cut the corner.
             if n.links.iter().any(|l| l.kind == Move::Crouch) {
                 n.flags |= flags::NARROW;
             }
@@ -1133,11 +1093,7 @@ impl NavGrid {
     /// no spawns gives no evidence about what is reachable, and throwing the
     /// whole graph away on no evidence would be worse than keeping it.
     fn prune(&mut self, roots: &[usize]) {
-        let mut keep: Vec<bool> = self
-            .nodes
-            .iter()
-            .map(|n| !n.links.is_empty())
-            .collect();
+        let mut keep: Vec<bool> = self.nodes.iter().map(|n| !n.links.is_empty()).collect();
         // A node with no outgoing links is still worth keeping if something
         // links *to* it: it is a dead end you can walk into, such as a pit.
         for n in &self.nodes {
@@ -1192,9 +1148,14 @@ impl NavGrid {
         self.nodes.iter().map(|n| n.links.len()).sum()
     }
 
-    /// The node closest to a world position.
+    /// The node closest to a world position (pure 3D).
     pub fn nearest(&self, p: Vec3) -> Option<usize> {
         route::nearest(self, p)
+    }
+
+    /// Prefer a node on the same floor as `p` (see [`route::nearest_prefer_z`]).
+    pub fn nearest_prefer_z(&self, p: Vec3) -> Option<usize> {
+        route::nearest_prefer_z(self, p)
     }
 
     /// Every node carrying `flag`.
@@ -1250,7 +1211,12 @@ impl NavGrid {
     }
 
     /// The node in lattice cell `cell` closest in height to `z`.
-    fn node_in(&self, cols: &HashMap<(i32, i32), Vec<u32>>, cell: (i32, i32), z: f32) -> Option<usize> {
+    fn node_in(
+        &self,
+        cols: &HashMap<(i32, i32), Vec<u32>>,
+        cell: (i32, i32),
+        z: f32,
+    ) -> Option<usize> {
         let best = cols.get(&cell)?.iter().copied().min_by(|&a, &b| {
             let (da, db) = (
                 (self.nodes[a as usize].origin[2] - z).abs(),
@@ -1268,14 +1234,7 @@ impl NavGrid {
 
     /// Can a bot walk the *straight line* between two nodes?
     ///
-    /// YaPB answers this from `vistab`, a per-node-pair visibility bitmap built
-    /// with traces when the graph is authored (`yapb/src/planner.cpp:186`). We
-    /// cannot: the follower is handed a [`NavGrid`] and nothing else — no BSP,
-    /// no `World`, no way to trace — and a 4715-node map would need eleven
-    /// million traces and a 2.8 MB table to carry one.
-    ///
-    /// So this asks the graph instead, and the graph is not a weaker source
-    /// than a trace: **every edge in it was admitted by a hull trace** through
+    /// Checks the graph edges admitted by hull traces along the corridor.
     /// [`classify`]. Walk the lattice cells the line crosses; each one must
     /// hold a node at roughly the line's height, and consecutive ones must be
     /// joined by a [`Move::Walk`] edge. A wall between the two ends breaks that
@@ -1317,20 +1276,7 @@ impl NavGrid {
     }
 
     /// Must the route stop at a node between `a` and `b`?
-    ///
-    /// `AStarAlgo::cantSkipNode` (`yapb/src/planner.cpp:176-220`), minus one
-    /// test. Its `tooClose` clause reads `distanceSq < cr::sqrtf (40.0f)` —
-    /// `sqrtf`, not `sqrf`, so the threshold is 6.32 *square* units and the
-    /// test fires only for two nodes less than 2.5 units apart. Verified
-    /// against the source rather than assumed: `crlib`'s `sqrf` and `sqrtf` are
-    /// both in scope there, and no graph puts two nodes that close. It is dead
-    /// code, and reproducing it would only look like intent.
-    pub fn cant_skip(
-        &self,
-        a: usize,
-        b: usize,
-        visible: &dyn Fn(usize, usize) -> bool,
-    ) -> bool {
+    pub fn cant_skip(&self, a: usize, b: usize, visible: &dyn Fn(usize, usize) -> bool) -> bool {
         let (na, nb) = (&self.nodes[a], &self.nodes[b]);
         // No radius means "be exactly here", and a node you must arrive at is
         // not one you may skip past.
@@ -1348,24 +1294,18 @@ impl NavGrid {
         }
         // A jump is a button press at a place, not a direction of travel: merge
         // the node away and the bot walks into the lip it was meant to clear.
-        if na.links.iter().chain(&nb.links).any(|l| l.kind == Move::Jump) {
+        if na
+            .links
+            .iter()
+            .chain(&nb.links)
+            .any(|l| l.kind == Move::Jump)
+        {
             return true;
         }
         !visible(a, b)
     }
 
     /// Drop the nodes a bot does not need to visit.
-    ///
-    /// A\* on a 40-unit lattice returns a staircase: the shortest route across
-    /// open ground is a zig-zag of 40-unit hops, and a bot that steers at every
-    /// one of them walks the zig-zag. Greedy skip fixes exactly that — keep the
-    /// last node emitted, and emit the next only when the one *after* it cannot
-    /// be reached directly (`yapb/src/planner.cpp:222-240`).
-    ///
-    /// The result is never worse connected than the input: two consecutive
-    /// nodes of the output are either adjacent in the input or a pair
-    /// [`cant_skip`](Self::cant_skip) has already passed, so nothing further
-    /// apart than [`SKIP_MAX_DIST`] survives.
     pub fn smooth_path(&self, path: &[usize]) -> Vec<usize> {
         let cols = self.columns();
         self.smooth_path_with(path, &|a, b| self.corridor_clear(a, b, &cols))
@@ -1457,7 +1397,10 @@ impl NavGrid {
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
             .ok_or(NavError::TooShort)?;
         if checksum != expected {
-            return Err(NavError::StaleCache { expected, found: checksum });
+            return Err(NavError::StaleCache {
+                expected,
+                found: checksum,
+            });
         }
         let count = rd_u32(16)? as usize;
 
@@ -1486,7 +1429,12 @@ impl NavGrid {
                     kind: Move::from_byte(kind).ok_or(NavError::BadMoveKind(kind))?,
                 });
             }
-            nodes.push(NavNode { origin, flags, radius, links });
+            nodes.push(NavNode {
+                origin,
+                flags,
+                radius,
+                links,
+            });
         }
 
         for (i, n) in nodes.iter().enumerate() {
@@ -1557,32 +1505,97 @@ mod tests {
         let wall = 1000.0 - 16.0;
         Bsp {
             planes: vec![
-                Plane { normal: [0.0, 0.0, 1.0], dist: 36.0, kind: 2 },   // 0
-                Plane { normal: [1.0, 0.0, 0.0], dist: wall, kind: 0 },   // 1
-                Plane { normal: [1.0, 0.0, 0.0], dist: -wall, kind: 0 },  // 2
-                Plane { normal: [0.0, 1.0, 0.0], dist: wall, kind: 1 },   // 3
-                Plane { normal: [0.0, 1.0, 0.0], dist: -wall, kind: 1 },  // 4
-                Plane { normal: [0.0, 0.0, 1.0], dist: 18.0, kind: 2 },   // 5
-                Plane { normal: [0.0, 0.0, 1.0], dist: 0.0, kind: 2 },    // 6
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 36.0,
+                    kind: 2,
+                }, // 0
+                Plane {
+                    normal: [1.0, 0.0, 0.0],
+                    dist: wall,
+                    kind: 0,
+                }, // 1
+                Plane {
+                    normal: [1.0, 0.0, 0.0],
+                    dist: -wall,
+                    kind: 0,
+                }, // 2
+                Plane {
+                    normal: [0.0, 1.0, 0.0],
+                    dist: wall,
+                    kind: 1,
+                }, // 3
+                Plane {
+                    normal: [0.0, 1.0, 0.0],
+                    dist: -wall,
+                    kind: 1,
+                }, // 4
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 18.0,
+                    kind: 2,
+                }, // 5
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 0.0,
+                    kind: 2,
+                }, // 6
             ],
-            nodes: vec![Node { plane: 6, children: [-1, -2] }],
+            nodes: vec![Node {
+                plane: 6,
+                children: [-1, -2],
+            }],
             leaves: vec![
-                Leaf { contents: contents::EMPTY },
-                Leaf { contents: contents::SOLID },
+                Leaf {
+                    contents: contents::EMPTY,
+                },
+                Leaf {
+                    contents: contents::SOLID,
+                },
             ],
             clipnodes: vec![
                 // hull 1, root 0
-                ClipNode { plane: 0, children: [1, -2] },
-                ClipNode { plane: 1, children: [-2, 2] },
-                ClipNode { plane: 2, children: [3, -2] },
-                ClipNode { plane: 3, children: [-2, 4] },
-                ClipNode { plane: 4, children: [-1, -2] },
+                ClipNode {
+                    plane: 0,
+                    children: [1, -2],
+                },
+                ClipNode {
+                    plane: 1,
+                    children: [-2, 2],
+                },
+                ClipNode {
+                    plane: 2,
+                    children: [3, -2],
+                },
+                ClipNode {
+                    plane: 3,
+                    children: [-2, 4],
+                },
+                ClipNode {
+                    plane: 4,
+                    children: [-1, -2],
+                },
                 // hull 3, root 5
-                ClipNode { plane: 5, children: [6, -2] },
-                ClipNode { plane: 1, children: [-2, 7] },
-                ClipNode { plane: 2, children: [8, -2] },
-                ClipNode { plane: 3, children: [-2, 9] },
-                ClipNode { plane: 4, children: [-1, -2] },
+                ClipNode {
+                    plane: 5,
+                    children: [6, -2],
+                },
+                ClipNode {
+                    plane: 1,
+                    children: [-2, 7],
+                },
+                ClipNode {
+                    plane: 2,
+                    children: [8, -2],
+                },
+                ClipNode {
+                    plane: 3,
+                    children: [-2, 9],
+                },
+                ClipNode {
+                    plane: 4,
+                    children: [-1, -2],
+                },
             ],
             models: vec![Model {
                 mins: [-1000.0, -1000.0, -64.0],
@@ -1597,15 +1610,33 @@ mod tests {
     #[test]
     fn the_synthetic_flat_map_is_actually_walled_in() {
         let m = flat_map();
-        assert_eq!(m.hull_point_contents(Hull::Stand, [0.0, 0.0, 36.0]), contents::EMPTY);
-        assert_eq!(m.hull_point_contents(Hull::Stand, [990.0, 0.0, 36.0]), contents::SOLID);
-        assert_eq!(m.hull_point_contents(Hull::Stand, [0.0, -990.0, 36.0]), contents::SOLID);
-        assert_eq!(m.hull_point_contents(Hull::Duck, [990.0, 0.0, 18.0]), contents::SOLID);
-        assert_eq!(m.hull_point_contents(Hull::Duck, [0.0, 0.0, 18.0]), contents::EMPTY);
+        assert_eq!(
+            m.hull_point_contents(Hull::Stand, [0.0, 0.0, 36.0]),
+            contents::EMPTY
+        );
+        assert_eq!(
+            m.hull_point_contents(Hull::Stand, [990.0, 0.0, 36.0]),
+            contents::SOLID
+        );
+        assert_eq!(
+            m.hull_point_contents(Hull::Stand, [0.0, -990.0, 36.0]),
+            contents::SOLID
+        );
+        assert_eq!(
+            m.hull_point_contents(Hull::Duck, [990.0, 0.0, 18.0]),
+            contents::SOLID
+        );
+        assert_eq!(
+            m.hull_point_contents(Hull::Duck, [0.0, 0.0, 18.0]),
+            contents::EMPTY
+        );
     }
 
     fn spawn_info(spawns: &[Vec3]) -> MapInfo {
-        MapInfo { t_spawns: spawns.to_vec(), ..Default::default() }
+        MapInfo {
+            t_spawns: spawns.to_vec(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1613,7 +1644,11 @@ mod tests {
         let m = flat_map();
         let w = World::bare(&m);
         let g = ground_snap(&w, [0.0, 0.0, 100.0]).expect("floor is right there");
-        assert!((g[2] - 36.0).abs() < 0.1, "standing origin should be 36 up, got {}", g[2]);
+        assert!(
+            (g[2] - 36.0).abs() < 0.1,
+            "standing origin should be 36 up, got {}",
+            g[2]
+        );
         // Starting below the floor is start_solid, which is not a floor.
         assert_eq!(ground_snap(&w, [0.0, 0.0, -100.0]), None);
         // Starting too high finds nothing within reach.
@@ -1662,26 +1697,78 @@ mod tests {
     fn crouch_corridor() -> Bsp {
         Bsp {
             planes: vec![
-                Plane { normal: [0.0, 0.0, 1.0], dist: 36.0, kind: 2 }, // 0
-                Plane { normal: [1.0, 0.0, 0.0], dist: 0.0, kind: 0 },  // 1
-                Plane { normal: [1.0, 0.0, 0.0], dist: 32.0, kind: 0 }, // 2
-                Plane { normal: [0.0, 0.0, 1.0], dist: 18.0, kind: 2 }, // 3
-                Plane { normal: [0.0, 0.0, 1.0], dist: 30.0, kind: 2 }, // 4
-                Plane { normal: [0.0, 0.0, 1.0], dist: 0.0, kind: 2 },  // 5
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 36.0,
+                    kind: 2,
+                }, // 0
+                Plane {
+                    normal: [1.0, 0.0, 0.0],
+                    dist: 0.0,
+                    kind: 0,
+                }, // 1
+                Plane {
+                    normal: [1.0, 0.0, 0.0],
+                    dist: 32.0,
+                    kind: 0,
+                }, // 2
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 18.0,
+                    kind: 2,
+                }, // 3
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 30.0,
+                    kind: 2,
+                }, // 4
+                Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    dist: 0.0,
+                    kind: 2,
+                }, // 5
             ],
-            nodes: vec![Node { plane: 5, children: [-1, -2] }],
+            nodes: vec![Node {
+                plane: 5,
+                children: [-1, -2],
+            }],
             leaves: vec![
-                Leaf { contents: contents::EMPTY },
-                Leaf { contents: contents::SOLID },
+                Leaf {
+                    contents: contents::EMPTY,
+                },
+                Leaf {
+                    contents: contents::SOLID,
+                },
             ],
             clipnodes: vec![
-                ClipNode { plane: 0, children: [1, -2] },
-                ClipNode { plane: 1, children: [2, -1] },
-                ClipNode { plane: 2, children: [-1, -2] },
-                ClipNode { plane: 3, children: [4, -2] },
-                ClipNode { plane: 1, children: [5, -1] },
-                ClipNode { plane: 2, children: [-1, 6] },
-                ClipNode { plane: 4, children: [-2, -1] },
+                ClipNode {
+                    plane: 0,
+                    children: [1, -2],
+                },
+                ClipNode {
+                    plane: 1,
+                    children: [2, -1],
+                },
+                ClipNode {
+                    plane: 2,
+                    children: [-1, -2],
+                },
+                ClipNode {
+                    plane: 3,
+                    children: [4, -2],
+                },
+                ClipNode {
+                    plane: 1,
+                    children: [5, -1],
+                },
+                ClipNode {
+                    plane: 2,
+                    children: [-1, 6],
+                },
+                ClipNode {
+                    plane: 4,
+                    children: [-2, -1],
+                },
             ],
             models: vec![Model {
                 mins: [-4096.0; 3],
@@ -1718,7 +1805,10 @@ mod tests {
                 (0.0..=MAX_RADIUS).contains(&r) && (r / RADIUS_STEP).fract() == 0.0,
                 "radius {r} at x={x} is not one of the seven legal values"
             );
-            assert!(r <= last, "radius grew from {last} to {r} while approaching the wall");
+            assert!(
+                r <= last,
+                "radius grew from {last} to {r} while approaching the wall"
+            );
             last = r;
         }
         assert!(last < MAX_RADIUS, "the wall never shrank the radius at all");
@@ -1759,7 +1849,11 @@ mod tests {
         ] {
             let mut n = [0.0f32; 3];
             n[axis] = 1.0;
-            m.planes.push(Plane { normal: n, dist: d, kind: axis as i32 });
+            m.planes.push(Plane {
+                normal: n,
+                dist: d,
+                kind: axis as i32,
+            });
         }
         let root = m.clipnodes.len() as i16;
         // Six half-spaces. Even i is a "low" face: at or past it, keep testing;
@@ -1807,7 +1901,10 @@ mod tests {
         );
         // With the entity in play, the same segment is blocked.
         let w = World::new(&m, &info);
-        assert!(!w.clear(Hull::Stand, a, b), "the crate must block the trace");
+        assert!(
+            !w.clear(Hull::Stand, a, b),
+            "the crate must block the trace"
+        );
         let t = w.trace(Hull::Stand, a, b);
         assert!(
             (t.end[0] - 84.0).abs() < 1.0,
@@ -1846,12 +1943,23 @@ mod tests {
             occupied(&without) > 0,
             "without the entity the fill should walk right through the crate"
         );
-        assert_eq!(occupied(&with), 0, "no node may overlap a solid brush entity");
+        assert_eq!(
+            occupied(&with),
+            0,
+            "no node may overlap a solid brush entity"
+        );
 
         // The far side is still reachable -- the fill goes round, not through.
-        let near = with.nearest([0.0, 0.0, 36.0]).expect("a node near the spawn");
-        let far = with.nearest([320.0, 0.0, 36.0]).expect("a node past the crate");
-        assert!(with.find_path(near, far).is_some(), "the crate cut the map in two");
+        let near = with
+            .nearest([0.0, 0.0, 36.0])
+            .expect("a node near the spawn");
+        let far = with
+            .nearest([320.0, 0.0, 36.0])
+            .expect("a node past the crate");
+        assert!(
+            with.find_path(near, far).is_some(),
+            "the crate cut the map in two"
+        );
     }
 
     #[test]
@@ -1917,7 +2025,11 @@ mod tests {
         let m = flat_map();
         // Spawn far above, out of probe range: nothing snaps, nothing seeds.
         let g = NavGrid::generate(&m, &spawn_info(&[[0.0, 0.0, 100_000.0]]), 0);
-        assert!(g.is_empty(), "expected an empty grid, got {} nodes", g.len());
+        assert!(
+            g.is_empty(),
+            "expected an empty grid, got {} nodes",
+            g.len()
+        );
         assert_eq!(g.find_path(0, 0), None);
         assert_eq!(g.nearest([0.0; 3]), None);
     }
@@ -1938,7 +2050,10 @@ mod tests {
         assert!(!buys.is_empty(), "the buy zone should have tagged nodes");
         for i in &goals {
             let o = g.nodes[*i].origin;
-            assert!(o[0].abs() <= 60.0 + 16.0 && o[1].abs() <= 60.0 + 16.0, "{o:?}");
+            assert!(
+                o[0].abs() <= 60.0 + 16.0 && o[1].abs() <= 60.0 + 16.0,
+                "{o:?}"
+            );
         }
         // And the two sets are disjoint here, so a flag is not leaking.
         assert!(goals.iter().all(|i| !buys.contains(i)));
@@ -1970,7 +2085,10 @@ mod tests {
         let bytes = g.to_bytes();
         assert_eq!(
             NavGrid::from_bytes(&bytes, 2),
-            Err(NavError::StaleCache { expected: 2, found: 1 })
+            Err(NavError::StaleCache {
+                expected: 2,
+                found: 1
+            })
         );
     }
 
@@ -1981,16 +2099,25 @@ mod tests {
                 origin: [1.0, 2.0, 3.0],
                 flags: 0,
                 radius: 32.0,
-                links: vec![Link { to: 0, kind: Move::Walk }],
+                links: vec![Link {
+                    to: 0,
+                    kind: Move::Walk,
+                }],
             }],
             checksum: 5,
         };
         let good = g.to_bytes();
 
-        assert!(matches!(NavGrid::from_bytes(&[], 5), Err(NavError::TooShort)));
+        assert!(matches!(
+            NavGrid::from_bytes(&[], 5),
+            Err(NavError::TooShort)
+        ));
         let mut bad_magic = good.clone();
         bad_magic[0] ^= 0xFF;
-        assert!(matches!(NavGrid::from_bytes(&bad_magic, 5), Err(NavError::BadMagic(_))));
+        assert!(matches!(
+            NavGrid::from_bytes(&bad_magic, 5),
+            Err(NavError::BadMagic(_))
+        ));
         let mut bad_version = good.clone();
         bad_version[4] = 99;
         assert!(matches!(
@@ -2012,7 +2139,10 @@ mod tests {
         // An unknown move kind is caught.
         let mut bad_kind = good.clone();
         *bad_kind.last_mut().unwrap() = 200;
-        assert_eq!(NavGrid::from_bytes(&bad_kind, 5), Err(NavError::BadMoveKind(200)));
+        assert_eq!(
+            NavGrid::from_bytes(&bad_kind, 5),
+            Err(NavError::BadMoveKind(200))
+        );
     }
 
     /// The trap the version number exists for.
@@ -2045,7 +2175,10 @@ mod tests {
                 origin: [10.0, 20.0, 30.0],
                 flags: flags::GOAL,
                 radius: 0.0,
-                links: vec![Link { to: 0, kind: Move::Walk }],
+                links: vec![Link {
+                    to: 0,
+                    kind: Move::Walk,
+                }],
             }],
             checksum: 7,
         }
@@ -2073,7 +2206,10 @@ mod tests {
             Move::Break,
         ] {
             assert_eq!(Move::from_byte(m.to_byte()), Some(m));
-            assert!(m.cost_multiplier() >= 1.0, "{m:?} would break A* admissibility");
+            assert!(
+                m.cost_multiplier() >= 1.0,
+                "{m:?} would break A* admissibility"
+            );
         }
         assert_eq!(Move::from_byte(6), None);
     }
@@ -2107,8 +2243,7 @@ mod tests {
         let data = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
         Some(
-            Bsp::parse(&data)
-                .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display())),
+            Bsp::parse(&data).unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display())),
         )
     }
 
@@ -2147,7 +2282,9 @@ mod tests {
 
     #[test]
     fn de_dust2_is_a_bomb_map_with_two_sites() {
-        let Some(bsp) = real_map("de_dust2") else { return };
+        let Some(bsp) = real_map("de_dust2") else {
+            return;
+        };
         let info = MapInfo::from_bsp(&bsp).expect("should derive");
         assert_eq!(info.scenario, Scenario::Bomb);
         assert_eq!(info.bomb_sites.len(), 2, "de_dust2 has A and B");
@@ -2161,7 +2298,9 @@ mod tests {
 
     #[test]
     fn a_cs_map_is_a_hostage_map_with_a_rescue_zone() {
-        let Some(bsp) = real_map("cs_office") else { return };
+        let Some(bsp) = real_map("cs_office") else {
+            return;
+        };
         let info = MapInfo::from_bsp(&bsp).expect("should derive");
         assert_eq!(info.scenario, Scenario::Hostage);
         assert!(!info.rescue_zones.is_empty());
@@ -2184,10 +2323,9 @@ mod tests {
                 continue;
             }
             let data = std::fs::read(&path).expect("readable");
-            let bsp = Bsp::parse(&data)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let info = MapInfo::from_bsp(&bsp)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let bsp = Bsp::parse(&data).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let info =
+                MapInfo::from_bsp(&bsp).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             eprintln!(
                 "{:<16} {:?} bomb={} rescue={} buy={} ladders={} T={} CT={} hostages={}",
                 path.file_stem().unwrap().to_string_lossy(),
@@ -2260,8 +2398,12 @@ mod tests {
             if info.t_spawns.is_empty() || info.ct_spawns.is_empty() {
                 continue;
             }
-            let t = grid.nearest(info.t_spawns[0]).expect("a node near the T spawn");
-            let ct = grid.nearest(info.ct_spawns[0]).expect("a node near the CT spawn");
+            let t = grid
+                .nearest(info.t_spawns[0])
+                .expect("a node near the T spawn");
+            let ct = grid
+                .nearest(info.ct_spawns[0])
+                .expect("a node near the CT spawn");
             checked += 1;
             if grid.find_path(t, ct).is_some() {
                 connected += 1;
@@ -2280,22 +2422,33 @@ mod tests {
 
     #[test]
     fn de_dust2_generates_a_few_thousand_nodes() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let grid = &g.2;
         assert!(
             grid.len() > 1000,
             "expected a few thousand nodes on de_dust2, got {}",
             grid.len()
         );
-        assert!(grid.len() < 60_000, "suspiciously many nodes: {}", grid.len());
-        assert!(grid.edge_count() > grid.len() * 2, "the graph is barely connected");
+        assert!(
+            grid.len() < 60_000,
+            "suspiciously many nodes: {}",
+            grid.len()
+        );
+        assert!(
+            grid.edge_count() > grid.len() * 2,
+            "the graph is barely connected"
+        );
     }
 
     /// The correctness check that matters: re-run the *same* predicate that
     /// admitted each edge, on every consecutive pair of an actual route.
     #[test]
     fn every_step_of_a_real_route_is_re_admitted_by_the_engine_hull() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let (bsp, info, grid) = (&g.0, &g.1, &g.2);
         let world = World::new(bsp, info);
         let t = grid
@@ -2304,12 +2457,16 @@ mod tests {
         let goal = grid
             .nearest(info.bomb_sites[0].centre())
             .expect("a node near site A");
-        let path = grid.find_path(t, goal).expect("T spawn should reach site A");
+        let path = grid
+            .find_path(t, goal)
+            .expect("T spawn should reach site A");
         assert!(path.len() > 5, "suspiciously short path: {}", path.len());
 
         for w in path.windows(2) {
             let (a, b) = (grid.nodes[w[0]].origin, grid.nodes[w[1]].origin);
-            let recorded = grid.move_between(w[0], w[1]).expect("path used a real edge");
+            let recorded = grid
+                .move_between(w[0], w[1])
+                .expect("path used a real edge");
             assert_eq!(
                 classify(&world, a, b),
                 Some(recorded),
@@ -2362,7 +2519,11 @@ mod tests {
                 // ground probe both take that view.
                 let below = [n.origin[0], n.origin[1], n.origin[2] - 8.0];
                 let t = world.trace_ignoring_breakables(Hull::Stand, n.origin, below);
-                assert!(!t.start_solid, "{name}: node {i} at {:?} is in solid", n.origin);
+                assert!(
+                    !t.start_solid,
+                    "{name}: node {i} at {:?} is in solid",
+                    n.origin
+                );
                 assert!(
                     t.fraction < 1.0 && (t.end[2] - n.origin[2]).abs() < 1.0,
                     "{name}: node {i} at {:?} is floating (stopped at {:?})",
@@ -2405,7 +2566,9 @@ mod tests {
     /// Every recorded edge on a real map, not just the ones on one route.
     #[test]
     fn every_edge_on_a_real_map_is_re_admitted() {
-        let Some(g) = real_grid("cs_assault") else { return };
+        let Some(g) = real_grid("cs_assault") else {
+            return;
+        };
         let (bsp, info, grid) = (&g.0, &g.1, &g.2);
         let world = World::new(bsp, info);
         let mut checked = 0;
@@ -2443,7 +2606,9 @@ mod tests {
 
     #[test]
     fn every_spawn_and_objective_on_de_dust2_has_a_node_near_it() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let (info, grid) = (&g.1, &g.2);
         let check = |label: &str, p: Vec3| {
             let i = grid.nearest(p).expect("a non-empty grid");
@@ -2466,30 +2631,48 @@ mod tests {
 
     #[test]
     fn the_spawns_of_the_two_teams_are_connected_to_each_other() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let (info, grid) = (&g.1, &g.2);
         let t = grid.nearest(info.t_spawns[0]).unwrap();
         let ct = grid.nearest(info.ct_spawns[0]).unwrap();
-        assert!(grid.find_path(t, ct).is_some(), "T spawn cannot reach CT spawn");
-        assert!(grid.find_path(ct, t).is_some(), "CT spawn cannot reach T spawn");
+        assert!(
+            grid.find_path(t, ct).is_some(),
+            "T spawn cannot reach CT spawn"
+        );
+        assert!(
+            grid.find_path(ct, t).is_some(),
+            "CT spawn cannot reach T spawn"
+        );
     }
 
     #[test]
     fn a_ct_can_reach_every_hostage_on_cs_office() {
-        let Some(g) = real_grid("cs_office") else { return };
+        let Some(g) = real_grid("cs_office") else {
+            return;
+        };
         let (info, grid) = (&g.1, &g.2);
         let from = grid.nearest(info.ct_spawns[0]).unwrap();
         for (n, h) in info.hostage_spawns.iter().enumerate() {
             let to = grid.nearest(*h).expect("a node near the hostage");
             let d = route::dist(grid.nodes[to].origin, *h);
-            assert!(d < 128.0, "hostage {n} at {h:?} is {d:.0} units from any node");
-            assert!(grid.find_path(from, to).is_some(), "no route to hostage {n}");
+            assert!(
+                d < 128.0,
+                "hostage {n} at {h:?} is {d:.0} units from any node"
+            );
+            assert!(
+                grid.find_path(from, to).is_some(),
+                "no route to hostage {n}"
+            );
         }
     }
 
     #[test]
     fn the_move_mix_on_a_real_map_is_mostly_walking() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let grid = &g.2;
         let mut counts = [0usize; 6];
         for n in &grid.nodes {
@@ -2510,7 +2693,9 @@ mod tests {
 
     #[test]
     fn both_teams_can_reach_both_bomb_sites_on_de_dust2() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let (info, grid) = (&g.1, &g.2);
         for (team, spawns) in [("T", &info.t_spawns), ("CT", &info.ct_spawns)] {
             let from = grid.nearest(spawns[0]).expect("a node near the spawn");
@@ -2522,17 +2707,16 @@ mod tests {
                     "{team} spawn cannot reach bomb site {n} at {:?}",
                     site.centre()
                 );
-                eprintln!(
-                    "{team} spawn -> site {n}: {} nodes",
-                    path.unwrap().len()
-                );
+                eprintln!("{team} spawn -> site {n}: {} nodes", path.unwrap().len());
             }
         }
     }
 
     #[test]
     fn the_bomb_sites_on_de_dust2_have_flagged_nodes() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let grid = &g.2;
         let goals = grid.nodes_with_flag(flags::GOAL);
         let buys = grid.nodes_with_flag(flags::BUY_ZONE);
@@ -2542,7 +2726,9 @@ mod tests {
 
     #[test]
     fn a_real_grid_round_trips_through_the_cache() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let grid = &g.2;
         let bytes = grid.to_bytes();
         let back = NavGrid::from_bytes(&bytes, grid.checksum).expect("should load");
@@ -2558,9 +2744,13 @@ mod tests {
 
     #[test]
     fn a_hostage_map_routes_from_a_ct_spawn_to_a_rescue_zone() {
-        let Some(g) = real_grid("cs_office") else { return };
+        let Some(g) = real_grid("cs_office") else {
+            return;
+        };
         let (info, grid) = (&g.1, &g.2);
-        let from = grid.nearest(info.ct_spawns[0]).expect("a node near the spawn");
+        let from = grid
+            .nearest(info.ct_spawns[0])
+            .expect("a node near the spawn");
         let to = grid
             .nearest(info.rescue_zones[0].centre())
             .expect("a node near the rescue zone");
@@ -2579,7 +2769,9 @@ mod tests {
     /// destination jitter and the path smoothing that depend on it.
     #[test]
     fn de_dust2_nodes_get_a_spread_of_wayzone_radii() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let grid = &g.2;
 
         let mut hist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
@@ -2594,8 +2786,7 @@ mod tests {
 
         for (i, n) in grid.nodes.iter().enumerate() {
             assert!(
-                (0.0..=MAX_RADIUS).contains(&n.radius)
-                    && (n.radius / RADIUS_STEP).fract() == 0.0,
+                (0.0..=MAX_RADIUS).contains(&n.radius) && (n.radius / RADIUS_STEP).fract() == 0.0,
                 "node {i} has radius {}, which is not one of {{0,16,..,96}}",
                 n.radius
             );
@@ -2628,15 +2819,21 @@ mod tests {
     /// raw node count, and nothing further apart than 400 units.
     #[test]
     fn post_smoothing_takes_the_zig_zag_out_of_a_real_route() {
-        let Some(g) = real_grid("de_dust2") else { return };
+        let Some(g) = real_grid("de_dust2") else {
+            return;
+        };
         let (bsp, info, grid) = (&g.0, &g.1, &g.2);
         let world = World::new(bsp, info);
 
-        let from = grid.nearest(info.t_spawns[0]).expect("a node near the T spawn");
+        let from = grid
+            .nearest(info.t_spawns[0])
+            .expect("a node near the T spawn");
         let to = grid
             .nearest(info.bomb_sites[0].centre())
             .expect("a node near site A");
-        let raw = grid.find_path(from, to).expect("T spawn should reach site A");
+        let raw = grid
+            .find_path(from, to)
+            .expect("T spawn should reach site A");
         let smooth = grid.smooth_path(&raw);
         eprintln!(
             "de_dust2 T spawn -> site A: {} raw nodes -> {} smoothed ({} %)",
@@ -2673,14 +2870,7 @@ mod tests {
                 w[1]
             );
             // Every hop is either an edge the graph already believed in, or a
-            // *new* straight line the corridor test invented -- and the second
-            // kind has to be held to the engine's answer, because the corridor
-            // test is only a stand-in for YaPB's traced visibility table. Hull
-            // 3 at a standing origin spans waist to shoulders, so a kerb inside
-            // `sv_stepsize` -- which a player walks over -- is not an
-            // obstruction, but a wall is.
-            //
-            // The distinction matters: an edge can legitimately be a *fall*,
+            // new straight line the corridor test found.
             // where the straight line leaves the ledge and passes through the
             // wall below it. Asserting a clear line on those would be asserting
             // something untrue about a route the bot has always walked.
@@ -2703,7 +2893,9 @@ mod tests {
 
     #[test]
     fn a_ladder_map_produces_ladder_nodes_and_links() {
-        let Some(g) = real_grid("cs_assault") else { return };
+        let Some(g) = real_grid("cs_assault") else {
+            return;
+        };
         let (info, grid) = (&g.1, &g.2);
         assert_eq!(info.ladders.len(), 8, "cs_assault has eight func_ladder");
         let ladder_nodes = grid.nodes_with_flag(flags::LADDER);
@@ -2716,7 +2908,13 @@ mod tests {
             .iter()
             .map(|n| n.links.iter().filter(|l| l.kind == Move::Ladder).count())
             .sum();
-        eprintln!("cs_assault: {} ladder nodes, {ladder_links} ladder links", ladder_nodes.len());
-        assert!(ladder_links > 0, "ladder nodes exist but nothing climbs them");
+        eprintln!(
+            "cs_assault: {} ladder nodes, {ladder_links} ladder links",
+            ladder_nodes.len()
+        );
+        assert!(
+            ladder_links > 0,
+            "ladder nodes exist but nothing climbs them"
+        );
     }
 }

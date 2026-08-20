@@ -36,7 +36,7 @@
 //! to a different target restarts it.
 
 use crate::aim::{
-    aim_error, compensate, predict_punch, COMBAT_GAINS, NAV_GAINS, SpringGains, ViewMotion,
+    aim_error, compensate, predict_punch, SpringGains, ViewMotion, COMBAT_GAINS, NAV_GAINS,
 };
 use crate::combat::{engage, select_target, EngageParams};
 use crate::fire::FireControl;
@@ -51,8 +51,9 @@ use crate::objective::hostage::{HostageEscort, ESCORT_WALK_SPEED};
 use crate::objective::{Objective, ObjectiveState};
 use crate::rng::Rng;
 use crate::task::Difficulty;
-use crate::weapons::WeaponId;
-use crate::world::WorldView;
+use crate::utility::{NadeKind, ThrowMachine};
+use crate::weapons::{Equipment, WeaponId};
+use crate::world::{Team, WorldView};
 
 /// Full running speed. CS 1.6's `cl_forwardspeed`/`cl_sidespeed` default is
 /// 400, but the weapon-carry cap is 250; the bot moves at the cap it can
@@ -71,7 +72,6 @@ pub const ARRIVE_RADIUS: f32 = 24.0;
 /// no waypoint left, arriving within this room-scale radius is correct --
 /// otherwise the bot grinds at the site edge forever (see the `goto` rung).
 pub const SITE_ARRIVE_RADIUS: f32 = 80.0;
-
 
 /// Speed at which the bot makes no footstep noise.
 ///
@@ -161,12 +161,7 @@ pub const STRAFE_MAX: f64 = 1.15;
 /// that is not quite steady.
 pub const AIM_ERROR_REFRESH: f32 = 0.35;
 
-/// Plan W1: this bot's personality, as (aggression, fear) in `[0,1]`.
-///
-/// YaPB draws `m_baseAgressionLevel` / `m_baseFearLevel` from a personality
-/// window per bot (`yapb/src/manager.cpp:199-213, 1236-1254`): 50% Normal
-/// (`rg(0.4,0.7)` both), else 50/50 Rusher (`rg(0.7,1.0)` /
-/// `rg(0.0,0.4)`) or Careful (`rg(0.2,0.5)` / `rg(0.7,1.0)`).
+/// Personality profile, as (aggression, fear) in `[0,1]`.
 ///
 /// Deterministic in the seed so a given bot is the same bot every round, and
 /// independent of the RNG stream used for behaviour.
@@ -184,6 +179,12 @@ pub fn personality(seed: u64) -> (f32, f32) {
         r if r < 0.75 => (0.7 + u(seed + 1) * 0.3, u(seed + 2) * 0.4),
         _ => (0.2 + u(seed + 1) * 0.3, 0.7 + u(seed + 2) * 0.3),
     }
+}
+
+/// Point to aim at while navigating: same XY as the path, eye height of the
+/// bot (not the bombsite floor / nav lattice z). Keeps pitch near-level.
+fn nav_look_point(from: Vec3, look: Vec3) -> Vec3 {
+    [look[0], look[1], from[2] + crate::math::VIEW_HEIGHT]
 }
 
 /// Linear interpolation between two world points, for the camp view sweep.
@@ -219,12 +220,7 @@ pub struct Nav {
     /// straight at the goal, which is only correct in an open room.
     pub waypoint: Option<Vec3>,
     /// Where to LOOK while walking -- a point further along the route than
-    /// [`Nav::waypoint`], because the head leads the body. `None` means look
-    /// at [`Nav::steer`] like the feet do.
-    ///
-    /// This is deliberately not the path's raw next node list: the caller's
-    /// navigation layer applies YaPB's visibility/radius ladder exactly once,
-    /// here, instead of the brain re-deriving graph state it does not own.
+    /// [`Nav::waypoint`], because the head leads the body.
     pub look: Option<Vec3>,
     /// The caller's navigation layer advanced to a new waypoint this tick.
     ///
@@ -287,13 +283,7 @@ impl From<Option<Vec3>> for Nav {
     }
 }
 
-/// Plan W5: a post-arrival camp/guard task.
-///
-/// The plan's YaPB rule: a bot that has reached its objective picks a defend
-/// node 300-600u away that no teammate has claimed, walks to it, holds there
-/// for a while sweeping the view, then re-picks. The claim mechanism is the
-/// W2 deterministic partition (bot index + round), so no IPC is needed and a
-/// teammate behind a wall is not a problem.
+/// Post-arrival camp/guard task.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CampTask {
     /// Where to stand (the defend point).
@@ -338,7 +328,14 @@ impl CampTask {
 pub struct Controller {
     pub params: EngageParams,
     pub difficulty: Difficulty,
+    /// Construction seed — util slot ownership + economy spread.
+    pub seed: u64,
     pub rng: Rng,
+    /// Phase U2: coordinated nade throws.
+    throw: ThrowMachine,
+    /// Nades granted by this round's freeze buy (bitmask of [`NadeKind::owned_bit`]).
+    /// `clientdata.weapons` is not on the wire, so this is our inventory source.
+    owned_nades: u8,
     /// Current smoothed view angle, carried between ticks.
     ///
     /// This is **where the bullets should go**, not what gets sent — see the
@@ -356,6 +353,8 @@ pub struct Controller {
     pub idle: AntiIdle,
     /// The target being tracked, and for how long it has been visible.
     tracking: Option<(u16, f32)>,
+    /// Last combat target origin for constant-velocity aim lead (Phase C).
+    enemy_prev: Option<(u16, Vec3)>,
     /// The current aim error, in degrees, and how long it has been held.
     aim_offset: (Angles, f32),
     /// The weapon we last saw ourselves holding, so the fire latches can be
@@ -367,14 +366,7 @@ pub struct Controller {
     /// velocity, and a fleet that does is a tell no amount of path variety
     /// hides -- thirty dots crossing a map in perfect lockstep.
     pace: f32,
-    /// Plan W1: this bot's personality, drawn once at construction.
-    ///
-    /// YaPB draws `m_baseAgressionLevel` / `m_baseFearLevel` from a personality
-    /// window per bot. Normal: `rg(0.4,0.7)` on both; Rusher:
-    /// `rg(0.7,1.0)` / `rg(0.0,0.4)`; Careful: `rg(0.2,0.5)` /
-    /// `rg(0.7,1.0)` (`yapb/src/manager.cpp:199-213, 1236-1254`).
-    /// Used by W5 (camp hold scaled by fear) and W6 (slow near the goal when
-    /// fear is high).
+    /// Personality, drawn once at construction.
     pub aggression: f32,
     pub fear: f32,
     /// Natural-walker C: body-yaw turn overshoot state.
@@ -440,7 +432,10 @@ impl Controller {
         let this = Self {
             params: EngageParams::default(),
             difficulty,
+            seed,
             rng: Rng::new(seed),
+            throw: ThrowMachine::default(),
+            owned_nades: 0,
             view: Angles::default(),
             view_motion: ViewMotion::default(),
             objective: ObjectiveState::default(),
@@ -450,14 +445,13 @@ impl Controller {
             fire: FireControl::new(difficulty.fire_params()),
             idle: AntiIdle::from_seed(seed),
             tracking: None,
+            enemy_prev: None,
             aim_offset: (Angles::default(), f32::INFINITY),
             last_weapon: WeaponId::None,
             // 0.82..1.00 of full speed. Wide enough to be visible when two bots
             // run the same corridor, narrow enough that nobody is left behind.
             pace: 0.82 + (seed % 19) as f32 * 0.01,
-            // Plan W1: personality drawn once per bot, from the seed's RNG.
-            // 50% Normal, else 50/50 Rusher/Careful, each with YaPB's
-            // aggression/fear windows (manager.cpp:199-213).
+            // Personality profile:
             aggression: personality(seed).0,
             fear: personality(seed).1,
             over_time: 0.0,
@@ -474,7 +468,10 @@ impl Controller {
         };
         // A mis-tuned per-seed drift is a loud failure here, not a bot quietly
         // kicked twenty minutes in.
-        debug_assert!(this.idle.guarantees(), "the per-seed anti-idle must be provably safe");
+        debug_assert!(
+            this.idle.guarantees(),
+            "the per-seed anti-idle must be provably safe"
+        );
         this
     }
 
@@ -486,25 +483,19 @@ impl Controller {
     /// underdamped gains: the overshoot IS the flick. Nav uses the stiff
     /// damped pair: walking somewhere is a purpose, not a reflex.
     fn aim_at(&mut self, desired: Angles, gains: SpringGains, dt: f32) {
-        self.view = self.view_motion.step(self.view, desired, gains, f64::from(dt));
+        self.view = self
+            .view_motion
+            .step(self.view, desired, gains, f64::from(dt));
     }
 
     /// Advance the view toward `desired` on a movement rung: guarded so a big
     /// turn cannot swing through the back of the bot's own head.
     ///
-    /// `travel_yaw` is the bearing of the point being walked to; when the
-    /// short way round would take the view behind the direction of travel the
-    /// spring is driven the long way around instead (YaPB's
-    /// `updateLookAngles`, `yapb/src/vision.cpp:172-195`).
-    fn aim_at_guarded(
-        &mut self,
-        desired: Angles,
-        gains: SpringGains,
-        dt: f32,
-        travel_yaw: f64,
-    ) {
+    /// `travel_yaw` is the bearing of the point being walked to.
+    fn aim_at_guarded(&mut self, desired: Angles, gains: SpringGains, dt: f32, travel_yaw: f64) {
         self.view =
-            self.view_motion.step_guarded(self.view, desired, gains, f64::from(dt), travel_yaw);
+            self.view_motion
+                .step_guarded(self.view, desired, gains, f64::from(dt), travel_yaw);
     }
 
     /// The aim error to apply this tick, re-drawn periodically.
@@ -611,7 +602,11 @@ impl Controller {
             }
             None => 1.0,
         };
-        let ease = if remaining <= APPROACH_RADIUS { WALK_SPEED / FORWARD_SPEED } else { 1.0 };
+        let ease = if remaining <= APPROACH_RADIUS {
+            WALK_SPEED / FORWARD_SPEED
+        } else {
+            1.0
+        };
         let scale = slow * ease * speed_scale;
 
         // Natural-walker C: body-yaw turn overshoot. On a hard bearing change
@@ -620,12 +615,20 @@ impl Controller {
         // so it can never aim into a wall.
         let over = self.turn_overshoot(delta, dt);
 
-        let (f, s) = move_axes_strafe(view.yaw, bearing + over, speed * turn * self.pace * scale, weave);
+        let (f, s) = move_axes_strafe(
+            view.yaw,
+            bearing + over,
+            speed * turn * self.pace * scale,
+            weave,
+        );
         // The weave must not push the total sidemove past the engine cap.
         (f, s.clamp(-250.0, 250.0))
     }
 
     /// Body-yaw turn overshoot: a brief swing wide on hard corners.
+    ///
+    /// Kept small — large overshoot + unstick yaw read as the crosshair
+    /// "jumping" on the live radar camera.
     ///
     /// Plan natural-walking-model.md, part C. When the bearing changes by more
     /// than [`TURN_SLOW_ANGLE`], the bot steers at `bearing + over` for a
@@ -642,7 +645,7 @@ impl Controller {
         }
         if self.over_time > 0.0 {
             self.over_time -= dt;
-            let amt = 12.0 * self.over_dir;
+            let amt = 6.0 * self.over_dir;
             if self.over_time <= 0.0 {
                 self.over_dir = 0.0;
             }
@@ -659,12 +662,13 @@ impl Controller {
     /// [`HOP_SLOW_SCALE`] of full speed; otherwise the hop runs at normal
     /// pace. The `fear`-driven and approach slow-downs are separate.
     pub fn note_node_advance(&mut self) {
-        let pct = HOP_SLOW_PCT * match self.difficulty {
-            Difficulty::Easy => 1.0,
-            Difficulty::Normal => 2.0,
-            Difficulty::Hard => 3.0,
-            Difficulty::Unfair => 4.0,
-        };
+        let pct = HOP_SLOW_PCT
+            * match self.difficulty {
+                Difficulty::Easy => 1.0,
+                Difficulty::Normal => 2.0,
+                Difficulty::Hard => 3.0,
+                Difficulty::Unfair => 4.0,
+            };
         self.hop_slow = if self.rng.chance(f64::from(pct) / 100.0) {
             Some(HOP_SLOW_SCALE)
         } else {
@@ -672,14 +676,39 @@ impl Controller {
         };
     }
 
-    /// Plan W5: how long this bot holds a camp/defend spot, scaled by fear.
-    ///
-    /// YaPB camps for `rg(camp_min, camp_max)` seconds; a more fearful bot
-    /// holds longer before moving on. Drawn per task so two camps are not
-    /// identical.
+    /// How long this bot holds a camp/defend spot, scaled by fear.
     fn camp_hold(&mut self) -> f32 {
-        let base = self.rng.range(8.0, 16.0) as f32;
-        base * (1.0 + self.fear * 0.5)
+        let base = self.rng.range(5.0, 12.0) as f32;
+        base * (1.0 + self.fear * 0.45) * (1.0 - self.aggression * 0.45).max(0.35)
+    }
+
+    /// Leave the site and push somewhere the round can still happen.
+    ///
+    /// Sets [`Controller::nav_goal`] so the path follower routes across the
+    /// map again (enemy last-seen, else a long-range patrol). Without this,
+    /// arrival permanently parks the bot in local 120–320u roam near the
+    /// site and combat dies as soon as the first push ends.
+    fn pick_hunt_goal(&mut self, world: &WorldView) {
+        if let Some(e) = world.known_enemies().min_by(|a, b| {
+            distance2d(world.me.origin, a.origin)
+                .partial_cmp(&distance2d(world.me.origin, b.origin))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            self.nav_goal = Some(e.origin);
+        } else {
+            let a = self.rng.unit() * std::f64::consts::TAU;
+            // Long enough to force a real re-route on dust2 (spawn→site ~2–3k).
+            let r = self.rng.range(1000.0, 2400.0);
+            self.nav_goal = Some([
+                world.me.origin[0] + (a.cos() * r) as f32,
+                world.me.origin[1] + (a.sin() * r) as f32,
+                world.me.origin[2],
+            ]);
+        }
+        self.roam_timer = 0.0;
+        self.roam_stuck_for = 0.0;
+        self.post_arrival = None;
+        self.failed_defend = None;
     }
 
     /// Plan W5: one tick of the post-arrival camp/roam task.
@@ -695,12 +724,7 @@ impl Controller {
             // is a post-arrival reposition, not a route hop, so WALK_SPEED.
             task.give_up_after -= dt;
             let look_angles = aim_angles(world.me.origin, task.spot);
-            self.aim_at_guarded(
-                look_angles,
-                NAV_GAINS,
-                dt,
-                f64::from(look_angles.yaw),
-            );
+            self.aim_at_guarded(look_angles, NAV_GAINS, dt, f64::from(look_angles.yaw));
             self.rung = "camp";
             let view = self.wire_view(world);
             // Never walk backwards to a camp spot: if the spot is behind the
@@ -714,17 +738,32 @@ impl Controller {
             let (forwardmove, sidemove) = if delta > TURN_STOP_ANGLE {
                 (0.0, 0.0)
             } else {
-                self.travel(view, world.me.origin, task.spot, WALK_SPEED, to_spot, 0.0, 1.0, dt)
+                self.travel(
+                    view,
+                    world.me.origin,
+                    task.spot,
+                    WALK_SPEED,
+                    to_spot,
+                    0.0,
+                    1.0,
+                    dt,
+                )
             };
-            return Intent { view, forwardmove, sidemove, move_target: Some(task.spot), ..Intent::default() };
+            return Intent {
+                view,
+                forwardmove,
+                sidemove,
+                move_target: Some(task.spot),
+                ..Intent::default()
+            };
         }
         // Give up on an unreachable spot: hold where we are instead of
         // grinding toward geometry we cannot stand on.
         task.moving = false;
 
-        // Holding: sweep the view between the two points, and stand still.
+        // Holding: sweep the view between the two points at head height.
         let phase = 1.0 - (task.hold_left / task.hold_total).max(0.0);
-        let sweep = lerp_vec(task.sweep_a, task.sweep_b, phase);
+        let sweep = nav_look_point(world.me.origin, lerp_vec(task.sweep_a, task.sweep_b, phase));
         let look_angles = aim_angles(world.me.origin, sweep);
         self.aim_at_guarded(
             look_angles,
@@ -736,7 +775,10 @@ impl Controller {
 
         self.rung = "camp";
         let view = self.wire_view(world);
-        let mut intent = Intent { view, ..Intent::default() };
+        let mut intent = Intent {
+            view,
+            ..Intent::default()
+        };
         // The caller drops the task when hold_left hits zero, so a fresh
         // defend point is picked for the next hold.
         if task.hold_left <= 0.0 {
@@ -767,8 +809,10 @@ impl Controller {
         self.escort.reset();
         self.fire.reset();
         self.tracking = None;
+        self.enemy_prev = None;
         self.nav_goal = None;
         self.failed_defend = None;
+        self.post_arrival = None;
     }
 
     /// How long the current target has been visible, advancing the counter.
@@ -823,9 +867,13 @@ impl Controller {
         if world.me.freeze_period {
             self.fire.reset();
             self.tracking = None;
+            // Rising-edge reset of used util slots for the new round.
+            let _ = self.throw.tick(world, self.seed, self.owned_nades, dt);
             let view = self.wire_view(world);
             let mut intent = Intent::hold(view);
-            intent.commands = self.buy_plan(world);
+            let plan = self.buy_plan(world);
+            self.note_buy_util(&plan);
+            intent.commands = plan;
             self.rung = "freeze";
             return intent;
         }
@@ -843,8 +891,46 @@ impl Controller {
         let threat = select_target(world, &self.params).copied().filter(|t| {
             !carrying || distance2d(world.me.origin, t.origin) <= CARRIER_HOLDS_FIRE_BEYOND
         });
-        if let Some(target) = threat {
-            let eng = engage(world, &target, self.view, &self.params, &mut self.rng);
+        // While walking a lineup, only *close* gunfights abort util. Far peeks
+        // must not cancel mid smoke forever. Outside util, any threat engages.
+        let engage_target = threat.filter(|t| {
+            let d = distance2d(world.me.origin, t.origin);
+            !self.throw.active() || d < 700.0
+        });
+        if let Some(target) = engage_target {
+            // Drop util mid-fight (keep used-slot memory).
+            if self.throw.active() {
+                self.throw.abort_active();
+            }
+            let mut eng = engage(world, &target, self.view, &self.params, &mut self.rng);
+
+            // Mild constant-velocity lead — capped so we do not aim through a
+            // wall past a strafing enemy (live: "shooting through walls" when
+            // the lead point left LOS).
+            if target.visible {
+                if let Some((e, prev)) = self.enemy_prev {
+                    if e == target.entity && dt > 1e-4 {
+                        let lead_t = match self.difficulty {
+                            Difficulty::Easy => 0.03,
+                            Difficulty::Normal => 0.06,
+                            Difficulty::Hard => 0.09,
+                            Difficulty::Unfair => 0.12,
+                        };
+                        let mut pred = [
+                            target.origin[0] + (target.origin[0] - prev[0]) / dt * lead_t,
+                            target.origin[1] + (target.origin[1] - prev[1]) / dt * lead_t,
+                            target.origin[2] + (target.origin[2] - prev[2]) / dt * lead_t,
+                        ];
+                        // Never lead more than ~half a body per axis from truth.
+                        for i in 0..3 {
+                            let d = pred[i] - target.origin[i];
+                            pred[i] = target.origin[i] + d.clamp(-24.0, 24.0);
+                        }
+                        eng.aim = aim_angles(world.me.origin, crate::math::eye_position(pred));
+                    }
+                }
+            }
+            self.enemy_prev = Some((target.entity, target.origin));
 
             // A new target is a new mistake: re-draw the aim error rather than
             // carrying the last one across, which would otherwise let a bot
@@ -861,9 +947,12 @@ impl Controller {
             // Three independent gates, all of which must pass. The cone is
             // measured against where the bot *thinks* it should be pointing —
             // the error is a mistake it is not aware of making.
+            //
+            // `target.visible` is re-checked every tick (world + brush LOS).
+            // Firing without it is the wallbang tell.
             let reacted = self.reacted(target.entity, dt);
             let on_target = aim_error(self.view, intended) <= self.params.fire_cone_degrees;
-            let want = reacted && on_target && eng.fire && world.me.can_shoot;
+            let want = target.visible && reacted && on_target && eng.fire && world.me.can_shoot;
 
             // Wanting the shot and being able to take it are different things.
             // Spread is chosen at the instant of PrimaryAttack from
@@ -905,8 +994,16 @@ impl Controller {
             } else {
                 let closing = if eng.advance { FORWARD_SPEED } else { 0.0 };
                 let remaining = distance2d(world.me.origin, target.origin);
-                let (f, s) =
-                    self.travel(view, world.me.origin, target.origin, closing, remaining, 0.0, 1.0, dt);
+                let (f, s) = self.travel(
+                    view,
+                    world.me.origin,
+                    target.origin,
+                    closing,
+                    remaining,
+                    0.0,
+                    1.0,
+                    dt,
+                );
                 (f, s + STRAFE_SPEED * side)
             };
 
@@ -922,6 +1019,46 @@ impl Controller {
         }
         self.tracking = None;
 
+        // --- 3b) Utility throw (U2) ---------------------------------------
+        // After combat, before plant/goto. Owners walk to lineup, pin, release.
+        if let Some(ti) = self.throw.tick(world, self.seed, self.owned_nades, dt) {
+            self.aim_at(ti.aim, NAV_GAINS, dt);
+            let view = self.wire_view(world);
+            let (forwardmove, sidemove) = if let Some(to) = ti.move_to {
+                let remaining = distance2d(world.me.origin, to);
+                self.travel(
+                    view,
+                    world.me.origin,
+                    to,
+                    FORWARD_SPEED,
+                    remaining,
+                    0.0,
+                    1.0,
+                    dt,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let mut intent = Intent {
+                view,
+                forwardmove,
+                sidemove,
+                attack: ti.attack,
+                move_target: ti.move_to,
+                ..Intent::default()
+            };
+            if let Some(w) = ti.select {
+                intent.commands.push(BotCommand::Select(w));
+            }
+            // Consume inventory bits for slots marked used this round.
+            if ti.rung == "util-done" {
+                self.consume_used_util_kinds();
+            }
+            self.rung = ti.rung;
+            return intent;
+        }
+        self.enemy_prev = None;
+
         // --- 4/5) Objectives ----------------------------------------------
         // Defuse first: a live bomb is a countdown and outranks everything.
         let defuse = self.defuse.tick(world, self.view, dt);
@@ -934,7 +1071,16 @@ impl Controller {
             let (forwardmove, sidemove) = match defuse.move_to {
                 Some(to) => {
                     let remaining = distance2d(world.me.origin, to);
-                    self.travel(view, world.me.origin, to, FORWARD_SPEED, remaining, 0.0, 1.0, dt)
+                    self.travel(
+                        view,
+                        world.me.origin,
+                        to,
+                        FORWARD_SPEED,
+                        remaining,
+                        0.0,
+                        1.0,
+                        dt,
+                    )
                 }
                 None => (0.0, 0.0),
             };
@@ -956,13 +1102,21 @@ impl Controller {
                 // Arrival is measured against the bomb site; steering follows
                 // the route to it. Once arrived the route is irrelevant and the
                 // site itself is what to face.
-                let steer = if arrived { target } else { nav.steer().unwrap_or(target) };
+                let steer = if arrived {
+                    target
+                } else {
+                    nav.steer().unwrap_or(target)
+                };
                 // The head leads the body: on the walk in, look further along
                 // the route than the feet are aiming at. Once arrived (or with
                 // no route), the site itself is what to face -- and the plant
                 // machine's use cone is against it, so looking away would be
                 // sabotage.
-                let look = if arrived { target } else { nav.look.unwrap_or(steer) };
+                let look = if arrived {
+                    target
+                } else {
+                    nav.look.unwrap_or(steer)
+                };
                 let look_angles = aim_angles(world.me.origin, look);
                 self.aim_at_guarded(
                     look_angles,
@@ -1030,6 +1184,7 @@ impl Controller {
                     intent.commands.push(BotCommand::Select(w));
                 }
                 self.rung = if arrived { "plant" } else { "plant-walk" };
+                self.holster_nade_if_idle(world, &mut intent);
                 return intent;
             }
         }
@@ -1066,7 +1221,11 @@ impl Controller {
             // range are the follower's `None`, not a guess.
             let steer = escort.move_to.map(|to| nav.steer().unwrap_or(to));
 
-            let speed = if escort.walk { WALK_SPEED } else { FORWARD_SPEED };
+            let speed = if escort.walk {
+                WALK_SPEED
+            } else {
+                FORWARD_SPEED
+            };
             self.rung = "hostage";
             let view = self.wire_view(world);
             let (forwardmove, sidemove) = match steer {
@@ -1101,7 +1260,11 @@ impl Controller {
         //
         // Going to the site is right whether or not there is an objective to
         // perform there -- it is where the round happens.
-        if let Some(t) = self.objective.target.or(nav.goal) {
+        // Destination priority: bomb machine target > hunt/patrol nav_goal >
+        // map objective. Hunt goals must win the arrival test too, or a bot
+        // that set nav_goal after camping still measures "arrived" at the
+        // old site and never leaves (live: endless `roam` at to_goal ~0).
+        if let Some(t) = self.objective.target.or(self.nav_goal).or(nav.goal) {
             // A bomb site is a room, not a point. Once the route is exhausted
             // (no waypoint left, steering straight at the goal) the goal point
             // may sit inside a brush the bot cannot stand in -- so being
@@ -1110,13 +1273,24 @@ impl Controller {
             // server reports velocity 0 (measured: 98.7% of "still" samples
             // were requesting movement with wp 0 / node -1).
             let route_done = nav.waypoint.is_none();
-            let arrive_r = if route_done { SITE_ARRIVE_RADIUS } else { ARRIVE_RADIUS };
+            let arrive_r = if route_done {
+                SITE_ARRIVE_RADIUS
+            } else {
+                ARRIVE_RADIUS
+            };
             let arrived = distance2d(world.me.origin, t) < arrive_r;
             let steer = if arrived { t } else { nav.steer().unwrap_or(t) };
             // Look ahead of the feet, with the back-swing guard: a head leads
             // a body, and it never swings backwards through its own neck.
-            let look = if arrived { t } else { nav.look.unwrap_or(steer) };
-            let look_angles = aim_angles(world.me.origin, look);
+            // Look at head-height above the path point, not the floor of a
+            // bomb-site brush (live B-site: bots entered then stared at ground).
+            let look = if arrived {
+                t
+            } else {
+                nav.look.unwrap_or(steer)
+            };
+            let look_eye = nav_look_point(world.me.origin, look);
+            let look_angles = aim_angles(world.me.origin, look_eye);
             self.aim_at_guarded(
                 look_angles,
                 NAV_GAINS,
@@ -1130,15 +1304,26 @@ impl Controller {
             }
 
             // Plan W5: once arrived, do something instead of standing still.
+            // Phase G4: post-plant T defence must NOT hunt mid — stay on holds.
+            let post_plant = self.objective.objective == Objective::DefendPlant
+                || (world.bomb.planted && world.me.team == Team::Terrorist);
             if arrived {
                 if self.post_arrival.is_none() {
                     // First tick of arrival: start a camp/roam task. The defend
                     // point comes from the caller (which owns the grid); without
                     // one, roam -- but keep moving, never a hard stop.
-                    if let Some(defend) = nav.defend_point {
+                    // Post-plant: camp the hold itself, look toward bomb/site.
+                    if post_plant {
+                        let look = world.bomb.origin.unwrap_or(t);
+                        let hold = self.camp_hold() * 1.5;
+                        self.post_arrival = Some(CampTask::new(t, look, t, hold));
+                    } else if let Some(defend) = nav.defend_point {
                         // If this exact spot already failed us (unreachable),
                         // do not grind toward it again -- roam instead.
-                        if self.failed_defend.map_or(true, |f| distance2d(f, defend) > 40.0) {
+                        if self
+                            .failed_defend
+                            .map_or(true, |f| distance2d(f, defend) > 40.0)
+                        {
                             // Sweep between the defend spot and a point slightly
                             // back toward the goal, so the view moves during the
                             // hold.
@@ -1149,80 +1334,81 @@ impl Controller {
                     }
                 }
                 if let Some(mut task) = self.post_arrival.take() {
-                    let intent = self.camp_tick(&mut task, world, dt);
+                    let mut intent = self.camp_tick(&mut task, world, dt);
                     if task.give_up_after <= 0.0 && task.moving {
                         // The spot was unreachable: remember it so the next
-                        // arrival does not pick it again, and roam instead.
+                        // arrival does not pick it again, and hunt instead.
                         self.failed_defend = Some(task.spot);
+                        if !post_plant {
+                            self.pick_hunt_goal(world);
+                        }
+                        // Fall through to path toward the new hunt goal next
+                        // tick (nav_goal now set; this tick still returns camp
+                        // pose which is fine for one frame).
                     } else if task.hold_left > dt {
-                        // Still holding: put the task back. Once the hold has
-                        // effectively elapsed (epsilon for float drift), drop
-                        // it so a fresh defend point is picked.
+                        // Still holding: put the task back.
                         self.post_arrival = Some(task);
+                    } else if post_plant {
+                        // Re-hold: do not abandon the planted bomb.
+                        let look = world.bomb.origin.unwrap_or(t);
+                        let hold = self.camp_hold() * 1.5;
+                        self.post_arrival = Some(CampTask::new(t, look, t, hold));
+                    } else {
+                        // Hold finished: leave the site and re-engage the map.
+                        self.pick_hunt_goal(world);
                     }
+                    if post_plant {
+                        self.rung = "defend";
+                    }
+                    self.holster_nade_if_idle(world, &mut intent);
                     return intent;
                 }
-                // No defend point and no task: roam slowly, keeping the
-                // anti-idle alive. Roam to a random nearby drift point, NOT
-                // the objective -- the site point can be inside a brush the
-                // bot cannot stand on, and walking at it forever reads as
-                // stuck (measured: `fwd 59` in roam, `vel 0`, for minutes).
-                //
-                // A random point can also be across a wall: if we have made no
-                // progress for a few seconds (server-measured speed ~ 0), pick
-                // a new one instead of grinding.
-                if self.roam_timer <= 0.0 || (self.roam_stuck_for > 2.5 && world.me.speed < 10.0) {
-                    let a = self.rng.unit() * std::f64::consts::TAU;
-                    let r = self.rng.range(120.0, 320.0);
-                    self.roam_target = [
-                        world.me.origin[0] + (a.cos() * r) as f32,
-                        world.me.origin[1] + (a.sin() * r) as f32,
-                        world.me.origin[2],
-                    ];
-                    self.roam_timer = self.rng.range(3.0, 7.0) as f32;
-                    self.roam_stuck_for = 0.0;
-                }
-                self.roam_timer -= dt;
-                if world.me.speed < 10.0 {
-                    self.roam_stuck_for += dt;
-                } else {
-                    self.roam_stuck_for = 0.0;
-                }
-                self.rung = "roam";
-                let view = self.wire_view(world);
-                // Never back up to a roam point either (same tell as camp):
-                // if the target is behind the view, just turn -- the view
-                // leads, the walk resumes. Measured: `fwd -37 yaw -13` while
-                // roaming with site None.
-                let delta = norm_angle(
-                    f64::from(aim_angles(world.me.origin, self.roam_target).yaw)
-                        - f64::from(view.yaw),
-                )
-                .abs();
-                let (forwardmove, sidemove) = if delta > TURN_STOP_ANGLE {
-                    (0.0, 0.0)
-                } else {
-                    self.travel(
+                if post_plant {
+                    // No camp task yet: stand and face the bomb area.
+                    self.rung = "defend";
+                    let view = self.wire_view(world);
+                    let mut intent = Intent {
                         view,
-                        world.me.origin,
-                        self.roam_target,
-                        WALK_SPEED,
-                        200.0,
-                        nav.weave,
-                        nav.speed_scale,
-                        dt,
-                    )
-                };
-                return Intent {
+                        move_target: Some(t),
+                        ..Intent::default()
+                    };
+                    self.holster_nade_if_idle(world, &mut intent);
+                    return intent;
+                }
+                // No defend point and no task: do NOT micro-roam forever next
+                // to the site (that is what looked "stuck, no fighting" on the
+                // live radar). Immediately pick a hunt/patrol destination so
+                // the path follower routes across the map and teams meet again.
+                self.pick_hunt_goal(world);
+                self.rung = "hunt";
+                let view = self.wire_view(world);
+                let to = self.nav_goal.unwrap_or(t);
+                // First step toward the hunt point (path follower takes over
+                // with a proper route next frame via nav_goal). Prefer full
+                // speed so the bot visibly leaves the site pile.
+                let remaining = distance2d(world.me.origin, to);
+                let (forwardmove, sidemove) = self.travel(
+                    view,
+                    world.me.origin,
+                    to,
+                    FORWARD_SPEED,
+                    remaining,
+                    0.0,
+                    1.0,
+                    dt,
+                );
+                let mut intent = Intent {
                     view,
                     forwardmove,
                     sidemove,
-                    move_target: Some(self.roam_target),
+                    move_target: Some(to),
                     ..Intent::default()
                 };
+                self.holster_nade_if_idle(world, &mut intent);
+                return intent;
             }
 
-            self.rung = "goto";
+            self.rung = if post_plant { "defend" } else { "goto" };
             let view = self.wire_view(world);
             let remaining = distance2d(world.me.origin, t);
             let (forwardmove, sidemove) = self.travel(
@@ -1235,13 +1421,15 @@ impl Controller {
                 nav.speed_scale,
                 dt,
             );
-            return Intent {
+            let mut intent = Intent {
                 view,
                 forwardmove,
                 sidemove,
                 move_target: Some(steer),
                 ..Intent::default()
             };
+            self.holster_nade_if_idle(world, &mut intent);
+            return intent;
         }
 
         // --- 6) Nothing ----------------------------------------------------
@@ -1250,48 +1438,62 @@ impl Controller {
         // apart, and standing perfectly still gets the bot kicked.
         let action = self.fire.decide(&world.me.weapon_or_unknown(), false);
         self.rung = "idle";
-        Intent {
+        let mut intent = Intent {
             view: self.wire_view(world),
             reload: action.reload,
             ..Intent::default()
-        }
+        };
+        self.holster_nade_if_idle(world, &mut intent);
+        intent
     }
 
     /// What to buy, given the money on hand.
     ///
-    /// Deliberately minimal and deliberately ordered: armour first because it
-    /// is the best value in the game, then a rifle, then a kit for CTs. The
-    /// aliases are the bare buy words — `ak47`, not `weapon_ak47`, which would
-    /// be a weapon switch (`dlls/client.cpp:3560`).
+    /// Pro-style classes (pistol / eco / force / full) and **owned util slots**
+    /// only — see `docs/utility-economy-plan.md` and [`crate::economy`].
     pub fn buy_plan(&self, world: &WorldView) -> Vec<BotCommand> {
-        use crate::weapons::Equipment;
-        use crate::world::Team;
+        crate::economy::build_buy_plan(world.me.money, world.me.team, self.seed)
+    }
 
-        let mut plan = Vec::new();
-        let mut money = world.me.money;
-        let mut spend = |cost: i32, cmd: BotCommand, plan: &mut Vec<BotCommand>| {
-            if money >= cost {
-                money -= cost;
-                plan.push(cmd);
-            }
-        };
-
-        // Kevlar + helmet, 1000.
-        spend(1000, BotCommand::BuyEquipment(Equipment::VestHelm), &mut plan);
-
-        // A rifle appropriate to the side.
-        let rifle = match world.me.team {
-            Team::Terrorist => (2500, WeaponId::Ak47),
-            _ => (3100, WeaponId::M4a1),
-        };
-        spend(rifle.0, BotCommand::BuyWeapon(rifle.1), &mut plan);
-
-        if world.me.team == Team::CounterTerrorist {
-            spend(200, BotCommand::BuyEquipment(Equipment::Defuser), &mut plan);
+    /// If we are idle-walking with a grenade selected, switch back to a gun.
+    fn holster_nade_if_idle(&self, world: &WorldView, intent: &mut Intent) {
+        if self.throw.active() {
+            return;
         }
-        spend(300, BotCommand::BuyEquipment(Equipment::HeGrenade), &mut plan);
+        let id = world.me.weapon_or_unknown().id;
+        if crate::utility::holding_nade(id) {
+            intent
+                .commands
+                .push(BotCommand::Select(crate::utility::preferred_gun(world)));
+        }
+    }
 
-        plan
+    /// Record nades from this freeze's buy plan into `owned_nades`.
+    fn note_buy_util(&mut self, plan: &[BotCommand]) {
+        self.owned_nades = 0;
+        for c in plan {
+            match c {
+                BotCommand::BuyEquipment(Equipment::SmokeGrenade) => {
+                    self.owned_nades |= NadeKind::Smoke.owned_bit();
+                }
+                BotCommand::BuyEquipment(Equipment::Flashbang) => {
+                    self.owned_nades |= NadeKind::Flash.owned_bit();
+                }
+                BotCommand::BuyEquipment(Equipment::HeGrenade) => {
+                    self.owned_nades |= NadeKind::He.owned_bit();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// After a throw completes, drop inventory bits for every used slot kind.
+    fn consume_used_util_kinds(&mut self) {
+        for s in crate::utility::dust2_slots() {
+            if self.throw.slot_was_used(s.id) {
+                self.owned_nades &= !s.kind.owned_bit();
+            }
+        }
     }
 }
 
@@ -1345,8 +1547,9 @@ mod tests {
         assert_eq!(intent.move_target, Some(site));
     }
 
-    /// ...and once it is there, plan W5 means it does NOT grind into the wall
-    /// -- with no defend point it roams slowly instead of stopping dead.
+    /// ...and once it is there, it does NOT grind into the wall -- with no
+    /// defend point it starts a hunt/patrol so teams keep meeting (was: endless
+    /// local roam at the site, which looked stuck on the live radar).
     #[test]
     fn arriving_at_the_site_roams_instead_of_stopping() {
         let mut c = Controller::new(7, Difficulty::Normal);
@@ -1355,11 +1558,13 @@ mod tests {
             ..Default::default()
         };
         let intent = c.think(&w, Some([4.0, 0.0, 0.0]), 0.1);
-        assert_eq!(c.rung, "roam", "arrival with no defend point roams");
+        assert_eq!(c.rung, "hunt", "arrival with no defend point starts a hunt");
+        assert!(c.nav_goal.is_some(), "hunt publishes a far nav_goal");
         assert!(
-            intent.forwardmove > 0.0,
-            "roaming should keep the bot moving, got {}",
-            intent.forwardmove
+            intent.forwardmove != 0.0 || intent.sidemove != 0.0,
+            "hunt should keep the bot moving, got fwd {} side {}",
+            intent.forwardmove,
+            intent.sidemove
         );
     }
 
@@ -1385,7 +1590,10 @@ mod tests {
     fn a_dead_bot_holds_and_does_nothing() {
         let mut c = Controller::new(1, Difficulty::Normal);
         let w = WorldView {
-            me: SelfState { alive: false, ..me_at([0.0; 3], Team::Terrorist) },
+            me: SelfState {
+                alive: false,
+                ..me_at([0.0; 3], Team::Terrorist)
+            },
             ..Default::default()
         };
         let intent = c.think(&w, None, 0.1);
@@ -1441,7 +1649,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(c.think(&far, None, 0.1).forwardmove > 0.0, "closes on a far enemy");
+        assert!(
+            c.think(&far, None, 0.1).forwardmove > 0.0,
+            "closes on a far enemy"
+        );
 
         let mut c = Controller::new(3, Difficulty::Normal);
         let close = WorldView {
@@ -1455,18 +1666,28 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(c.think(&close, None, 0.1).forwardmove, 0.0, "holds at knife range");
+        assert_eq!(
+            c.think(&close, None, 0.1).forwardmove,
+            0.0,
+            "holds at knife range"
+        );
     }
 
     #[test]
     fn the_carrier_walks_to_the_site_then_plants() {
         let mut c = Controller::new(5, Difficulty::Normal);
         let site: Vec3 = [1000.0, 0.0, 0.0];
-        let bomb = BombState { carried_by_me: true, ..Default::default() };
+        let bomb = BombState {
+            carried_by_me: true,
+            ..Default::default()
+        };
 
         let far = WorldView {
             me: SelfState {
-                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                weapon: Some(WeaponState {
+                    id: WeaponId::C4,
+                    ..Default::default()
+                }),
                 ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
             },
             bomb,
@@ -1480,7 +1701,10 @@ mod tests {
         let onsite = WorldView {
             me: SelfState {
                 in_bomb_zone: true,
-                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                weapon: Some(WeaponState {
+                    id: WeaponId::C4,
+                    ..Default::default()
+                }),
                 ..me_at([1000.0, 10.0, 0.0], Team::Terrorist)
             },
             bomb,
@@ -1506,20 +1730,37 @@ mod tests {
         let world = WorldView {
             me: SelfState {
                 in_bomb_zone: true, // plant_c4_anywhere, or a generous trigger
-                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                weapon: Some(WeaponState {
+                    id: WeaponId::C4,
+                    ..Default::default()
+                }),
                 ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
             },
-            bomb: BombState { carried_by_me: true, ..Default::default() },
+            bomb: BombState {
+                carried_by_me: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         // Right on top of the next waypoint, and 3000 units from the site.
         let waypoint: Vec3 = [40.0, 0.0, 0.0];
-        let nav = Nav { goal: Some(site), waypoint: Some(waypoint), look: None, new_waypoint: false, defend_point: None, weave: 0.0, speed_scale: 1.0 };
+        let nav = Nav {
+            goal: Some(site),
+            waypoint: Some(waypoint),
+            look: None,
+            new_waypoint: false,
+            defend_point: None,
+            weave: 0.0,
+            speed_scale: 1.0,
+        };
         let intent = c.think(&world, nav, 0.1);
 
         assert!(intent.forwardmove > 0.0, "stopped 3000 units from the site");
-        assert!(!intent.attack, "tried to plant 3000 units from the bomb site");
+        assert!(
+            !intent.attack,
+            "tried to plant 3000 units from the bomb site"
+        );
         assert_eq!(c.objective.objective, Objective::MoveToPlant);
         assert_eq!(intent.move_target, Some(waypoint), "steers at the waypoint");
     }
@@ -1560,7 +1801,10 @@ mod tests {
         };
         let intent = c.think(&w, nav, 0.1);
         assert_eq!(c.rung, "camp", "arrival should start the camp task");
-        assert!(intent.forwardmove > 0.0, "should walk to the defend point, not stand still");
+        assert!(
+            intent.forwardmove > 0.0,
+            "should walk to the defend point, not stand still"
+        );
         assert_eq!(intent.move_target, Some(defend));
     }
 
@@ -1583,7 +1827,10 @@ mod tests {
             assert_eq!(i.forwardmove, 0.0, "holding the spot does not walk");
         }
         assert!(
-            c.post_arrival.is_none() || c.post_arrival.as_ref().map_or(false, |t| t.hold_left <= 0.0),
+            c.post_arrival.is_none()
+                || c.post_arrival
+                    .as_ref()
+                    .map_or(false, |t| t.hold_left <= 0.0),
             "the task should have expired after its hold"
         );
     }
@@ -1596,17 +1843,31 @@ mod tests {
         // Force the dice to roll a slow hop.
         c.note_node_advance();
         let slowed = c.hop_slow;
-        assert!(slowed.is_some() || slowed.is_none(), "dice may land either way");
+        assert!(
+            slowed.is_some() || slowed.is_none(),
+            "dice may land either way"
+        );
 
         let w = WorldView {
             me: me_at([0.0, 0.0, 0.0], Team::Terrorist),
             ..Default::default()
         };
         let site = [1000.0, 0.0, 0.0];
-        let nav = Nav { goal: Some(site), waypoint: Some(site), look: None, new_waypoint: false, defend_point: None, weave: 0.0, speed_scale: 1.0 };
+        let nav = Nav {
+            goal: Some(site),
+            waypoint: Some(site),
+            look: None,
+            new_waypoint: false,
+            defend_point: None,
+            weave: 0.0,
+            speed_scale: 1.0,
+        };
         let intent = c.think(&w, nav, 0.1);
         // The slowed hop was consumed (whether it slowed or not).
-        assert_eq!(c.hop_slow, None, "the per-hop slow must be consumed by the hop");
+        assert_eq!(
+            c.hop_slow, None,
+            "the per-hop slow must be consumed by the hop"
+        );
 
         // And the approach slow-down works: close to the goal, speed eases.
         let near = WorldView {
@@ -1628,10 +1889,14 @@ mod tests {
     fn a_hard_turn_fires_the_body_overshoot_and_it_decays() {
         let mut c = Controller::new(7, Difficulty::Normal);
         // Straight ahead: no overshoot.
-        assert_eq!(c.turn_overshoot(10.0, 0.02), 0.0, "no overshoot on a straight line");
+        assert_eq!(
+            c.turn_overshoot(10.0, 0.02),
+            0.0,
+            "no overshoot on a straight line"
+        );
         // A > 45 deg bearing change fires it (direction is per-bot, so +-12).
         let first = c.turn_overshoot(80.0, 0.02);
-        assert!(first.abs() > 0.0 && first.abs() <= 12.0, "overshoot {first}");
+        assert!(first.abs() > 0.0 && first.abs() <= 6.0, "overshoot {first}");
         // It persists for a few ticks then decays (once the bearing settles).
         let mut saw = first;
         for _ in 0..10 {
@@ -1663,9 +1928,16 @@ mod tests {
             speed_scale: 1.0,
         };
         let intent = c.think(&w, nav, 0.1);
-        // Arrived -> roam (no defend point), NOT a grinding goto.
-        assert_eq!(c.rung, "roam", "should have left the goto rung at the site edge");
-        assert!(intent.forwardmove > 0.0, "roam keeps moving");
+        // Arrived -> hunt (no defend point), NOT a grinding goto.
+        assert_eq!(
+            c.rung, "hunt",
+            "should have left the goto rung at the site edge"
+        );
+        assert!(c.nav_goal.is_some(), "hunt sets a re-route goal");
+        assert!(
+            intent.forwardmove != 0.0 || intent.sidemove != 0.0,
+            "hunt keeps moving"
+        );
     }
 
     #[test]
@@ -1677,11 +1949,17 @@ mod tests {
                 in_bomb_zone: true,
                 ..me_at([1000.0, 10.0, 0.0], Team::Terrorist) // holding an AK
             },
-            bomb: BombState { carried_by_me: true, ..Default::default() },
+            bomb: BombState {
+                carried_by_me: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let intent = c.think(&w, Some(site), 0.1);
-        assert!(!intent.attack, "attacking with a rifle out just shoots the floor");
+        assert!(
+            !intent.attack,
+            "attacking with a rifle out just shoots the floor"
+        );
         assert_eq!(intent.console_lines(), vec!["weapon_c4".to_string()]);
     }
 
@@ -1692,14 +1970,23 @@ mod tests {
         let w = WorldView {
             me: SelfState {
                 in_bomb_zone: false,
-                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                weapon: Some(WeaponState {
+                    id: WeaponId::C4,
+                    ..Default::default()
+                }),
                 ..me_at([1000.0, 10.0, 0.0], Team::Terrorist)
             },
-            bomb: BombState { carried_by_me: true, ..Default::default() },
+            bomb: BombState {
+                carried_by_me: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         for _ in 0..40 {
-            assert!(!c.think(&w, Some(site), 0.1).attack, "iuser3 said we are not in a zone");
+            assert!(
+                !c.think(&w, Some(site), 0.1).attack,
+                "iuser3 said we are not in a zone"
+            );
         }
     }
 
@@ -1707,10 +1994,15 @@ mod tests {
     fn a_ct_defuses_with_use_not_attack() {
         let mut c = Controller::new(9, Difficulty::Unfair);
         let site: Vec3 = [1000.0, 0.0, 0.0];
+        let me_origin = [1000.0, 10.0, 0.0];
+        // Pre-aim at the bomb so use-cone is already satisfied (gains only
+        // affect how we get there, not the gate once aligned).
+        c.view = aim_angles(me_origin, site);
         let w = WorldView {
             me: SelfState {
                 has_defuse_kit: true,
-                ..me_at([1000.0, 10.0, 0.0], Team::CounterTerrorist)
+                on_ground: true,
+                ..me_at(me_origin, Team::CounterTerrorist)
             },
             bomb: BombState {
                 planted: true,
@@ -1719,10 +2011,8 @@ mod tests {
             },
             ..Default::default()
         };
-        // The first tick may still be turning to face the bomb; give the aim a
-        // moment to come inside VIEW_FIELD_NARROW.
         let mut intent = c.think(&w, None, 0.1);
-        for _ in 0..30 {
+        for _ in 0..40 {
             if intent.use_action {
                 break;
             }
@@ -1793,7 +2083,10 @@ mod tests {
         w.players[0].entity = 2;
         c.fire.reset();
         let immediate = c.think(&w, None, 0.05);
-        assert!(!immediate.attack, "a new enemy must be reacted to, not inherited");
+        assert!(
+            !immediate.attack,
+            "a new enemy must be reacted to, not inherited"
+        );
     }
 
     #[test]
@@ -1874,7 +2167,10 @@ mod tests {
         c.view = aim_angles(w.me.origin, crate::math::eye_position([200.0, 0.0, 0.0]));
         for _ in 0..60 {
             let i = c.think(&w, None, 0.05);
-            assert!(!i.attack, "shooting at an unseen enemy is shooting at a wall");
+            assert!(
+                !i.attack,
+                "shooting at an unseen enemy is shooting at a wall"
+            );
         }
     }
 
@@ -1883,7 +2179,10 @@ mod tests {
         // iuser3 & PLAYER_CAN_SHOOT is cleared while defusing, among others.
         let mut c = instant(29);
         let w = WorldView {
-            me: SelfState { can_shoot: false, ..me_at([0.0, 0.0, 0.0], Team::Terrorist) },
+            me: SelfState {
+                can_shoot: false,
+                ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
+            },
             players: vec![PlayerView {
                 entity: 1,
                 origin: [300.0, 0.0, 0.0],
@@ -1945,7 +2244,10 @@ mod tests {
         let mut c = instant(31);
         let w = WorldView {
             me: SelfState {
-                punchangle: Angles { pitch: -3.0, yaw: 0.0 },
+                punchangle: Angles {
+                    pitch: -3.0,
+                    yaw: 0.0,
+                },
                 ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
             },
             players: vec![PlayerView {
@@ -1968,7 +2270,11 @@ mod tests {
             c.view.pitch
         );
         // And the internal aim did not absorb the recoil.
-        assert!(c.view.pitch.abs() < 1.0, "internal aim drifted to {}", c.view.pitch);
+        assert!(
+            c.view.pitch.abs() < 1.0,
+            "internal aim drifted to {}",
+            c.view.pitch
+        );
     }
 
     #[test]
@@ -2015,19 +2321,26 @@ mod tests {
         assert!(!intent.attack);
         let lines = intent.console_lines();
         assert!(lines.contains(&"vesthelm".to_string()), "{lines:?}");
-        assert!(lines.contains(&"ak47".to_string()), "a T buys an AK: {lines:?}");
-        assert!(!lines.iter().any(|l| l.starts_with("weapon_")), "buys are not switches");
+        assert!(
+            lines.contains(&"ak47".to_string()),
+            "a T buys an AK: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("weapon_")),
+            "buys are not switches"
+        );
     }
 
     #[test]
     fn a_poor_bot_buys_only_what_it_can_afford() {
-        // The invariant that matters is that the plan never overspends and
-        // never lists something out of reach. It is greedy in priority order,
-        // so a bot that cannot afford armour still picks up the cheap things.
+        // Eco / pistol class: never rifle, never overspend (see economy.rs).
         let c = Controller::new(43, Difficulty::Normal);
 
         let w = WorldView {
-            me: SelfState { money: 900, ..me_at([0.0; 3], Team::CounterTerrorist) },
+            me: SelfState {
+                money: 900,
+                ..me_at([0.0; 3], Team::CounterTerrorist)
+            },
             ..Default::default()
         };
         let plan = c.buy_plan(&w);
@@ -2039,27 +2352,30 @@ mod tests {
             !plan.contains(&BotCommand::BuyWeapon(WeaponId::M4a1)),
             "and so is a rifle: {plan:?}"
         );
-        assert_eq!(
-            plan,
-            vec![
-                BotCommand::BuyEquipment(Equipment::Defuser),
-                BotCommand::BuyEquipment(Equipment::HeGrenade),
-            ]
+        assert!(
+            !plan.iter().any(|c| matches!(
+                c,
+                BotCommand::BuyEquipment(
+                    Equipment::HeGrenade | Equipment::SmokeGrenade | Equipment::Flashbang
+                )
+            )),
+            "eco must not buy util: {plan:?}"
         );
+        assert!(crate::economy::plan_cost(&plan) <= 900, "{plan:?}");
 
         let w = WorldView {
-            me: SelfState { money: 1250, ..me_at([0.0; 3], Team::CounterTerrorist) },
+            me: SelfState {
+                money: 1250,
+                ..me_at([0.0; 3], Team::CounterTerrorist)
+            },
             ..Default::default()
         };
         let plan = c.buy_plan(&w);
-        assert_eq!(
-            plan,
-            vec![
-                BotCommand::BuyEquipment(Equipment::VestHelm),
-                BotCommand::BuyEquipment(Equipment::Defuser),
-            ],
-            "armour first, then the kit — no rifle, and no nade left at 50"
+        assert!(
+            !plan.contains(&BotCommand::BuyWeapon(WeaponId::M4a1)),
+            "still eco band: {plan:?}"
         );
+        assert!(crate::economy::plan_cost(&plan) <= 1250, "{plan:?}");
     }
 
     #[test]
@@ -2071,8 +2387,14 @@ mod tests {
                 BotCommand::BuyEquipment(Equipment::VestHelm) => 1000,
                 BotCommand::BuyEquipment(Equipment::Defuser) => 200,
                 BotCommand::BuyEquipment(Equipment::HeGrenade) => 300,
+                BotCommand::BuyEquipment(Equipment::Flashbang) => 200,
+                BotCommand::BuyEquipment(Equipment::SmokeGrenade) => 300,
+                BotCommand::BuyEquipment(Equipment::Vest) => 650,
+                BotCommand::BuyEquipment(Equipment::PrimaryAmmo) => 0,
+                BotCommand::BuyEquipment(Equipment::SecondaryAmmo) => 0,
                 BotCommand::BuyWeapon(WeaponId::Ak47) => 2500,
                 BotCommand::BuyWeapon(WeaponId::M4a1) => 3100,
+                BotCommand::BuyWeapon(WeaponId::Deagle) => 650,
                 other => panic!("unpriced item in the plan: {other:?}"),
             }
         }
@@ -2080,12 +2402,18 @@ mod tests {
         for team in [Team::Terrorist, Team::CounterTerrorist] {
             for money in (0..17_000).step_by(137) {
                 let w = WorldView {
-                    me: SelfState { money, ..me_at([0.0; 3], team) },
+                    me: SelfState {
+                        money,
+                        ..me_at([0.0; 3], team)
+                    },
                     ..Default::default()
                 };
                 let plan = c.buy_plan(&w);
                 let total: i32 = plan.iter().map(cost).sum();
-                assert!(total <= money, "{team:?} with {money} planned {total}: {plan:?}");
+                assert!(
+                    total <= money,
+                    "{team:?} with {money} planned {total}: {plan:?}"
+                );
                 // Every entry must actually be renderable as a console command.
                 for cmd in &plan {
                     assert!(cmd.to_console().is_some(), "unrenderable {cmd:?}");
@@ -2163,7 +2491,10 @@ mod tests {
             speed < full * 0.95,
             "turning hard cost nothing: speed {speed} against a full {full}"
         );
-        assert!(speed > full * TURN_HARD_SCALE - 1.0, "slowed more than the hard band");
+        assert!(
+            speed > full * TURN_HARD_SCALE - 1.0,
+            "slowed more than the hard band"
+        );
 
         // ...and running straight at it is full pace, undiminished.
         let straight: Vec3 = [800.0, 0.0, 0.0];
@@ -2229,8 +2560,14 @@ mod tests {
                 stopped = true;
             }
         }
-        assert_eq!(fired_while_fast, 0, "fired {fired_while_fast} shots at a sprint");
-        assert!(stopped, "never planted itself -- the stop is deadlocked on the shot");
+        assert_eq!(
+            fired_while_fast, 0,
+            "fired {fired_while_fast} shots at a sprint"
+        );
+        assert!(
+            stopped,
+            "never planted itself -- the stop is deadlocked on the shot"
+        );
 
         // Airborne is worse than moving, and is refused at any speed.
         let mut c = Controller::new(2, Difficulty::Unfair);
@@ -2280,10 +2617,16 @@ mod tests {
         let at = |d: f32| WorldView {
             me: SelfState {
                 in_bomb_zone: true,
-                weapon: Some(WeaponState { id: WeaponId::C4, ..Default::default() }),
+                weapon: Some(WeaponState {
+                    id: WeaponId::C4,
+                    ..Default::default()
+                }),
                 ..me_at([site[0] - d, 0.0, 0.0], Team::Terrorist)
             },
-            bomb: BombState { carried_by_me: true, ..Default::default() },
+            bomb: BombState {
+                carried_by_me: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2296,12 +2639,19 @@ mod tests {
         // Now wobble across the boundary; the button must never come up.
         let mut released = 0;
         for i in 0..40 {
-            let d = if i % 2 == 0 { ARRIVE_RADIUS + 1.0 } else { ARRIVE_RADIUS - 1.0 };
+            let d = if i % 2 == 0 {
+                ARRIVE_RADIUS + 1.0
+            } else {
+                ARRIVE_RADIUS - 1.0
+            };
             if !c.think(&at(d), Some(site), 0.05).attack {
                 released += 1;
             }
         }
-        assert_eq!(released, 0, "released the trigger {released} times while arming");
+        assert_eq!(
+            released, 0,
+            "released the trigger {released} times while arming"
+        );
         assert!(c.plant.is_arming(), "the arm was thrown away");
     }
 
@@ -2331,7 +2681,10 @@ mod tests {
                 visible: true,
                 ..Default::default()
             }],
-            bomb: BombState { carried_by_me: carrying, ..Default::default() },
+            bomb: BombState {
+                carried_by_me: carrying,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -2346,12 +2699,18 @@ mod tests {
         // Carrying, and it can walk away: it walks.
         let mut c = Controller::new(1, Difficulty::Normal);
         c.think(&world(far, true), Some(site), 0.1);
-        assert_ne!(c.rung, "combat", "the carrier stopped for a fight it could leave");
+        assert_ne!(
+            c.rung, "combat",
+            "the carrier stopped for a fight it could leave"
+        );
 
         // Carrying, but the enemy is on top of it: running is not an option.
         let mut c = Controller::new(1, Difficulty::Normal);
         c.think(&world(near, true), Some(site), 0.1);
-        assert_eq!(c.rung, "combat", "the carrier ignored an enemy at close range");
+        assert_eq!(
+            c.rung, "combat",
+            "the carrier ignored an enemy at close range"
+        );
     }
 
     /// Circling an opponent, but planting to shoot.
@@ -2365,7 +2724,11 @@ mod tests {
         let w = WorldView {
             me: SelfState {
                 can_shoot: true,
-                weapon: Some(WeaponState { id: WeaponId::Ak47, clip: 30, ..Default::default() }),
+                weapon: Some(WeaponState {
+                    id: WeaponId::Ak47,
+                    clip: 30,
+                    ..Default::default()
+                }),
                 ..me_at([0.0, 0.0, 0.0], Team::Terrorist)
             },
             players: vec![PlayerView {
@@ -2431,7 +2794,11 @@ mod tests {
         let mut c = Controller::new(53, Difficulty::Normal);
         let w = WorldView {
             me: me_at([140.0, 0.0, 0.0], Team::CounterTerrorist),
-            hostages: vec![HostageView { entity: 1, origin: [100.0, 0.0, 0.0], ..Default::default() }],
+            hostages: vec![HostageView {
+                entity: 1,
+                origin: [100.0, 0.0, 0.0],
+                ..Default::default()
+            }],
             rescue_zones: vec![[-2000.0, 0.0, 0.0]],
             ..Default::default()
         };
@@ -2439,7 +2806,10 @@ mod tests {
         let mut edges = 0;
         for tick in 0..200 {
             let u = c.think(&w, None, 0.05).use_action;
-            assert!(!(u && prev), "held +use on a FCAP_ONOFF_USE hostage at tick {tick}");
+            assert!(
+                !(u && prev),
+                "held +use on a FCAP_ONOFF_USE hostage at tick {tick}"
+            );
             if u && !prev {
                 edges += 1;
             }
@@ -2462,12 +2832,19 @@ mod tests {
                 visible: true,
                 ..Default::default()
             }],
-            hostages: vec![HostageView { entity: 1, origin: [100.0, 0.0, 0.0], ..Default::default() }],
+            hostages: vec![HostageView {
+                entity: 1,
+                origin: [100.0, 0.0, 0.0],
+                ..Default::default()
+            }],
             rescue_zones: vec![[-2000.0, 0.0, 0.0]],
             ..Default::default()
         };
         let intent = c.think(&w, None, 0.05);
-        assert!(!intent.use_action, "do not fumble with a hostage mid-firefight");
+        assert!(
+            !intent.use_action,
+            "do not fumble with a hostage mid-firefight"
+        );
         assert_eq!(intent.move_target, Some([140.0, 300.0, 0.0]));
     }
 
@@ -2512,7 +2889,10 @@ mod tests {
             reserve: 90,
             ..Default::default()
         });
-        assert!(c.think(&w, None, 0.05).attack, "the rifle should fire immediately");
+        assert!(
+            c.think(&w, None, 0.05).attack,
+            "the rifle should fire immediately"
+        );
     }
 
     #[test]
@@ -2576,9 +2956,18 @@ mod tests {
         let easy = settled_error(Difficulty::Easy);
         let normal = settled_error(Difficulty::Normal);
         let unfair = settled_error(Difficulty::Unfair);
-        assert!(easy > normal, "easy {easy} should be worse than normal {normal}");
-        assert!(normal > unfair, "normal {normal} should be worse than unfair {unfair}");
-        assert!(unfair < 0.5, "unfair should be essentially perfect, was {unfair}");
+        assert!(
+            easy > normal,
+            "easy {easy} should be worse than normal {normal}"
+        );
+        assert!(
+            normal > unfair,
+            "normal {normal} should be worse than unfair {unfair}"
+        );
+        assert!(
+            unfair < 0.5,
+            "unfair should be essentially perfect, was {unfair}"
+        );
         assert!(
             easy <= Difficulty::Easy.aim_error_degrees() * 1.5,
             "easy error {easy} exceeds its own bound"
@@ -2588,7 +2977,12 @@ mod tests {
     #[test]
     fn the_aim_error_is_bounded_by_the_difficulty() {
         // A uniform disc, so no draw can ever exceed the stated radius.
-        for d in [Difficulty::Easy, Difficulty::Normal, Difficulty::Hard, Difficulty::Unfair] {
+        for d in [
+            Difficulty::Easy,
+            Difficulty::Normal,
+            Difficulty::Hard,
+            Difficulty::Unfair,
+        ] {
             let mut c = Controller::new(99, d);
             for _ in 0..5000 {
                 let e = c.aim_error_offset(true, 0.05);
@@ -2610,7 +3004,11 @@ mod tests {
         for _ in 0..20 {
             c.aim_error_offset(false, 0.05);
         }
-        assert_ne!(c.aim_error_offset(false, 0.05), first, "should have been re-drawn");
+        assert_ne!(
+            c.aim_error_offset(false, 0.05),
+            first,
+            "should have been re-drawn"
+        );
     }
 
     #[test]
@@ -2630,7 +3028,11 @@ mod tests {
         let mut a = Controller::new(101, Difficulty::Normal);
         let mut b = Controller::new(101, Difficulty::Normal);
         for tick in 0..50 {
-            assert_eq!(a.think(&w, None, 0.05), b.think(&w, None, 0.05), "tick {tick}");
+            assert_eq!(
+                a.think(&w, None, 0.05),
+                b.think(&w, None, 0.05),
+                "tick {tick}"
+            );
         }
     }
 }

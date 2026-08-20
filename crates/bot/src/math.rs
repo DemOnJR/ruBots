@@ -123,8 +123,7 @@ pub fn move_axes(view_yaw: f32, travel_yaw: f32, speed: f32) -> (f32, f32) {
 }
 
 /// Decompose travel into a forward/strafe pair that keeps the body moving
-/// forward while the view turns (YaPB's `m_moveSpeed` + `m_strafeSpeed`
-/// model, `yapb/src/navigate.cpp:1065-1081`).
+/// forward while the view turns.
 ///
 /// A pure `move_axes` at a hard corner drives `fwd -> 0` as `side -> max`,
 /// which reads as "stops and slides". A human instead keeps pressing forward

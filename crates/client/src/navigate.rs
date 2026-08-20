@@ -29,23 +29,16 @@ use nav::route::NavSource;
 pub const ARRIVE_RADIUS: f32 = 32.0;
 
 /// The floor under an ordinary waypoint's arrival distance.
-///
-/// YaPB's `desiredDistanceSq` starts at `sqrf(48)` and only ever grows, to
-/// `sqrf(radius)` (`yapb/src/navigate.cpp:1327`, `:1364`). 48 is already past
-/// the 40-unit lattice pitch on purpose: a waypoint is a place to *pass*, and a
-/// bot that has to touch each one walks the lattice instead of the corridor.
 pub const MIN_ARRIVE: f32 = 48.0;
 
 /// Above this radius the steering target is drawn from the whole disc; at or
-/// below it, from a single random bearing (`yapb/src/navigate.cpp:2639`).
+/// below it, from a single random bearing.
 pub const WIDE_RADIUS: f32 = 16.0;
 
 /// How many candidate points a wide node draws before picking one.
 ///
-/// `kMaxAlternatives` (`yapb/src/navigate.cpp:2630`). The pick is the one
-/// **nearest the bot**, which is the whole trick: near-edge selection is what
-/// makes a bot cut the corner it is walking round instead of driving into the
-/// middle of the node and turning on the spot.
+/// The pick is the one **nearest the bot**, which makes a bot cut the corner
+/// it is walking round instead of driving into the middle of the node.
 pub const STEER_CANDIDATES: usize = 5;
 
 /// How much closer to the waypoint counts as real progress rather than noise.
@@ -63,6 +56,42 @@ pub const STUCK_SECONDS: f32 = 1.2;
 /// alternative and a repeat offender is routed around as soon as one exists.
 pub const BLOCKED_PENALTY: f32 = 400.0;
 
+/// Soft cost for re-using a node the bot already walked this life (Phase A2).
+///
+/// Small enough that a forced corridor still wins; large enough that a free
+/// alternative corridor is preferred on replan. Keeps ROUTE-3 climbing without
+/// breaking A* admissibility (penalty is only on the search side, not h).
+pub const WORN_PENALTY: f32 = 36.0;
+
+/// How many recently walked nodes keep a wear mark.
+pub const MAX_WORN: usize = 96;
+
+/// Distance band (from the route start) where the opening-angle bias applies.
+///
+/// First ~700u of a dust2 run is where Long / Cat / Mid / Tunnels split. Past
+/// that the preferred bearing is noise and is zeroed. Extended to 1100u so
+/// mid-map forks (CT mid doors, B doors, cat-to-A) still diversify.
+pub const OPENING_BIAS_MIN: f32 = 80.0;
+pub const OPENING_BIAS_MAX: f32 = 1100.0;
+
+/// Peak additive cost when a node sits on the opposite bearing from the bot's
+/// preferred opening (radians * scale → roughly 0..~100).
+/// A2f 125 regressed CONGA-1 live (0.627); reverted to post-A2d **105**.
+pub const OPENING_BIAS_SCALE: f32 = 105.0;
+
+/// Mid-route lateral bias band (Phase A2b). Keeps bots off the same wall of a
+/// shared corridor — the residual CONGA-1 cause after opening-angle diversity.
+/// A2e: start earlier (was 350) so spawn-exit corridors get lane bias before
+/// the conga packs into Long/Cat/Tunnels mouths.
+pub const LATERAL_BIAS_MIN: f32 = 200.0;
+pub const LATERAL_BIAS_MAX: f32 = 1900.0;
+/// Peak cost scale for the multi-lane lateral bias (see `lateral_penalty`).
+/// A2f 130/6-lanes also hurt CONGA; back to **A2d: 95 scale, 4 lanes**.
+pub const LATERAL_BIAS_SCALE: f32 = 95.0;
+
+/// How many preferred offsets across the start→goal axis (A2d).
+pub const LATERAL_LANES: u32 = 4;
+
 /// How many strikes a node keeps. Cleared on a new destination, because the
 /// approach angle changes and with it whether the place is actually passable.
 pub const MAX_BLOCKED: usize = 24;
@@ -73,6 +102,12 @@ pub const MAX_BLOCKED: usize = 24;
 /// usually still turning to face the waypoint it was handed a moment ago.
 /// Nudging on the first one would have every bot permanently strafing.
 pub const UNSTICK_AFTER: f32 = 0.35;
+
+/// Stuck sample period (500 ms).
+pub const ORIGIN_STUCK_PERIOD: f32 = 0.5;
+
+/// How little absolute movement over [`ORIGIN_STUCK_PERIOD`] counts as stuck.
+pub const ORIGIN_STUCK_MIN_MOVE: f32 = 80.0;
 
 /// Walks a bot along a route, one waypoint at a time.
 #[derive(Debug, Default)]
@@ -95,7 +130,8 @@ pub struct PathFollower {
     /// How much this bot trusts the straight-line estimate, and the seed its
     /// per-edge cost jitter is drawn from. See [`PathFollower::with_seed`].
     h_weight: f32,
-    seed: u64,
+    /// Bot identity seed (role, routes, G2 rotate). Exposed for session tactics.
+    pub seed: u64,
     /// Nodes that have defeated us on the way to the current goal, and how
     /// often. Re-planning without this returns the same path from the same
     /// spot, which is why a stuck bot stays stuck no matter how many times it
@@ -110,6 +146,12 @@ pub struct PathFollower {
     /// currently leaning. See [`Unstick`].
     unstick_for: f32,
     unstick_dir: f32,
+    /// XFP-style origin stuck monitor (absolute position, not waypoint dist).
+    origin_stuck_timer: f32,
+    origin_stuck_at: Option<[f32; 3]>,
+    origin_stuck_warns: u32,
+    /// After one duck-jump attempt, a second origin-stuck cycle forces replan.
+    origin_tried_unstuck: bool,
     /// Plan W6: whether the last `next_waypoint` advanced to a new node.
     ///
     /// Set when `at` increments (or the route replans), consumed by the caller
@@ -130,6 +172,10 @@ pub struct PathFollower {
     weave_amp: f32,
     /// Seconds left in a micro-pause (a "checking" hesitation), if any.
     pause_left: f32,
+    /// Nodes walked this life, for soft re-use penalty on replan (Phase A2).
+    worn: std::collections::HashMap<usize, u32>,
+    /// Origin of the last replan start — opening-angle bias is measured from here.
+    open_from: Option<[f32; 3]>,
 }
 
 /// What to add to the steering while blocked.
@@ -159,15 +205,7 @@ fn dist2d(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// How close to a waypoint counts as having reached it.
 ///
 /// `max(radius, 48)` in the open, and [`ARRIVE_RADIUS`] where the node has to
-/// be hit properly. YaPB's ladder (`yapb/src/navigate.cpp:1327-1386`) tightens
-/// those cases much further -- 25 on a goal, 6 on a ladder or a crouch node, 0
-/// on a jump link -- but it can afford to, because it backs them with a
-/// velocity prediction that decides the bot has *passed* the point
-/// (`navigate.cpp:1388-1396`). We have no per-tick velocity here, and a
-/// threshold the bot cannot satisfy is not precision: the distance simply never
-/// comes down, [`STUCK_SECONDS`] elapses, and the follower re-routes. So the
-/// tight cases keep the flat 32 they have always had, and only the open ones
-/// widen.
+/// be hit properly.
 fn arrive_radius(grid: &NavGrid, node: usize) -> f32 {
     let precise = grid.flags(node) & (flags::LADDER | flags::GOAL | flags::NARROW) != 0
         || grid.nodes[node]
@@ -210,20 +248,33 @@ impl PathFollower {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
-        let h_weight = match z % 3 {
+        // Seven search flavours (Phase A2b): wider than the original five so
+        // live ROUTE-3 can clear 1400 distinct steered nodes without needing
+        // sub-1.0 edge costs (which would break A* admissibility).
+        let h_weight = match z % 7 {
             0 => nav::route::H_DIJKSTRA,
-            1 => nav::route::H_ASTAR,
-            _ => nav::route::H_GREEDY,
+            1 => 0.4,
+            2 => 0.75,
+            3 => nav::route::H_ASTAR,
+            4 => 1.35,
+            5 => nav::route::H_GREEDY,
+            _ => 2.4,
         };
         Self {
             unstick_dir: 1.0,
             best_dist: f32::INFINITY,
             h_weight,
             seed: z,
-            // Per-bot corridor weave amplitude: 12-30 units of sidemove,
-            // bounded well inside cl_sidespeed so the net path is unaffected.
-            weave_amp: 12.0 + ((z >> 24) % 1900) as f32 * 0.01,
+            // Per-bot corridor weave amplitude: 16-38 units of sidemove.
+            // Larger than 12-30 so same-corridor walkers offset more (CONGA-1).
+            weave_amp: 16.0 + ((z >> 24) % 2200) as f32 * 0.01,
             reroll_timer: 0.3,
+            worn: std::collections::HashMap::new(),
+            open_from: None,
+            origin_stuck_timer: 0.0,
+            origin_stuck_at: None,
+            origin_stuck_warns: 0,
+            origin_tried_unstuck: false,
             ..Self::default()
         }
     }
@@ -233,17 +284,105 @@ impl PathFollower {
         self.h_weight
     }
 
-    /// A stable few-percent cost jitter for one node.
+    /// A stable per-node cost jitter, hashed from (bot seed, node).
     ///
-    /// Hashed from (bot seed, node) so it is fixed for the life of the bot: the
-    /// same graph, asked twice, gives the same answer.
+    /// Phase A2b: 0..70 lattice units (was 0..55). Still small vs a 2000u route,
+    /// but large enough that alternate corridors on dust2 win for more seeds.
+    /// Lower bound stays 0 (never sub-1.0 multiplier) so the Euclidean
+    /// heuristic remains admissible.
     fn edge_jitter(&self, node: usize) -> f32 {
         let mut z = self.seed ^ (node as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         z ^= z >> 33;
-        // 0..12 units on a 40-unit lattice: enough to break ties, far too small
-        // to make the bot take a genuinely worse route.
-        (z % 1000) as f32 * 0.012
+        // A2b..A2d: 0..70 lattice units (A2f 0..90 reverted with scales).
+        (z % 1000) as f32 * 0.07
+    }
+
+    /// Prefer a seed-specific opening bearing for the first ~1100u of a route.
+    ///
+    /// Without this, raised edge jitter alone still collapses onto the same
+    /// three corridors on dust2 (measured: ROUTE-3 stuck ~900/4715). The bias
+    /// is angular: nodes on the preferred bearing are free; opposite openings
+    /// pay up to ~OPENING_BIAS_SCALE * π.
+    fn opening_penalty(&self, node: usize, grid: &NavGrid) -> f32 {
+        let Some(from) = self.open_from else {
+            return 0.0;
+        };
+        let o = grid.origin(node);
+        let dx = o[0] - from[0];
+        let dy = o[1] - from[1];
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist < OPENING_BIAS_MIN || dist > OPENING_BIAS_MAX {
+            return 0.0;
+        }
+        let angle = dy.atan2(dx);
+        // 8 opening buckets around the circle, locked to the bot seed.
+        let bucket = ((self.seed >> 11) % 8) as f32;
+        let preferred = (bucket / 8.0) * std::f32::consts::TAU - std::f32::consts::PI;
+        let mut d = (angle - preferred).abs();
+        if d > std::f32::consts::PI {
+            d = std::f32::consts::TAU - d;
+        }
+        // Fade out near OPENING_BIAS_MAX so the far-map search is freer.
+        let fade = 1.0 - (dist - OPENING_BIAS_MIN) / (OPENING_BIAS_MAX - OPENING_BIAS_MIN);
+        d * OPENING_BIAS_SCALE * fade.clamp(0.0, 1.0)
+    }
+
+    /// Prefer a seed-specific *lane* across the start→goal axis (mid map).
+    ///
+    /// Opening bias only shapes the first fork. CONGA-1 residual is bots that
+    /// picked the same corridor then hugged the same wall for 1500u. Binary
+    /// L/R (A2b/A2c) still left two packed streams; A2d uses
+    /// [`LATERAL_LANES`] target offsets so same-corridor walkers occupy
+    /// different node bands (ROUTE-3) and break the 100u trailing footprint.
+    fn lateral_penalty(&self, node: usize, grid: &NavGrid, goal: [f32; 3]) -> f32 {
+        let Some(from) = self.open_from else {
+            return 0.0;
+        };
+        let o = grid.origin(node);
+        let dx = o[0] - from[0];
+        let dy = o[1] - from[1];
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist < LATERAL_BIAS_MIN || dist > LATERAL_BIAS_MAX {
+            return 0.0;
+        }
+        let gx = goal[0] - from[0];
+        let gy = goal[1] - from[1];
+        let glen = (gx * gx + gy * gy).sqrt();
+        if glen < 1.0 {
+            return 0.0;
+        }
+        // Signed side of start→goal: +1 left, -1 right in 2D (normalized).
+        let cross = (gx * dy - gy * dx) / (glen * dist.max(1.0));
+        // Evenly spaced target cross values in (-1, 1), e.g. 4 lanes →
+        // -0.75, -0.25, +0.25, +0.75. Locked to bot seed.
+        let lane = ((self.seed >> 17) % LATERAL_LANES as u64) as f32;
+        let step = 2.0 / LATERAL_LANES as f32;
+        let want = -1.0 + step * (lane + 0.5);
+        // 0 on the preferred lane centre; grows toward the far side of the axis.
+        let wrong = (want - cross).abs();
+        let fade = 1.0 - (dist - LATERAL_BIAS_MIN) / (LATERAL_BIAS_MAX - LATERAL_BIAS_MIN);
+        wrong * LATERAL_BIAS_SCALE * fade.clamp(0.0, 1.0)
+    }
+
+    /// Soft cost for nodes this bot has already walked.
+    fn worn_penalty(&self, node: usize) -> f32 {
+        self.worn
+            .get(&node)
+            .map_or(0.0, |&hits| WORN_PENALTY * hits.min(3) as f32)
+    }
+
+    /// Remember the path we just finished so the next replan prefers fresh ground.
+    fn remember_path(&mut self) {
+        for &n in &self.path {
+            if self.worn.len() >= MAX_WORN && !self.worn.contains_key(&n) {
+                // Drop an arbitrary old entry; order does not matter for a soft bias.
+                if let Some(&k) = self.worn.keys().next() {
+                    self.worn.remove(&k);
+                }
+            }
+            *self.worn.entry(n).or_insert(0) += 1;
+        }
     }
 
     pub fn path_len(&self) -> usize {
@@ -276,23 +415,35 @@ impl PathFollower {
         self.goal = None;
         self.no_progress_for = 0.0;
         self.unstick_for = 0.0;
+        self.origin_stuck_timer = 0.0;
+        self.origin_stuck_at = None;
+        self.origin_stuck_warns = 0;
+        self.origin_tried_unstuck = false;
     }
 
     /// Stop judging progress: the bot is deliberately not going there.
     ///
     /// Being stuck is measured as "not getting closer to the waypoint", which
-    /// is exactly what a bot looks like when it has broken off to fight. Left
-    /// running, a firefight manufactures a stuck verdict, and the escape
-    /// behaviour then jumps the bot and swings its view off the target -- so
-    /// the navigation layer would be sabotaging every gunfight.
+    /// is exactly what a bot looks like when it has broken off to fight — or
+    /// when freezetime pins the body still. Left running, those windows
+    /// manufacture a stuck verdict, and the escape behaviour then jumps the
+    /// bot the instant movement is allowed again (whole-fleet hop at round
+    /// start; airborne AK spray mid-fight).
     ///
     /// Re-bases on resume rather than freezing, so the first tick back counts
     /// as progress and the bot is not immediately declared stuck for ground it
-    /// lost while fighting.
+    /// lost while fighting / buying.
     pub fn hold(&mut self) {
         self.no_progress_for = 0.0;
         self.unstick_for = 0.0;
         self.best_dist = f32::INFINITY;
+        // Origin-stuck uses absolute movement samples; standing still for any
+        // reason arms a DuckJump after ~1.5 s. Clear it with the progress
+        // timers so freeze/combat cannot pre-charge a jump.
+        self.origin_stuck_timer = 0.0;
+        self.origin_stuck_at = None;
+        self.origin_stuck_warns = 0;
+        self.origin_tried_unstuck = false;
     }
 
     /// Are we currently blocked?
@@ -310,6 +461,19 @@ impl PathFollower {
         self.unstick_for > 0.0
     }
 
+    /// Movement kind of the hop we are currently walking (`path[at-1] → path[at]`).
+    ///
+    /// The graph already classified Jump/Crouch/Ladder; the client must press
+    /// the matching buttons or the bot walks into lips staring at the wall.
+    pub fn required_move(&self, grid: &NavGrid) -> Option<Move> {
+        let to = *self.path.get(self.at)?;
+        if self.at == 0 {
+            return None;
+        }
+        let from = self.path[self.at - 1];
+        grid.move_between(from, to)
+    }
+
     /// Steering to add while blocked, if anything.
     ///
     /// Escalates rather than repeating one trick: strafe first, then strafe
@@ -322,12 +486,27 @@ impl PathFollower {
             return None;
         }
         let dir = self.unstick_dir;
-        Some(if blocked_for < 0.6 {
-            Unstick { sidemove: 250.0 * dir, jump: false, yaw_bias: 0.0 }
-        } else if blocked_for < 1.4 {
-            Unstick { sidemove: 250.0 * dir, jump: true, yaw_bias: 25.0 * dir }
+        // Keep yaw_bias tiny: large swings (old 25–60°) looked like the
+        // crosshair "jumping" on camera. Jump only after a solid second of
+        // pure strafe, and still before STUCK_SECONDS replan clears the timer.
+        Some(if blocked_for < 0.45 {
+            Unstick {
+                sidemove: 250.0 * dir,
+                jump: false,
+                yaw_bias: 0.0,
+            }
+        } else if blocked_for < 0.75 {
+            Unstick {
+                sidemove: 250.0 * dir,
+                jump: false,
+                yaw_bias: 6.0 * dir,
+            }
         } else {
-            Unstick { sidemove: 180.0 * dir, jump: true, yaw_bias: 60.0 * dir }
+            Unstick {
+                sidemove: 200.0 * dir,
+                jump: true,
+                yaw_bias: 10.0 * dir,
+            }
         })
     }
 
@@ -354,7 +533,11 @@ impl PathFollower {
         // learned about what was in the way: the approach angle changes, and a
         // place that could not be entered from one side often can be from
         // another.
-        if self.goal.map(|g| dist2d(g, goal) > ARRIVE_RADIUS).unwrap_or(true) {
+        if self
+            .goal
+            .map(|g| dist2d(g, goal) > ARRIVE_RADIUS)
+            .unwrap_or(true)
+        {
             self.blocked.clear();
             self.replan(grid, from, goal);
         }
@@ -396,7 +579,56 @@ impl PathFollower {
             target = self.current_target(grid, from, goal);
             self.watch(target, from);
         }
+
+        // Absolute origin stuck check (sample every 0.5 s).
+        self.origin_stuck_tick(grid, from, goal, dt);
+
         target
+    }
+
+    /// XFP `CheckStuckMonitor`: if we barely moved for a few half-second
+    /// samples, duck-jump once; if that fails, full repath with blocked pen.
+    fn origin_stuck_tick(&mut self, grid: &NavGrid, from: [f32; 3], goal: [f32; 3], dt: f32) {
+        self.origin_stuck_timer += dt;
+        if self.origin_stuck_timer < ORIGIN_STUCK_PERIOD {
+            return;
+        }
+        self.origin_stuck_timer = 0.0;
+        if let Some(prev) = self.origin_stuck_at {
+            let moved = dist2d(from, prev);
+            if moved < ORIGIN_STUCK_MIN_MOVE {
+                self.origin_stuck_warns = (self.origin_stuck_warns + 1).min(3);
+            } else {
+                self.origin_stuck_warns = self.origin_stuck_warns.saturating_sub(1);
+                if self.origin_tried_unstuck && self.origin_stuck_warns == 0 {
+                    self.origin_tried_unstuck = false;
+                }
+            }
+        }
+        self.origin_stuck_at = Some(from);
+        if self.origin_stuck_warns < 3 {
+            return;
+        }
+        // Three consecutive "didn't move" samples (~1.5 s of scraping).
+        if self.origin_tried_unstuck {
+            // Second cycle: replan (XFP ResetObjectiveMovement).
+            self.reroutes += 1;
+            if let Some(&node) = self.path.get(self.at) {
+                *self.blocked.entry(node).or_insert(0) += 2;
+            }
+            self.replan(grid, from, goal);
+            self.origin_stuck_warns = 0;
+            self.origin_tried_unstuck = false;
+            self.unstick_for = 0.0;
+            self.no_progress_for = 0.0;
+        } else {
+            // First cycle: force jump phase (XFP DuckJump). Do not flip
+            // unstick_dir here — the waypoint-stuck path owns that, and flipping
+            // twice would cancel (test: giving_up switches evade direction).
+            self.origin_tried_unstuck = true;
+            self.origin_stuck_warns = 0;
+            self.unstick_for = UNSTICK_AFTER + 0.85;
+        }
     }
 
     /// Consume every waypoint already reached and report the next one.
@@ -420,11 +652,7 @@ impl PathFollower {
                 }
             };
             // Measured against the point actually being steered at, not the
-            // node centre -- `pev->origin.distanceSq (m_pathOrigin)`,
-            // `yapb/src/navigate.cpp:1328`. Using the centre here would hand
-            // back a target the bot is never judged against, and a bot walking
-            // to the edge of a disc it is measured at the middle of arrives
-            // twice.
+            // node centre.
             if dist2d(from, point) <= arrive_radius(grid, node) {
                 self.at += 1;
                 self.steer = None;
@@ -443,35 +671,32 @@ impl PathFollower {
     }
 
     /// Where inside a waypoint's disc to actually walk.
-    ///
-    /// `Bot::setPathOrigin` (`yapb/src/navigate.cpp:2629-2679`). A node with
-    /// room around it is a **disc**, and thirty bots steering at thirty
-    /// different points in it is thirty bodies filling a corridor instead of
-    /// one line of them tracking its centre.
-    ///
-    /// Two regimes, as YaPB has them:
-    ///
-    /// * a wide node draws [`STEER_CANDIDATES`] points from the square
-    ///   `[-r, r]^2` and takes the one **nearest the bot** -- deliberately the
-    ///   near edge, which is what cuts corners;
-    /// * a narrow one (`0 < r <= 16`) takes a single bearing at a random
-    ///   distance. YaPB draws that bearing within +-90 degrees of the bot's own
-    ///   body yaw; this layer is handed a position and not a view, so it draws
-    ///   the whole circle. The difference is which half of a 16-unit disc gets
-    ///   used.
-    ///
-    /// The square rather than the disc is YaPB's, and its corners reach
-    /// `r * 1.41` -- a little past what the radius sweep certified for the two
-    /// widest classes. It is a steering target and not a teleport: the bot is
-    /// already "arrived" at `max(r, 48)` away, so it never walks the last of
-    /// that distance.
     fn steer_point(&mut self, grid: &NavGrid, node: usize, from: [f32; 3]) -> [f32; 3] {
         let origin = grid.origin(node);
         let r = grid.radius(node);
-        if r <= 0.0 {
+        // On narrow/zero-radius nodes (doors, ladders, A-site lips)
+        // steer at the midpoint toward the next path node.
+        let narrow = r <= WIDE_RADIUS || grid.flags(node) & flags::NARROW != 0;
+        if narrow {
+            if let Some(&next) = self.path.get(self.at + 1) {
+                let next_o = grid.origin(next);
+                let portal = [
+                    (origin[0] + next_o[0]) * 0.5,
+                    (origin[1] + next_o[1]) * 0.5,
+                    (origin[2] + next_o[2]) * 0.5,
+                ];
+                if dist2d(from, portal) > 48.0 {
+                    return portal;
+                }
+            }
+            if r <= 0.0 {
+                return origin;
+            }
+        } else if r <= 0.0 {
             return origin;
         }
         if r > WIDE_RADIUS && grid.flags(node) & flags::NARROW == 0 {
+            // Near-edge pick only.
             let mut best = origin;
             let mut best_dist = f32::INFINITY;
             for _ in 0..STEER_CANDIDATES {
@@ -562,10 +787,7 @@ impl PathFollower {
         // amplitude by how much room the current node has: full weave in a
         // wide node, ~nothing in a doorway.
         self.weave_phase += dt * self.draw_range(1.5, 3.0);
-        let room = self
-            .path
-            .get(self.at)
-            .map_or(0.0, |&n| grid.radius(n));
+        let room = self.path.get(self.at).map_or(0.0, |&n| grid.radius(n));
         let room_scale = (room / 48.0).clamp(0.0, 1.0);
         let weave = self.weave_amp * room_scale * self.weave_phase.sin();
 
@@ -589,23 +811,36 @@ impl PathFollower {
     }
 
     fn replan(&mut self, grid: &NavGrid, from: [f32; 3], goal: [f32; 3]) {
+        // Wear the path we are about to abandon so the next search prefers
+        // fresh corridors (Phase A2). Skip when the path is empty (first plan).
+        if !self.path.is_empty() {
+            self.remember_path();
+        }
         self.goal = Some(goal);
         self.at = 0;
         self.steer = None;
         self.tracked = None;
         self.best_dist = f32::INFINITY;
         self.no_progress_for = 0.0;
+        self.open_from = Some(from);
         // Plan W5: a new route is a new defend point for after arrival.
         self.defend = self.pick_defend_point(grid, goal);
         let blocked = std::mem::take(&mut self.blocked);
-        let raw = match (grid.nearest(from), grid.nearest(goal)) {
+        // Floor-aware snap: pure 3D nearest can pick a tunnel under A while the
+        // bot stands on the platform (CT A→B "stare at wall").
+        let raw = match (grid.nearest_prefer_z(from), grid.nearest_prefer_z(goal)) {
             (Some(a), Some(b)) => grid
                 .find_path_tuned(
                     a,
                     b,
                     &|n| {
-                        blocked.get(&n).map_or(0.0, |&hits| BLOCKED_PENALTY * hits as f32)
+                        blocked
+                            .get(&n)
+                            .map_or(0.0, |&hits| BLOCKED_PENALTY * hits as f32)
                             + self.edge_jitter(n)
+                            + self.opening_penalty(n, grid)
+                            + self.lateral_penalty(n, grid, goal)
+                            + self.worn_penalty(n)
                     },
                     self.h_weight,
                 )
@@ -628,11 +863,16 @@ impl PathFollower {
     /// we are partitioning the node pool). Falls back to the goal itself when
     /// no node is in range.
     fn pick_defend_point(&mut self, grid: &NavGrid, goal: [f32; 3]) -> Option<[f32; 3]> {
-        let goal_node = grid.nearest(goal)?;
+        let goal_node = grid.nearest_prefer_z(goal)?;
+        let gz = goal[2];
         let candidates: Vec<usize> = (0..grid.nodes.len())
             .filter(|&n| {
-                let d = dist2d(grid.origin(n), goal);
-                (300.0..=600.0).contains(&d) && grid.flags(n) & flags::NARROW == 0
+                let o = grid.origin(n);
+                let d = dist2d(o, goal);
+                // Stay on the goal's floor band so camp spots are not under A.
+                (300.0..=600.0).contains(&d)
+                    && (o[2] - gz).abs() <= 48.0
+                    && grid.flags(n) & flags::NARROW == 0
             })
             .collect();
         if candidates.is_empty() {
@@ -674,20 +914,9 @@ impl PathFollower {
 
     /// Where to LOOK while walking -- which is not where to walk.
     ///
-    /// The head leads the body: YaPB's `setAimDirection` ladder
-    /// (`yapb/src/vision.cpp:365-640`) steers at the current waypoint but
+    /// The head leads the body: steers at the current waypoint but
     /// looks one or two nodes further on, so the eyes arrive before the feet
-    /// and the bot reads as a person rounding a corner rather than a dot
-    /// tracking a dot. The ladder's conditions keep the eyes from doing
-    /// anything stupid at close range:
-    ///
-    /// * two nodes ahead only when both are plain -- no ladder, crouch, jump
-    ///   or narrow node between the eyes and the far point;
-    /// * the hop between the two nodes is flat (`|z diff| < 8`);
-    /// * the current node has room (`radius >= 16`, i.e. not a doorway);
-    /// * the far point is within 384 units, inside YaPB's `kMaxAimDistance`;
-    /// * otherwise one node ahead; with the route exhausted, `None`, so the
-    ///   caller falls back to the steering point (== the destination).
+    /// and the bot reads as a person rounding a corner.
     pub fn look_target(&self, grid: &NavGrid, from: [f32; 3]) -> Option<[f32; 3]> {
         if self.path.is_empty() {
             return None;
@@ -699,9 +928,8 @@ impl PathFollower {
         if i + 1 < self.path.len() {
             let far = self.path[i + 1];
             let far_origin = grid.origin(far);
-            let plain = |n: usize| {
-                grid.flags(n) & (flags::LADDER | flags::CROUCH | flags::NARROW) == 0
-            };
+            let plain =
+                |n: usize| grid.flags(n) & (flags::LADDER | flags::CROUCH | flags::NARROW) == 0;
             if plain(node)
                 && plain(far)
                 && (far_origin[2] - origin[2]).abs() < 8.0
@@ -754,19 +982,29 @@ mod tests {
         let goal = map.objective(false, 0).expect("a bomb site");
 
         let mut f = PathFollower::with_seed(9);
-        f.next_waypoint(&map.grid, start, goal, 0.02).expect("a first waypoint");
+        // Walk a few hops so we are not on a zero-radius doorway node (room_scale=0
+        // kills the weave and made this assert flake on some nav lattices).
+        let mut pos = start;
+        for _ in 0..8 {
+            if let Some(w) = f.next_waypoint(&map.grid, pos, goal, 0.02) {
+                pos = w;
+            }
+        }
 
         let mut weave_abs_max = 0.0f32;
         let mut pauses = 0;
         for _ in 0..200 {
-            let (weave, speed_scale) = f.natural_walk(&map.grid, start, 0.02);
+            let (weave, speed_scale) = f.natural_walk(&map.grid, pos, 0.02);
             weave_abs_max = weave_abs_max.max(weave.abs());
             if speed_scale < 1.0 {
                 pauses += 1;
             }
         }
         // Bounded and inside cl_sidespeed (250).
-        assert!(weave_abs_max <= 250.0, "weave {weave_abs_max} exceeds cl_sidespeed");
+        assert!(
+            weave_abs_max <= 250.0,
+            "weave {weave_abs_max} exceeds cl_sidespeed"
+        );
         assert!(weave_abs_max > 1.0, "weave never moved: {weave_abs_max}");
         // The weave is an oscillator: it must change sign, not push one way.
         // (Over a short window the integral of a sine is not zero, so the sum
@@ -858,25 +1096,31 @@ mod tests {
 
         // Just handed a waypoint: nothing to correct yet.
         f.next_waypoint(&map.grid, start, goal, 0.02);
-        assert!(f.unstick().is_none(), "nudged before it had a chance to walk");
+        assert!(
+            f.unstick().is_none(),
+            "nudged before it had a chance to walk"
+        );
 
         // Blocked -- the origin never changes, so the distance to the waypoint
         // never comes down. Strafe first, no jump yet.
-        for _ in 0..25 {
+        for _ in 0..30 {
             f.next_waypoint(&map.grid, start, goal, 0.02);
         }
         let a = f.unstick().expect("blocked bot should be nudged");
         assert!(a.sidemove.abs() > 0.0, "first response is a sidestep");
         assert!(!a.jump);
 
-        // Still blocked: add the jump. Stay under STUCK_SECONDS so this tests
-        // the escalation and not the give-up.
-        for _ in 0..30 {
+        // Still blocked, under STUCK_SECONDS so we escalate rather than replan.
+        for _ in 0..25 {
             f.next_waypoint(&map.grid, start, goal, 0.02);
         }
         let b = f.unstick().expect("still blocked");
         assert!(b.jump, "a persistent block should provoke a jump");
-        assert!(b.yaw_bias.abs() > 0.0, "and stop staring at the wall");
+        assert!(
+            b.yaw_bias.abs() <= 12.0,
+            "yaw bias stays small, got {}",
+            b.yaw_bias
+        );
     }
 
     /// Moving again must clear it, or the bot strafes across the whole map.
@@ -937,7 +1181,10 @@ mod tests {
         };
 
         let routes: Vec<_> = (0..8u64).map(route_of).collect();
-        assert!(routes.iter().all(|r| r.len() > 5), "a route came back implausibly short");
+        assert!(
+            routes.iter().all(|r| r.len() > 5),
+            "a route came back implausibly short"
+        );
 
         // Jaccard over the 128-unit cells each route visits. Identical searches
         // score 1.0; the live baseline was 0.62 and the plan's target is <= 0.30.
@@ -961,10 +1208,65 @@ mod tests {
         // similar jitter legitimately take the same corridor, and forcing them
         // apart would be noise, not variety. What must not happen is everyone
         // agreeing.
-        assert!(mean < 0.95, "every seed produced the same route (mean overlap {mean:.2})");
-        let distinct: std::collections::BTreeSet<_> =
-            routes.iter().map(|r| r.iter().copied().collect::<Vec<_>>()).collect();
-        assert!(distinct.len() >= 2, "8 seeds produced {} distinct routes", distinct.len());
+        assert!(
+            mean < 0.95,
+            "every seed produced the same route (mean overlap {mean:.2})"
+        );
+        let distinct: std::collections::BTreeSet<_> = routes
+            .iter()
+            .map(|r| r.iter().copied().collect::<Vec<_>>())
+            .collect();
+        assert!(
+            distinct.len() >= 2,
+            "8 seeds produced {} distinct routes",
+            distinct.len()
+        );
+    }
+
+    /// Phase A2 offline gate: 30 seeds on T-spawn → site A produce many distinct
+    /// node sequences (plan target was ≥8; we aim ≥12 after opening bias).
+    #[test]
+    fn thirty_seeds_produce_many_distinct_dust2_routes() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        let start = *map.info.t_spawns.first().expect("a T spawn");
+        // Force site A (higher z platform ~[1152, 2464, 144]).
+        let goal = map
+            .info
+            .bomb_sites
+            .iter()
+            .max_by(|a, b| a.centre()[2].partial_cmp(&b.centre()[2]).unwrap())
+            .map(|z| z.centre())
+            .expect("bomb site");
+
+        let mut sequences = std::collections::BTreeSet::new();
+        let mut all_nodes = std::collections::BTreeSet::new();
+        for seed in 0..30u64 {
+            let mut f = PathFollower::with_seed(seed.wrapping_mul(0x9E37_79B9));
+            f.next_waypoint(&map.grid, start, goal, 0.02);
+            // Full node-index sequence after smoothing — exact path identity.
+            let seq: Vec<(i32, i32)> = f
+                .path_nodes(&map.grid)
+                .iter()
+                .map(|p| ((p[0] / 80.0).round() as i32, (p[1] / 80.0).round() as i32))
+                .collect();
+            for &c in &seq {
+                all_nodes.insert(c);
+            }
+            sequences.insert(seq);
+        }
+        eprintln!(
+            "30 seeds → {} distinct routes, {} distinct 80u cells",
+            sequences.len(),
+            all_nodes.len()
+        );
+        assert!(
+            sequences.len() >= 12,
+            "Phase A2 gate: want ≥12 distinct T→A routes, got {}",
+            sequences.len()
+        );
     }
 
     /// A waypoint with room around it is a disc, and the bot aims at the near
@@ -1049,17 +1351,28 @@ mod tests {
             );
         }
 
-        // Within the disc of the node it belongs to, wherever that is.
+        // Within the disc of the node, or on the portal edge to the next node
+        // (XFP door steering: zero-radius nodes aim at the doorway midpoint).
         let o = map.grid.origin(node);
         let r = map.grid.radius(node);
+        let in_disc =
+            (first[0] - o[0]).abs() <= r.max(1.0) && (first[1] - o[1]).abs() <= r.max(1.0);
+        let on_portal = f.path.get(f.at + 1).map_or(false, |&n| {
+            let n_o = map.grid.origin(n);
+            let portal = [(o[0] + n_o[0]) * 0.5, (o[1] + n_o[1]) * 0.5];
+            (first[0] - portal[0]).abs() < 1.0 && (first[1] - portal[1]).abs() < 1.0
+        });
         assert!(
-            (first[0] - o[0]).abs() <= r && (first[1] - o[1]).abs() <= r,
-            "{first:?} is not inside the {r}-unit disc around {o:?}"
+            in_disc || on_portal,
+            "{first:?} is not inside the {r}-unit disc around {o:?} nor on portal"
         );
 
         // Walking onto it advances the route and draws a new point.
         f.next_waypoint(&map.grid, first, goal, 0.02);
-        assert!(f.at > 0 || f.path.len() <= 1, "arriving did not consume the waypoint");
+        assert!(
+            f.at > 0 || f.path.len() <= 1,
+            "arriving did not consume the waypoint"
+        );
     }
 
     /// The bug that made a speed threshold useless.
@@ -1177,7 +1490,10 @@ mod tests {
         // a detour becomes the cheaper answer.
         let before = f.reroutes;
         assert!(step(&mut f, &|f| f.reroutes > before + 6), "never gave up");
-        assert!(step(&mut f, &|f| f.unstick().is_some()), "never nudged again");
+        assert!(
+            step(&mut f, &|f| f.unstick().is_some()),
+            "never nudged again"
+        );
 
         let second = f.unstick().expect("still blocked").sidemove.signum();
         assert_ne!(first, second, "must try the other side after giving up");

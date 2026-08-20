@@ -10,3 +10,4 @@ netchan = { path = "../netchan" }
 auth = { path = "../auth" }
 bot = { path = "../bot" }
 nav = { path = "../nav" }
+socket2 = "0.5"

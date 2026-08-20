@@ -38,8 +38,8 @@ for i in $(seq 1 "$N"); do
     if [ $((i % 2)) -eq 1 ]; then team=1; else team=2; fi
     # 15 characters, unique per bot, stable across runs so the server sees the
     # same SteamID for "the same" bot each time.
-    key=$(printf 'AIPLAYERBOT%04d' "$i")
-    name=$(printf 'Bot%02d' "$i")
+    key=$(printf 'REBBOT%04d' "$i")
+    name=$(printf 'reBot%02d' "$i")
 
     # Each bot runs a little longer than the one before, so the fleet LEAVES
     # spread out as well as arriving spread out.
@@ -56,9 +56,9 @@ for i in $(seq 1 "$N"); do
     # ReAuthCheck 0.1.6. Do not rely on it.
     life=$(( SECS + 5 * (i - 1) / 2 ))
 
-    AIPLAYERS_NAME="$name" \
-    AIPLAYERS_KEY="$key" \
-    AIPLAYERS_TEAM="$team" \
+    REB_NAME="$name" AIPLAYERS_NAME="$name" \
+    REB_KEY="$key" AIPLAYERS_KEY="$key" \
+    REB_TEAM="$team" AIPLAYERS_TEAM="$team" \
         "$EXE" "$ADDR" "$life" "$OUT/$name.bin" > "$OUT/bot$i.log" 2>&1 &
     pids+=($!)
     echo "  $name  team $team  key $key  pid ${pids[-1]}"

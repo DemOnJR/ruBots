@@ -132,7 +132,9 @@ pub fn seed_rng(seed: usize) -> impl FnMut() -> usize {
 /// install; then the copies extracted from the test-server container.
 fn find_bsp(name: &str) -> Option<PathBuf> {
     let file = format!("{name}.bsp");
-    let roots = std::env::var("AIPLAYERS_MAPS_DIR")
+    let roots = std::env::var("REB_MAPS_DIR")
+        .or_else(|_| std::env::var("REBOTS_MAPS_DIR"))
+        .or_else(|_| std::env::var("AIPLAYERS_MAPS_DIR"))
         .ok()
         .map(PathBuf::from)
         .into_iter()

@@ -1,18 +1,13 @@
-//! Navigation graph — YaPB waypoint files.
+//! Navigation graph — waypoint files.
 //!
-//! Port of `internal/nav/graph.go`. The binary's `LoadGraph` (`0x1406F7DA0`)
-//! checks `dword[0] == 0x59415042`, requires at least `0x18` header bytes, and
-//! strides node records by `0xDC`.
-//!
-//! Those three numbers identify the format exactly: YaPB's `kStorageMagic` is
-//! `0x59415042`, its `StorageHeader` is six `int32`s (24 = `0x18`), and its
-//! `Path` node struct is 220 bytes (`0xDC`):
+//! Binary waypoint format with `0x59415042` magic, `0x18` header bytes, and
+//! `0xDC` node strides:
 //!
 //! ```text
 //! number  i32      4      \
 //! flags   i32      4       |
 //! origin  Vector  12       |
-//! start   Vector  12       > 56 bytes  (= the 0x38 stride also seen in LoadGraph)
+//! start   Vector  12       > 56 bytes
 //! end     Vector  12       |
 //! radius  f32      4       |
 //! light   f32      4       |
@@ -21,12 +16,8 @@
 //! vis     PathVis        4
 //!                     = 220
 //! ```
-//!
-//! Format details cross-checked against the YaPB project; the implementation
-//! here is written from that layout, not copied from it.
 
-
-/// `kStorageMagic`.
+/// Waypoint storage magic (`0x5941_5042`).
 pub const MAGIC: u32 = 0x5941_5042;
 /// Graph storage version the loader expects.
 pub const VERSION: i32 = 2;

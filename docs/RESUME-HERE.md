@@ -1,5 +1,269 @@
 # Where we are, and what to do next
 
+## 2026-08-11: Remote join + fileconsistency (done)
+
+Nexaplay `85.215.153.249:27015`: RevEmu auth OK; bot streams, joins team, moves.
+Drop `Reason: Invalid length` / `opcode clc_fileconsistency` was a **netchan
+idle leak**, not a consistency bit-pack bug. Documented in
+**`docs/remote-join.md`**. Do not “fix” consistency framing first if that
+log line returns — decode `.sent` for bare `07` on non-fragment packets.
+
+## 2026-08-11: Loop G2 + A2g (validated live)
+
+**G2 is validated.** `docs/metrics-dust2-2026-08-11-g2-a2g-live.md`:
+
+- **G2-ROTATE 9 / 9 CTs** — 9 distinct rotations, each bot exactly once (dedup + 4 s cooldown hold).
+- **Bomb-driven (5):** plant at B pulled Bot02/06/18/20 to site 0 (B), plant at A pulled Bot04 to site 1 (A) — correct site targeting.
+- **Pressure-driven (4):** Bot08/10/12/14 rotated on ≥2 visible enemies with no bomb (no false rotates from single contacts).
+- **Delay preserved:** delay buckets (seed%10 ∈ {0,3}) held the quiet site under light pressure; Bot16 (B assault) never rotated.
+- **A2g non-regressive:** CONGA-1 **0.548** (best since A2d), CONGA-2 0.055, ROUTE-2 0.108, STILL-1 0.195 all in target. Remaining misses are the pre-existing humanization gaps (CONGA-1, ROUTE-3, PILE-2 max 10).
+
+After U2d+A2f CONGA-1 **0.627** miss and Nexaplay 20-bot pre snapshot CONGA-1
+**0.579** (`docs/metrics-dust2-2026-08-11-nexaplay-pre-g2.md`):
+
+| Change | Detail |
+|---|---|
+| **A2g** | Revert A2f crank: `OPENING_BIAS_SCALE` 125→**105**, `LATERAL_BIAS_SCALE` 130→**95**, `LATERAL_LANES` 6→**4**, edge jitter 0..90→**0..70** |
+| **G2** | `role::ct_rotate_pick` + `Session::maybe_ct_rotate`: CT repaths when ≥2 visible enemies near one site (or bomb planted); seed buckets 0/3 delay unless ≥3 contacts; 4 s cooldown |
+| **Util** | Full/force: **every** bot buys flash; throw machine allows flash for non-owners; smoke/HE stay slot-owned |
+
+Tests: bot **231** ok; client **195** ok (incl. `g2_rotate_fires_on_two_enemies…`).
+
+**Validation 2026-08-11:** the staged 20-bot × 900 s A2g run completed with 5,638
+live samples. Metrics: CONGA-1 **0.573** (miss), CONGA-2 **0.051** (pass), ROUTE-2
+**0.104** (pass), ROUTE-3 **1121** (miss), STILL-1 **0.208** (pass), VIEW-1
+**66.7°** (pass), PILE-2 max **10** (miss). Full report:
+`docs/metrics-dust2-2026-08-11-g2-a2g.md`.
+
+The capture format did not expose G2 events, so `Session::apply_ct_rotation` now
+logs a cumulative `rotate` counter/site; the parser emits `G2-ROTATE`, and client
+library tests are **196** including the deduplication test.
+
+**Instrumented retest (2026-08-11):** resolved — the server was down; after
+`docker compose up -d` (fresh container) the 20-bot × 900 s run completed with
+5,749 live samples, **G2-ROTATE 9 / 9**, two plants, no mass-drop. See the
+validated section above and the full report. G0 can start.
+
+## 2026-08-11: G0 team / round state bus (implemented)
+
+G0 is implemented as a pure reducer plus an optional localhost multicast bus:
+
+- `crates/bot/src/team.rs` — `TeamReport`, `TeamSnapshot`, and `PlantSite`.
+  Same-team reports derive alive A/B/mid counts, two-contact site pressure, and
+  planted-site belief. A late joiner with only `bomb_planted=true` inherits the
+  first teammate's known plant origin.
+- `crates/client/src/telemetry.rs` — versioned `APT2` fixed-layout team packet
+  and `TeamBus` on multicast `239.255.0.1:27017`; existing radar `APT1` packet is
+  unchanged.
+- `crates/client/src/session.rs` — local report generation from `WorldView`,
+  explicit assigned-site tracking through G1/G2, snapshot reset per round, and
+  teammate report ingestion.
+- `crates/client/examples/capture_running.rs` — publishes and consumes G0
+  reports when `AIPLAYERS_TEAM_PORT` is set.
+- `scripts/swarm.ps1` — enables `AIPLAYERS_TEAM_PORT=27017` by default.
+
+Offline G0 tests pass: five CT reports with a B-site wipe derive `pressure=B`,
+plant-at-A origin is inherited by a late joiner as `PlantSite::A`, foreign-team
+reports are ignored, and the `APT2` packet round-trips with bomb origin, role,
+and rung.
+
+Validation: full workspace suite passed, including live sign-on; `capture_running`
+built successfully. The two-bot smoke reached signon and joined with the bus
+enabled for Bot02; Bot01 was rejected by the server's ReAuthCheck/idle-timeout
+state before runtime, so this was not a G0 bind failure. G2 continues to use its
+validated local-PVS signal; the next G0 follow-up is to consume `TeamSnapshot`
+pressure/plant state in G2 and add snapshot-driven rotation tests.
+
+## 2026-08-11: Upgrade plan + Phase A1 roles (in progress)
+
+Full investigation + research plan: natural walking, aiming, radar GUI, bomb
+play. Summary:
+
+- **Freeze de_dust2** until the 18 humanize metrics pass; then other maps/mods.
+- **Do not** train MLMove first — use its findings as design constraints
+  (wall-hug, cover, team roles). Keep spring aim; add placement later.
+- **Next algorithm layers:** roles + approach rings (A1/A3) → route diversity
+  (A2) → ORCA-lite local avoid (B) → aim placement (C) → plant spots (D) →
+  GUI tabs / APT2 (E) → other maps/mods (F).
+- **Phase G — professional team tactics** (planned): CT site/lane defaults,
+  rotate on site wipe, post-plant T holds + CT retake/defuse. Full write-up:
+  **`docs/tactics-plan.md`**. Can start G0+G1 in parallel with A2 CONGA work.
+
+### Navigation & steering improvements
+
+- **Portal steering** for doorways and narrow gaps.
+- Navigation graphs generated from map geometry.
+
+### Shipped this session (Phase A1 / A3)
+
+- `crates/client/src/role.rs` — `BotRole` { Assault, Hold, Flank, Split },
+  approach ring destinations 220–450 u from site, plant_spot always in zone,
+  carrier override so Hold bots still plant inside the volume.
+- `Session::refresh_objective` uses the role picker; `Decision.role` logged.
+- Offline tests: role distribution, dust2 site spread, ring fan-out.
+- Phase 0 checklist: `docs/metrics-dust2-phase0-checklist.md`.
+
+**Live measure 2026-08-11 (30 bots, 15 min):** see
+`docs/metrics-dust2-2026-08-11-roles.md`.
+
+| | prior walker | after roles | target |
+|---|---|---|---|
+| PILE-2 max | 15 | **6** | ≤5 |
+| CONGA-2 | 9.7% | **7.3%** | ≤12% |
+| ROUTE-2 | 0.191 | **0.109** | ≤0.15 |
+| CONGA-1 | 67% | 71% | ≤45% |
+| ROUTE-3 | 904 | 899 | ≥1400 |
+| Plants | — | **9** | — |
+
+Roles help pile/route-2; **CONGA-1 + ROUTE-3 need Phase A2 + B next.**
+`metrics.py` now accepts `role` on `obj:` lines.
+
+### 2026-08-11 continued: A2 + B + C + D + E (code)
+
+| Phase | Change |
+|---|---|
+| **A2** | Edge jitter 0..40, 5 h-weights, opening-angle bias first 720u, worn-path soft penalty. Offline: **30/30 distinct** T→A routes. |
+| **B** | ORCA-lite sidestep off visible teammates (disabled when struggling); cover bias on steer disc. |
+| **C** | Combat aim lead from last-tick enemy origin, difficulty-scaled. |
+| **D** | de_dust2 named plant spots (A/B default/open/back). |
+| **E** | GUI tabs Radar/Fleet/Settings, heading ticks, zoom, live fleet metrics. |
+
+Live re-measure after this stack is in flight (`swarm.ps1 -N 30 -Secs 900`).
+
+### 2026-08-11 A2b (CONGA-1 / ROUTE-3 push)
+
+Still open after A2 bump: CONGA-1 ~65–68% (≤45%), ROUTE-3 ~1276 (≥1400). PILE-2 max **PASS**.
+
+| Lever | Change |
+|---|---|
+| Edge jitter | 0..55 → **0..70** |
+| Opening bias | max 720→**1100**, scale 85→**105** |
+| **Lateral bias** | new: seed left/right of start→goal, 350–1900u, scale 60 |
+| h-weights | 5 → **7** flavours (0 / 0.4 / 0.75 / 1 / 1.35 / 1.6 / 2.4) |
+| Weave amp | 12–30 → **16–38** |
+| Worn penalty | 28 → **36** |
+| Role rings | 220–450 → **200–560** |
+| XFP stuck | origin sample 0.5s / 80u / jump then repath (prior) |
+
+Offline: **30 seeds → 30 distinct** T→A routes, 266 cells @80u.
+
+**Live:** 20-bot × 900s swarm + GUI; 5-minute measure/improve loop. Avoid MaxDrop mass-kill (docker restart clears ban).
+
+### 2026-08-11 A2c (full measure)
+
+Early snapshot: `docs/metrics-dust2-2026-08-11-a2c-pre.md`.  
+Full table: `docs/metrics-dust2-2026-08-11-a2c.md`.
+
+| metric | A2c full (N=20, 6170 live) | target |
+|---|---|---|
+| CONGA-1 | **0.567** | ≤0.45 |
+| CONGA-2 | **0.041** | ≤0.12 pass |
+| ROUTE-2 | **0.130** | ≤0.15 pass |
+| ROUTE-3 | **1082** | ≥1400 |
+| PILE-2 max | **10** | ≤5 |
+
+Scale-only (60→95) moved CONGA-1 a little; binary L/R still packs half the fleet per wall.
+
+### 2026-08-11 A2d (full measure)
+
+Full table: `docs/metrics-dust2-2026-08-11-a2d.md`.
+
+| metric | A2c | **A2d** | target |
+|---|---|---|---|
+| CONGA-1 | 0.567 | **0.545** | ≤0.45 |
+| ROUTE-3 | 1082 | **1222** | ≥1400 |
+| ROUTE-2 | 0.130 | **0.150** | ≤0.15 (edge) |
+| PILE-2 max | 10 | **10** | ≤5 |
+
+Lanes help ROUTE-3 more than CONGA-1. Next diversity lever: earlier lateral band
+or stronger ORCA — not another scale-only bump.
+
+### 2026-08-11 freeze-time mass jump (fixed)
+
+**Symptom:** every bot jumps in sync at freezetime end.  
+**Cause:** `next_waypoint` ran during freeze with pinned origin → stuck/unstick
++ origin-stuck armed jump for the whole fleet.  
+**Fix:** skip `next_waypoint` while `freeze_period` (same branch as dead);
+`hold()` also clears origin-stuck counters. Rebuilt `capture_running`.
+
+### 2026-08-11 Phase G tactics plan + first builds
+
+Full plan: **`docs/tactics-plan.md`**.
+
+| Phase | Status |
+|---|---|
+| G1 CT default anchors (`role.rs` `dust2_ct_setup`) | **shipped + live measured** — see `docs/metrics-dust2-2026-08-11-g1.md` |
+| G4 T post-plant `DefendPlant` + entry holds | **coded + unit tests green**; live swarm after G1 |
+| A2e `LATERAL_BIAS_MIN` 350→200 | **coded** with G4 binary |
+| G0 team bus / G2 rotate / G5 defuse race | still open |
+| **U/E utility + economy** | plan + E0/U0/U1 code — `docs/utility-economy-plan.md` |
+
+G1 live CT split (10 CTs): 3 near A, 2 near B, 5 mid/flex — both sites covered.
+
+### Utility + economy (2026-08-11)
+
+Problem: bots buy nades, walk with them out, never throw; everyone would dump
+the same util; no eco discipline.
+
+Practical design (pro 1.6-style):
+
+- **Slots** (`utility.rs`): mid smoke, long smoke, retake flash, … each has
+  **one owner** per seed bucket → no 10× mid smoke.
+- **Triggers**: execute choke / hold deny / post-plant / contact — **never**
+  freezetime or first 3 s (UTIL-1).
+- **Economy** (`economy.rs`): Pistol / Eco / Force / Full — eco buys **no**
+  rifle, **no** util stack; full buy only purchases **owned** nade kinds.
+- **U0 holster**: if holding HE/flash/smoke while walking, `Select` rifle.
+
+Still open: **U2 throw state machine** (pin/release + aim at lineup).
+
+### 2026-08-11 G4+A2e live measure
+
+`docs/metrics-dust2-2026-08-11-g4-a2e.md` — **601** `rung defend` samples (G4 works).
+CONGA-1 **0.589** (no win from A2e alone). Binary predated U/E rebuild.
+
+### 2026-08-11 U2 throw machine (shipped + live)
+
+`ThrowMachine` in `utility.rs`: Approach → Select → Aim → Pin → Release → holster.
+Wired in `controller` after combat; close threats abort util. Live: `docs/metrics-dust2-2026-08-11-u2.md`.
+
+### 2026-08-11 U2b (lineups + approach timeout)
+
+- `THROW_ARRIVE` 120→220, `APPROACH_TIMEOUT` 5s → throw in place  
+- Coords aligned to G1/plant spots; wider execute radii; contact HE aims enemy  
+- Live: `docs/metrics-dust2-2026-08-11-u2b.md` — pin+throw+done **8→31**, CONGA-1 **0.619→0.564**
+
+### 2026-08-11 U2c + B1
+
+- Inventory gate via freeze `owned_nades` mask (weapons bitmask not on wire)
+- ORCA 160u + forward brake when teammate ahead  
+- Live: `docs/metrics-dust2-2026-08-11-u2c-b1.md` — util collapses to real buys only;
+  CONGA-1 **0.574** (B1 no win). **231** bot tests.
+
+### 2026-08-11 U2d + A2f
+
+- Util before rifle on force/full; slot buckets 3; A2f stronger opening/lateral/jitter  
+- Live: `docs/metrics-dust2-2026-08-11-u2d-a2f.md` — CONGA-1 **0.627** (A2f miss);
+  util still ~35; **defend 264 / defuse 212** strong. Offline routes 346 cells.  
+- **231** bot tests.
+
+### 2026-08-11 Height-aware pathing + radar layers
+
+**Diagnosis:** Nav gen already multi-level; A→B wall-stare was wrong-floor
+`nearest` + Jump/Crouch edges never pressed as buttons.
+
+**Shipped:**
+- `route::nearest_prefer_z` / `NavGrid::nearest_prefer_z` — same-floor snap
+- PathFollower uses floor-aware replan + hop `required_move` → jump/duck
+- Radar: height bands (low/mid/high), jumps orange, crouch purple, ladders green,
+  falls blue, narrow doors, bomb goals; layer toggles in Settings
+
+Next: G2 rotate; live verify CT A→B; optional solid-brush boxes on radar.
+
+**Loop discipline:** feature → unit tests → live swarm → metrics doc → next.
+
+---
+
 Stopped 2026-08-03. Everything below is committed; `git log` carries the
 reasoning for each change and is worth reading before re-deriving anything.
 
@@ -47,8 +311,7 @@ nav 135 -- de_dust2-dependent tests need the bsp present). Nothing committed.
 What changed, by file:
 
 - `crates/bot/src/aim.rs` -- refactored `step` into `step_with_yaw_error`,
-  added `step_guarded` porting YaPB's back-swing guard verbatim
-  (`yapb/src/vision.cpp:172-195`), two tests (long-way-through-front; guard
+  added `step_guarded` with back-swing guard, two tests (long-way-through-front; guard
   inert when the short way is forward).
 - `crates/bot/src/controller.rs` -- `Controller` gained `view_motion:
   ViewMotion`; all five view sites now go through `aim_at`/`aim_at_guarded`:
@@ -73,9 +336,7 @@ What changed, by file:
 Gotchas learned this round (do not rediscover):
 
 - The back-swing guard only fires when current/desired straddle the travel
-  bearing with |c - t| >= 180 -- with travel exactly 0 YaPB's `fzero(forward)`
-  skips it (ported as `travel_yaw.abs() > 1e-4`). Test example: current 170,
-  desired -170, travel 0.5.
+  bearing with |c - t| >= 180. Test example: current 170, desired -170, travel 0.5.
 - `navgrid::flags` has NO `JUMP` constant (jumps are `Move::Jump` links) --
   compile error if you reference `flags::JUMP`.
 - `norm_angle` folds into [-180, 180).
@@ -185,13 +446,18 @@ verification needs more samples.
   `netq 7900`, after which the bot could never send another console command).
   Walk the stream.
 - The server log lags in 8 KB blocks and `docker logs` lags with it.
+- **`Invalid length` + `badread on opcode clc_fileconsistency` is usually not
+  a bad consistency body.** After STEAM auth succeeds, the killer was
+  `NetChannel::transmit` putting `reliable_buf` on **every** idle packet while
+  a fragment upload was in flight, but without the reliable/fragment flags.
+  Server saw a bare `07 <u16 length>` with a short body → drop. Fix: only
+  attach reliable/fragment payload when `send_reliable` is true (ReHLDS
+  `Netchan_Transmit`). Full write-up: **`docs/remote-join.md`** (section
+  “Trap: Invalid length”). Regression:
+  `cargo test -p netchan idle_packets_do_not_leak`.
 
 ## Reference
 
-- YaPB cloned read-only at `D:\Downloads\app\yapb` (`src/navigate.cpp`,
-  `planner.cpp`, `combat.cpp`, `botlib.cpp`). ReHLDS/ReGameDLL at
-  `D:\Downloads\app\{rehlds,regamedll}`. **Never edit any of them.**
-- `scripts/swarm.sh N SECS` -- N bots, alternating teams, own key and seed each.
-- `scripts/rcon.py "<cmd>"`, `crates/client/examples/mapinfo.rs`.
-- Tests need MSVC: `rustup run stable-x86_64-pc-windows-msvc cargo test --workspace`.
-  `os error 5` is antivirus on a freshly linked test exe -- re-run.
+- `scripts/swarm.ps1 -N <count> -Secs <seconds>` -- launch bots with unique keys and seeds.
+- `scripts/rcon.py "<cmd>"`.
+- Tests: `cargo test --workspace`.

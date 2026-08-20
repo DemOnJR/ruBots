@@ -29,6 +29,7 @@
 pub mod aim;
 pub mod combat;
 pub mod controller;
+pub mod economy;
 pub mod fire;
 pub mod idle;
 pub mod intent;
@@ -36,15 +37,18 @@ pub mod math;
 pub mod objective;
 pub mod rng;
 pub mod task;
+pub mod team;
+pub mod utility;
 pub mod weapons;
 pub mod world;
 
 pub use aim::{
-    aim_error, compensate, predict_punch, turn_toward, COMBAT_GAINS, NAV_GAINS, SpringGains,
-    ViewMotion,
+    aim_error, compensate, predict_punch, turn_toward, SpringGains, ViewMotion, COMBAT_GAINS,
+    NAV_GAINS,
 };
 pub use combat::{engage, select_target, threat_score, EngageParams, Engagement};
 pub use controller::Controller;
+pub use economy::{build_buy_plan, classify_buy, BuyClass};
 pub use fire::{FireAction, FireControl, FireParams, HoldFire, WeaponState};
 pub use idle::AntiIdle;
 pub use intent::{BotCommand, Intent};
@@ -54,5 +58,7 @@ pub use objective::hostage::{EscortPhase, HostageEscort};
 pub use objective::{Objective, ObjectiveState};
 pub use rng::Rng;
 pub use task::{Difficulty, Task};
+pub use team::{PlantSite, TeamReport, TeamSnapshot};
+pub use utility::{holding_nade, my_slots, NadeKind, ThrowMachine, UtilitySlot};
 pub use weapons::{Equipment, FireClass, WeaponId, WeaponInfo, WEAPONS};
 pub use world::{BombState, HostageView, PlayerView, SelfState, Team, WorldView};

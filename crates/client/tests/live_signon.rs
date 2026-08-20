@@ -41,7 +41,10 @@ fn server_is_up() -> bool {
 }
 
 fn skip_or_panic(what: &str) -> bool {
-    if std::env::var("AIPLAYERS_REQUIRE_SERVER").is_ok() {
+    if std::env::var("REB_REQUIRE_SERVER").is_ok()
+        || std::env::var("REBOTS_REQUIRE_SERVER").is_ok()
+        || std::env::var("AIPLAYERS_REQUIRE_SERVER").is_ok()
+    {
         panic!("no HLDS server on {SERVER}: {what}");
     }
     eprintln!("SKIP: no HLDS server on {SERVER} ({what})");
@@ -57,7 +60,7 @@ fn the_live_signon_is_reached_and_every_delta_table_learned() {
 
     let mut t = client::UdpTransport::connect(SERVER.parse().unwrap(), None)
         .expect("bind/connect udp");
-    let mut session = Session::new(Identity { name: "AIPlayer".into(), ..Default::default() });
+    let mut session = Session::new(Identity { name: "reBot".into(), ..Default::default() });
 
     match session.connect_and_signon(&mut t, Duration::from_secs(15)) {
         Ok(signon) => {

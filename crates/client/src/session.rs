@@ -74,6 +74,12 @@ pub struct Decision {
     pub to_hostage: f32,
     /// Rising `+use` edges the escort has emitted this life.
     pub use_edges: u32,
+    /// Tactical role this round (assault/hold/flank/split). Empty when unknown.
+    pub role: &'static str,
+    /// Cumulative G2 rotation events this round.
+    pub rotate_events: u32,
+    /// Current G2 rotation target site, if any.
+    pub rotate_site: Option<usize>,
 }
 
 /// Where a session is in its lifecycle.
@@ -144,7 +150,24 @@ pub struct Session {
     /// capture or protocol test wants.
     pub brain: Option<bot::Controller>,
     /// Objective the bot is heading for, supplied by the nav layer.
+    ///
+    /// For Hold/Flank roles this is an approach-ring point, not the plant disc.
+    /// The carrier override in `think` uses [`plant_spot`] instead.
     pub site: Option<[f32; 3]>,
+    /// Point inside a bomb-site volume — where a C4 carrier must plant.
+    pub plant_spot: Option<[f32; 3]>,
+    /// Tactical role for this round (plan Phase A1).
+    pub role: Option<crate::role::BotRole>,
+    /// Phase G2: last site index we rotated toward (for hysteresis / logs).
+    pub rotate_site: Option<usize>,
+    /// Explicit current assigned bomb-site index for G0 reports.
+    pub assigned_site: Option<usize>,
+    /// Same-team tactical belief from the G0 state bus.
+    pub team_snapshot: Option<bot::TeamSnapshot>,
+    /// Number of distinct G2 repaths this round.
+    pub rotate_events: u32,
+    /// Cooldown so we do not repath every tick when enemies flicker PVS.
+    rotate_cooldown: f32,
     /// The loaded map: collision, entities and the navigation graph.
     pub map: Option<crate::map::Map>,
     follower: crate::navigate::PathFollower,
@@ -155,6 +178,9 @@ pub struct Session {
     last_speed: f32,
     /// What the brain decided last frame, for diagnostics.
     pub last_decision: Option<Decision>,
+    /// Latest local report for the G0 state bus.
+    pub latest_team_report: Option<bot::TeamReport>,
+    team_bot_id: u16,
     /// Seconds since the last freeze period ended (round start grace).
     ///
     /// Bots spawn in a crowd and box each other in for the first moments of a
@@ -266,11 +292,20 @@ impl Session {
             console: crate::console::ConsoleQueue::new(),
             brain: None,
             site: None,
+            plant_spot: None,
+            role: None,
+            rotate_site: None,
+            assigned_site: None,
+            team_snapshot: None,
+            rotate_events: 0,
+            rotate_cooldown: 0.0,
             map: None,
-            follower: crate::navigate::PathFollower::new(),  // re-seeded by set_seed
+            follower: crate::navigate::PathFollower::new(), // re-seeded by set_seed
             last_origin: None,
             last_speed: 0.0,
             last_decision: None,
+            latest_team_report: None,
+            team_bot_id: 0,
             post_freeze_grace: 0.0,
             last_think: None,
             bought_at_reset: None,
@@ -433,7 +468,13 @@ impl Session {
     /// `svc_signonnum 1`, then `svc_voiceinit` with an empty codec string and a
     /// zero quality byte (`sv_main.cpp:5817-5822`) -- three fixed bytes, so the
     /// reassembled spawn response ends on this exact sequence.
-    pub const SPAWN_TAIL: [u8; 5] = [crate::svc::SVC_SIGNONNUM, 1, crate::svc::SVC_VOICEINIT, 0, 0];
+    pub const SPAWN_TAIL: [u8; 5] = [
+        crate::svc::SVC_SIGNONNUM,
+        1,
+        crate::svc::SVC_VOICEINIT,
+        0,
+        0,
+    ];
 
     fn has_spawn_tail(msg: &[u8]) -> bool {
         let from = msg.len().saturating_sub(16);
@@ -492,7 +533,10 @@ impl Session {
                     let end = (cursor + info.size as usize).min(body.len());
                     let chunk = &body[cursor..end];
                     cursor = end;
-                    if std::env::var("AIPLAYERS_FRAGTRACE").is_ok() {
+                    if std::env::var_os("REB_FRAGTRACE").is_some()
+                        || std::env::var_os("REBOTS_FRAGTRACE").is_some()
+                        || std::env::var_os("AIPLAYERS_FRAGTRACE").is_some()
+                    {
                         eprintln!(
                             "    frag s{i} idx={}/{} size={} chunkbytes={} held={}",
                             info.index(),
@@ -723,12 +767,7 @@ impl Session {
     /// reached [`Phase::Running`].
     pub fn move_sender(&mut self) -> Option<&mut MoveSender> {
         if self.sender.is_none() {
-            let table = self
-                .signon
-                .as_ref()?
-                .registry
-                .get("usercmd_t")?
-                .clone();
+            let table = self.signon.as_ref()?.registry.get("usercmd_t")?.clone();
             // The MoveSender drives the same netchannel we have been using, so
             // hand it a clone seeded at the current sequence; callers that send
             // moves should go through it thereafter.
@@ -741,7 +780,10 @@ impl Session {
 impl Session {
     /// Convenience constructor for a default identity with a chosen name.
     pub fn named(name: &str) -> Self {
-        Self::new(Identity { name: name.to_string(), ..Identity::default() })
+        Self::new(Identity {
+            name: name.to_string(),
+            ..Identity::default()
+        })
     }
 
     /// The command sequence a real CS 1.6 client sends after the signon, in
@@ -866,7 +908,10 @@ impl Session {
             // the only place its demands are visible -- and a command we do not
             // recognise is silently dropped, which is indistinguishable from a
             // server that never asked for anything.
-            if std::env::var_os("AIPLAYERS_TRACE_STUFF").is_some() {
+            if std::env::var_os("REB_TRACE_STUFF").is_some()
+                || std::env::var_os("REBOTS_TRACE_STUFF").is_some()
+                || std::env::var_os("AIPLAYERS_TRACE_STUFF").is_some()
+            {
                 eprintln!("  <<stufftext>> {:?}", text.trim());
             }
             let head = text.split_whitespace().next().unwrap_or("");
@@ -977,8 +1022,13 @@ impl Session {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_graphic()) {
             return;
         }
-        self.user_msgs
-            .insert(payload[0], crate::stream::UserMsgDef { name, size: payload[1] });
+        self.user_msgs.insert(
+            payload[0],
+            crate::stream::UserMsgDef {
+                name,
+                size: payload[1],
+            },
+        );
     }
 
     /// Measure one bit-packed-but-byte-aligned message at `at`, returning the
@@ -1182,21 +1232,28 @@ impl Session {
         if !msg.consistency.should_send {
             return None;
         }
-        let demands =
-            proto::consistency::demands(&msg.resources, &msg.consistency, msg.spawncount);
+        // Always answer every listed index — skipping missing resources shortens
+        // the response vs `num_consistency` and yields "Bad file data". Prefer
+        // decoding bounds; fall back to exact-file hash (0 if content missing).
+        let demands = proto::consistency::demands(&msg.resources, &msg.consistency, msg.spawncount);
 
         let mut answers = Vec::with_capacity(demands.len());
         for d in &demands {
             let answer = match d {
-                proto::consistency::Demand::Bounds { mins, maxs, .. } => {
-                    proto::consistency::Answer::Bounds(*mins, *maxs)
+                proto::consistency::Demand::Bounds {
+                    mins, maxs, check, ..
+                } => {
+                    // force_model_specifybounds_if_avail accepts "unavailable"
+                    // as mins=maxs=(-1,-1,-1). Use that when we have no model.
+                    if *check == proto::consistency::ForceType::ModelSpecifyBoundsIfAvail {
+                        // Still echo server bounds when we can (always have them).
+                        proto::consistency::Answer::Bounds(*mins, *maxs)
+                    } else {
+                        proto::consistency::Answer::Bounds(*mins, *maxs)
+                    }
                 }
                 proto::consistency::Demand::ExactFile { path, .. } => {
-                    // Without the file we cannot answer. Send the demand with a
-                    // zero hash rather than dropping the entry: the count must
-                    // still match, and a wrong hash is a *specific* server-side
-                    // complaint ("Bad file <name>") we can act on, whereas a
-                    // short count is the generic "Bad file data".
+                    // First 4 bytes of MD5 as LE u32 (`SV_CheckConsistencyResponse`).
                     let hash = self
                         .content
                         .as_ref()
@@ -1207,6 +1264,12 @@ impl Session {
                 }
             };
             answers.push((d.index(), answer));
+        }
+        // If the resource list omitted an index (shouldn't), pad with empty
+        // hashes so the entry count still matches — length must stay valid.
+        while answers.len() < msg.consistency.indices.len() {
+            let idx = msg.consistency.indices[answers.len()];
+            answers.push((idx, proto::consistency::Answer::Hash(0)));
         }
         Some(proto::consistency::build_body(&answers))
     }
@@ -1356,12 +1419,31 @@ impl Session {
         // Measured, not reported: this server does not transmit our velocity,
         // and every weapon's accuracy is decided by it. Taken before the
         // borrow of `map`, because `measured_speed` needs `&mut self`.
-        let origin = d.clientdata.as_ref().map(|c| c.origin()).unwrap_or([0.0; 3]);
+        let origin = d
+            .clientdata
+            .as_ref()
+            .map(|c| c.origin())
+            .unwrap_or([0.0; 3]);
         let speed = self.measured_speed(origin, now);
 
         let d = self.decoder.as_ref()?;
-        let sight = self.map.as_ref().map(|m| &m.bsp as &dyn crate::view::Sight);
-        let world = crate::view::project(d, rescue, sight, latency, speed);
+        // LOS through world + brush entities (func_wall/crates). Raw BSP alone
+        // wallbangs through dust2 cover.
+        let world = if let Some(m) = self.map.as_ref() {
+            let sight = crate::view::BrushSight {
+                bsp: &m.bsp,
+                brushes: &m.info.solid_brushes,
+            };
+            crate::view::project(
+                d,
+                rescue,
+                Some(&sight as &dyn crate::view::Sight),
+                latency,
+                speed,
+            )
+        } else {
+            crate::view::project(d, rescue, None, latency, speed)
+        };
 
         // Turn the objective into the NEXT waypoint. Steering straight at a
         // distant goal walks into walls -- on de_dust2 the straight line from
@@ -1385,25 +1467,33 @@ impl Session {
         // a hostage spawn, for the entire walk back to the rescue zone.
         // Where the FEET are going. The brain's own target wins -- a hostage or
         // rescue zone, a dropped bomb to retrieve, a planted one to defuse --
-        // falling back to the map objective.
+        // falling back to the role-aware map objective. A C4 carrier always
+        // uses the plant-spot (inside a bomb zone), even if its role is Hold
+        // and `site` is an approach ring (plan A1 carrier override).
+        // Phase G2: CT rotate when ≥2 visible enemies pressure one site (or bomb planted).
+        self.maybe_ct_rotate(&world, dt);
+
+        let map_goal =
+            crate::role::active_goal(world.bomb.carried_by_me, self.site, self.plant_spot);
         let route_goal = self
             .brain
             .as_ref()
             .and_then(|b| b.nav_goal.or(b.objective.target))
-            .or(self.site);
+            .or(map_goal);
         let site = match (self.map.take(), route_goal) {
-            (Some(m), Some(goal)) if world.me.alive => {
+            // Only advance stuck/progress while the body can actually move.
+            // Freezetime used to run next_waypoint with a pinned origin, so
+            // unstick_for and origin-stuck climbed for the whole buy phase and
+            // the fleet jumped in unison the moment freeze ended.
+            (Some(m), Some(goal)) if world.me.alive && !world.me.freeze_period => {
                 let w = self
                     .follower
                     .next_waypoint(&m.grid, world.me.origin, goal, dt);
                 self.map = Some(m);
                 w
             }
-            // Dead: no body to move, so no route to follow. Calling
-            // next_waypoint on a dead bot measures "no progress toward the
-            // waypoint" forever and re-plans every STUCK_SECONDS -- a dead bot
-            // on bot5 hit 164 reroutes in one match, all of them meaning
-            // nothing. Hold the last target instead.
+            // Dead or freeze: no (allowed) movement, so no stuck clock.
+            // Hold the last target instead of manufacturing replan/jump.
             (Some(m), Some(goal)) => {
                 self.map = Some(m);
                 self.follower.hold();
@@ -1455,7 +1545,8 @@ impl Session {
             _ => (0.0, 1.0),
         };
         let nav = bot::controller::Nav {
-            goal: self.site,
+            // Arrival / plant distance uses the active goal (carrier → plant).
+            goal: map_goal,
             waypoint: site,
             look,
             // Plan W6: the follower advanced a node this tick, so the brain
@@ -1483,6 +1574,16 @@ impl Session {
         // It also swings the view up to 60 degrees off the target. Entirely
         // self-inflicted, and invisible until the bots started shooting at each
         // other.
+        // Graph hop kinds → buttons. Without this, Jump/Crouch edges are walked
+        // as flat run and the bot pins on A lips / boxes while looking at a wall.
+        if let Some(m) = self.map.as_ref() {
+            match self.follower.required_move(&m.grid) {
+                Some(nav::navgrid::Move::Jump) => intent.jump = true,
+                Some(nav::navgrid::Move::Crouch) => intent.duck = true,
+                _ => {}
+            }
+        }
+
         let fighting = self.brain.as_ref().is_some_and(|b| b.rung == "combat");
         if fighting {
             self.follower.hold();
@@ -1509,15 +1610,18 @@ impl Session {
                             // onto it.
                             let yaw = f64::from(intent.view.yaw).to_radians();
                             let (sy, cy) = yaw.sin_cos();
-                            let right_dot =
-                                dx * sy as f32 - dy * cy as f32;
+                            let right_dot = dx * sy as f32 - dy * cy as f32;
                             if right_dot * dir > 0.0 {
                                 side_blocked = true;
                             }
                         }
                     }
                 }
-                intent.sidemove = if side_blocked { -u.sidemove } else { u.sidemove };
+                intent.sidemove = if side_blocked {
+                    -u.sidemove
+                } else {
+                    u.sidemove
+                };
                 // Never BACK UP while stuck: a human stuck at a door strafes
                 // sideways, they do not reverse into their own spawn. The
                 // unstick's yaw_bias swings the view, and the brain's travel
@@ -1531,6 +1635,29 @@ impl Session {
                 intent.jump |= u.jump;
                 intent.view.yaw =
                     bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
+            }
+        } else if !struggling && !fighting {
+            // Phase B / B1: ORCA-lite sidestep + soft brake when a teammate is
+            // ahead (CONGA-1). Disabled when struggling.
+            let avoid = teammate_avoid_sidemove(
+                world.me.origin,
+                intent.view.yaw,
+                intent.forwardmove,
+                intent.sidemove,
+                &world.players,
+                world.me.team,
+            );
+            if avoid.abs() > 1.0 {
+                intent.sidemove = (intent.sidemove + avoid).clamp(-250.0, 250.0);
+            }
+            let scale = teammate_forward_scale(
+                world.me.origin,
+                intent.view.yaw,
+                &world.players,
+                world.me.team,
+            );
+            if scale < 0.99 {
+                intent.forwardmove *= scale;
             }
         }
         let to_goal = route_goal
@@ -1570,11 +1697,79 @@ impl Session {
                 .and_then(|b| b.escort.target)
                 .and_then(|e| world.hostages.iter().find(|h| h.entity == e))
                 .map(|h| {
-                    let (dx, dy) = (h.origin[0] - world.me.origin[0], h.origin[1] - world.me.origin[1]);
+                    let (dx, dy) = (
+                        h.origin[0] - world.me.origin[0],
+                        h.origin[1] - world.me.origin[1],
+                    );
                     (dx * dx + dy * dy).sqrt()
                 })
                 .unwrap_or(f32::NAN),
             use_edges: self.brain.as_ref().map_or(0, |b| b.escort.edges),
+            role: self.role.map_or("none", |r| r.as_str()),
+            rotate_events: self.rotate_events,
+            rotate_site: self.rotate_site,
+        });
+
+        let contact_site = self.map.as_ref().and_then(|map| {
+            let enemy = world.visible_enemies().next()?;
+            let mut nearest = None;
+            let mut distance = f32::MAX;
+            for (index, site) in map.info.bomb_sites.iter().enumerate() {
+                let centre = site.centre();
+                let dx = enemy.origin[0] - centre[0];
+                let dy = enemy.origin[1] - centre[1];
+                let d = dx * dx + dy * dy;
+                if d < distance {
+                    distance = d;
+                    nearest = Some(index);
+                }
+            }
+            nearest.map(|index| {
+                if map.info.bomb_sites[index].centre()[2] > 100.0 {
+                    bot::PlantSite::A
+                } else {
+                    bot::PlantSite::B
+                }
+            })
+        });
+        let assigned_site = self.assigned_site.and_then(|index| {
+            self.map.as_ref()?.info.bomb_sites.get(index).map(|site| {
+                if site.centre()[2] > 100.0 {
+                    bot::PlantSite::A
+                } else {
+                    bot::PlantSite::B
+                }
+            })
+        });
+        let role = match self.role {
+            Some(crate::role::BotRole::Assault) => 1,
+            Some(crate::role::BotRole::Hold) => 2,
+            Some(crate::role::BotRole::Flank) => 3,
+            Some(crate::role::BotRole::Split) => 4,
+            None => 0,
+        };
+        let rung = match self.brain.as_ref().map(|brain| brain.rung) {
+            Some("goto") => 1,
+            Some("combat") => 2,
+            Some("defuse") => 3,
+            Some("plant") => 4,
+            Some("camp") => 5,
+            _ => 0,
+        };
+        self.latest_team_report = Some(bot::TeamReport {
+            bot_id: self.team_bot_id,
+            team: world.me.team,
+            alive: world.me.alive,
+            origin: world.me.origin,
+            assigned_site,
+            contact_site,
+            contact_at: contact_site.map(|_| world.round_time),
+            bomb_carrier: world.bomb.carried_by_me,
+            bomb_planted: world.bomb.planted,
+            bomb_origin: world.bomb.origin,
+            observed_at: world.round_time,
+            role,
+            rung,
         });
 
         for cmd in &intent.commands {
@@ -1636,14 +1831,141 @@ impl Session {
         self.follower = crate::navigate::PathFollower::with_seed(seed);
     }
 
+    pub fn set_team_bot_id(&mut self, bot_id: u16) {
+        self.team_bot_id = bot_id;
+    }
+
     /// Re-pick where to go, e.g. after switching team or a new round.
+    ///
+    /// Uses the role-aware picker (plan Phase A1/A3): each bot draws a tactical
+    /// role from its seed, a site, and either a plant-volume point or an
+    /// approach ring so 15 teammates do not share one corridor endpoint.
     pub fn refresh_objective(&mut self, seed: usize) {
         let is_ct = self
             .decoder
             .as_ref()
             .is_some_and(|d| d.game.my_team() == crate::usermsg::Team::CounterTerrorist);
-        self.site = self.map.as_ref().and_then(|m| m.objective(is_ct, seed));
+        match self
+            .map
+            .as_ref()
+            .and_then(|m| crate::role::pick_objective(m, is_ct, seed))
+        {
+            Some(pick) => {
+                self.role = Some(pick.role);
+                self.site = Some(pick.destination);
+                self.plant_spot = Some(pick.plant_spot);
+                self.assigned_site = pick.site_index;
+            }
+            None => {
+                self.role = None;
+                self.site = None;
+                self.plant_spot = None;
+                self.assigned_site = None;
+            }
+        }
+        self.rotate_site = None;
+        self.rotate_events = 0;
+        self.team_snapshot = None;
+        self.rotate_cooldown = 0.0;
         self.follower.reset();
+    }
+
+    /// Feed same-team reports into the G0 tactical snapshot.
+    pub fn ingest_team_reports(&mut self, reports: &[bot::TeamReport]) {
+        let Some(map) = self.map.as_ref() else {
+            return;
+        };
+        let Some(team) = self.decoder.as_ref().map(|d| match d.game.my_team() {
+            crate::usermsg::Team::Terrorist => bot::Team::Terrorist,
+            crate::usermsg::Team::CounterTerrorist => bot::Team::CounterTerrorist,
+            crate::usermsg::Team::Spectator => bot::Team::Spectator,
+            crate::usermsg::Team::Unassigned => bot::Team::Unassigned,
+        }) else {
+            return;
+        };
+        if !matches!(team, bot::Team::Terrorist | bot::Team::CounterTerrorist) {
+            return;
+        }
+        let Some(a) = map.info.bomb_sites.iter().find(|site| site.centre()[2] > 100.0)
+        else {
+            return;
+        };
+        let Some(b) = map.info.bomb_sites.iter().find(|site| site.centre()[2] <= 100.0)
+        else {
+            return;
+        };
+        let sites = [a.centre(), b.centre()];
+        let snapshot = self
+            .team_snapshot
+            .get_or_insert_with(|| bot::TeamSnapshot::new(team));
+        for report in reports.iter().copied().filter(|report| report.team == team) {
+            snapshot.apply(report, &sites);
+        }
+    }
+
+    /// The current same-team tactical snapshot, if a map/team is known.
+    pub fn team_snapshot(&self) -> Option<&bot::TeamSnapshot> {
+        self.team_snapshot.as_ref()
+    }
+
+    /// Phase G2 — repath CTs toward a threatened site, merging local PVS
+    /// enemies with the G0 same-team snapshot (pressure / plant belief).
+    fn maybe_ct_rotate(&mut self, world: &bot::world::WorldView, dt: f32) {
+        self.rotate_cooldown = (self.rotate_cooldown - dt).max(0.0);
+        if self.rotate_cooldown > 0.0 {
+            return;
+        }
+        if world.me.team != bot::world::Team::CounterTerrorist || !world.me.alive {
+            return;
+        }
+        // Freeze / buy: stay on G1 holds.
+        if world.me.freeze_period {
+            return;
+        }
+        let seed = self.follower.seed as usize;
+        let enemies: Vec<[f32; 3]> = world.visible_enemies().map(|p| p.origin).collect();
+        let Some(map) = self.map.as_ref() else {
+            return;
+        };
+        // G0 team-bus belief: a teammate's pressure report or plant sighting
+        // rotates this bot even when the enemy is outside its own PVS.
+        let team = match self.team_snapshot.as_ref() {
+            Some(snapshot) => crate::role::TeamTactics {
+                pressure_site: crate::role::plant_site_index(map, snapshot.pressure),
+                plant_site: crate::role::plant_site_index(map, snapshot.plant_site),
+            },
+            None => crate::role::TeamTactics::EMPTY,
+        };
+        let Some(pick) = crate::role::ct_rotate_pick(
+            map,
+            seed,
+            &enemies,
+            world.bomb.planted,
+            world.bomb.origin,
+            team,
+        ) else {
+            return;
+        };
+        if !self.apply_ct_rotation(pick) {
+            return;
+        }
+        self.rotate_cooldown = 4.0;
+        self.follower.reset();
+    }
+
+    /// Apply a new G2 target once, keeping repeated PVS observations from
+    /// inflating the live rotation count or resetting the route.
+    fn apply_ct_rotation(&mut self, pick: crate::role::ObjectivePick) -> bool {
+        if self.rotate_site == pick.site_index && self.site == Some(pick.destination) {
+            return false;
+        }
+        self.role = Some(pick.role);
+        self.site = Some(pick.destination);
+        self.plant_spot = Some(pick.plant_spot);
+        self.assigned_site = pick.site_index;
+        self.rotate_site = pick.site_index;
+        self.rotate_events = self.rotate_events.saturating_add(1);
+        true
     }
 
     /// Deploy a weapon after spawning.
@@ -1980,11 +2302,7 @@ impl Session {
     /// any in-flight reliable message plus `unreliable`.
     ///
     /// Returns the assembled `svc_*` message streams that arrived.
-    pub fn pump<T: Transport>(
-        &mut self,
-        t: &mut T,
-        unreliable: &[u8],
-    ) -> io::Result<Vec<Vec<u8>>> {
+    pub fn pump<T: Transport>(&mut self, t: &mut T, unreliable: &[u8]) -> io::Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         // Drain the ENTIRE backlog before acknowledging, so the sequence we
         // echo is the newest one we have seen.
@@ -2267,6 +2585,95 @@ impl Session {
     }
 }
 
+/// Phase B ORCA-lite: sidemove push away from nearby same-team players.
+///
+/// Full ORCA solves a linear program over velocity obstacles; we only need the
+/// "don't walk into your teammate's back" half for the dust2 approach stream.
+/// For each living same-team player inside `AVOID_RADIUS`, contribute half the
+/// separation responsibility as a view-relative sidemove (right = +).
+///
+/// Returns an additive sidemove in [-180, 180]. Callers clamp the total.
+fn teammate_avoid_sidemove(
+    me: [f32; 3],
+    view_yaw: f32,
+    fwd: f32,
+    side: f32,
+    players: &[bot::PlayerView],
+    my_team: bot::Team,
+) -> f32 {
+    // B1 CONGA push: wider bubble + stronger push (was 120 / 48 / 1.6).
+    const AVOID_RADIUS: f32 = 160.0;
+    const PERSONAL: f32 = 56.0; // approximate combined body radius
+                                // Not moving: nothing to avoid into.
+    if fwd.abs() < 1.0 && side.abs() < 1.0 {
+        return 0.0;
+    }
+    let yaw = f64::from(view_yaw).to_radians();
+    let (sy, cy) = yaw.sin_cos();
+    // View right: (sin yaw, -cos yaw) in GoldSrc xy.
+    let (rx, ry) = (sy as f32, -cy as f32);
+    // View forward for "teammate ahead" soft brake (applied by caller via
+    // magnitude of push when we return; we pack brake into |push| excess —
+    // no: return only sidemove; brake handled separately).
+    let mut push = 0.0f32;
+    for p in players {
+        if p.team != my_team || !p.alive {
+            continue;
+        }
+        let dx = p.origin[0] - me[0];
+        let dy = p.origin[1] - me[1];
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < 1.0 || d > AVOID_RADIUS {
+            continue;
+        }
+        // Penetration depth of personal spaces.
+        let pen = (PERSONAL - d).max(0.0) + (AVOID_RADIUS - d) * 0.22;
+        if pen <= 0.0 {
+            continue;
+        }
+        // Sign: if teammate is on our right, push left (negative sidemove).
+        let right_dot = dx * rx + dy * ry;
+        let dir = if right_dot >= 0.0 { -1.0 } else { 1.0 };
+        // Stronger than pure half-ORCA — live CONGA-1 still ~55–60%.
+        push += dir * pen * 2.4;
+    }
+    let _ = sy;
+    let _ = cy;
+    push.clamp(-220.0, 220.0)
+}
+
+/// Scale forwardmove when a teammate is directly ahead (CONGA brake).
+fn teammate_forward_scale(
+    me: [f32; 3],
+    view_yaw: f32,
+    players: &[bot::PlayerView],
+    my_team: bot::Team,
+) -> f32 {
+    const AHEAD_R: f32 = 140.0;
+    let yaw = f64::from(view_yaw).to_radians();
+    let (sy, cy) = yaw.sin_cos();
+    let (fx, fy) = (cy as f32, sy as f32); // GoldSrc forward
+    let mut scale = 1.0f32;
+    for p in players {
+        if p.team != my_team || !p.alive {
+            continue;
+        }
+        let dx = p.origin[0] - me[0];
+        let dy = p.origin[1] - me[1];
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < 1.0 || d > AHEAD_R {
+            continue;
+        }
+        let ahead = (dx * fx + dy * fy) / d;
+        if ahead > 0.55 {
+            // Closer + more centered ahead → slower.
+            let t = (1.0 - d / AHEAD_R) * ahead;
+            scale = scale.min(1.0 - 0.55 * t);
+        }
+    }
+    scale.clamp(0.35, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2276,7 +2683,10 @@ mod tests {
     /// for. Silence works on our test server and fails on real ones.
     #[test]
     fn a_cvar_query_is_answered_on_the_reliable_channel() {
-        let mut s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+        let mut s = Session::new(Identity {
+            name: "Bot7".into(),
+            ..Default::default()
+        });
         let mut msg = vec![crate::svc::SVC_SENDCVARVALUE];
         msg.extend_from_slice(b"cl_lw ");
         s.answer_cvar_queries(&msg);
@@ -2294,12 +2704,19 @@ mod tests {
     /// at the head of a queue that would never drain again.
     #[test]
     fn a_payload_byte_is_not_mistaken_for_a_cvar_query() {
-        let mut s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+        let mut s = Session::new(Identity {
+            name: "Bot7".into(),
+            ..Default::default()
+        });
 
         // svc_print, whose text happens to contain both opcode values.
         let mut msg = vec![crate::svc::SVC_PRINT];
         msg.extend_from_slice(&[
-            b'x', crate::svc::SVC_SENDCVARVALUE, crate::svc::SVC_SENDCVARVALUE2, b'y', 0,
+            b'x',
+            crate::svc::SVC_SENDCVARVALUE,
+            crate::svc::SVC_SENDCVARVALUE2,
+            b'y',
+            0,
         ]);
 
         let trace = s.trace_message(&msg);
@@ -2320,7 +2737,10 @@ mod tests {
     /// reply repeats the cvar name (SV_ParseCvarValue2, sv_user.cpp:1804-1815).
     #[test]
     fn a_v2_cvar_query_echoes_the_request_id_and_the_name() {
-        let mut s = Session::new(Identity { name: "Bot7".into(), ..Default::default() });
+        let mut s = Session::new(Identity {
+            name: "Bot7".into(),
+            ..Default::default()
+        });
         let mut msg = vec![crate::svc::SVC_SENDCVARVALUE2];
         msg.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         msg.extend_from_slice(b"name ");
@@ -2353,7 +2773,10 @@ mod tests {
     /// nothing else can change a userinfo key after the handshake.
     #[test]
     fn reassert_name_queues_a_setinfo_stringcmd_for_our_own_name() {
-        let mut s = Session::new(Identity { name: "Bot03".into(), ..Default::default() });
+        let mut s = Session::new(Identity {
+            name: "Bot03".into(),
+            ..Default::default()
+        });
         assert_eq!(s.chan.queued_count(), 0);
         s.reassert_name();
         assert_eq!(s.chan.queued_count(), 1);
@@ -2392,7 +2815,10 @@ mod tests {
         let mut t = Sink { sent: Vec::new() };
         s.disconnect(&mut t, Duration::from_millis(150)).unwrap();
 
-        assert!(!t.sent.is_empty(), "disconnect must put a packet on the wire");
+        assert!(
+            !t.sent.is_empty(),
+            "disconnect must put a packet on the wire"
+        );
 
         // Peel the netchannel off every packet and look for the actual bytes.
         //
@@ -2434,6 +2860,21 @@ mod tests {
         let s = Session::named("Tester");
         assert_eq!(s.phase, Phase::Handshake);
         assert!(s.signon.is_none());
+    }
+
+    #[test]
+    fn repeated_g2_target_does_not_count_or_repath_again() {
+        let mut s = Session::named("Tester");
+        let pick = crate::role::ObjectivePick {
+            role: crate::role::BotRole::Split,
+            destination: [100.0, 200.0, 0.0],
+            plant_spot: [120.0, 220.0, 0.0],
+            site_index: Some(1),
+        };
+        assert!(s.apply_ct_rotation(pick));
+        assert_eq!(s.rotate_events, 1);
+        assert!(!s.apply_ct_rotation(pick));
+        assert_eq!(s.rotate_events, 1);
     }
 
     #[test]
@@ -2553,7 +2994,11 @@ mod stufftext_is_parsed_not_scanned {
         // the real one.
         let mut s = Session::named("Probe");
         let trace = s.trace_message(&msg);
-        assert_eq!(trace.stopped_on, None, "halted at byte {}", trace.stopped_at);
+        assert_eq!(
+            trace.stopped_on, None,
+            "halted at byte {}",
+            trace.stopped_at
+        );
         assert_eq!(trace.stopped_at, msg.len());
         assert_eq!(trace.stufftexts(), vec!["allow_shaders 0\n".to_string()]);
 
@@ -2592,12 +3037,23 @@ mod stufftext_is_parsed_not_scanned {
 
         let mut s = Session::named("Probe");
         let trace = s.trace_message(&msg);
-        assert_eq!(trace.stopped_on, None, "halted at byte {}", trace.stopped_at);
+        assert_eq!(
+            trace.stopped_on, None,
+            "halted at byte {}",
+            trace.stopped_at
+        );
         assert_eq!(trace.stufftexts(), vec!["allow_autoaim 0\n".to_string()]);
         // The registration was learned from a walked message, not a scan.
         assert_eq!(s.user_msgs[&76].name, "SayText");
         assert!(s.user_msgs[&76].is_variable());
-        assert_eq!(trace.items.iter().filter(|i| matches!(i, Item::User { .. })).count(), 1);
+        assert_eq!(
+            trace
+                .items
+                .iter()
+                .filter(|i| matches!(i, Item::User { .. }))
+                .count(),
+            1
+        );
         assert_eq!(s.echo_stufftexts(&msg), vec!["allow_autoaim 0".to_string()]);
     }
 
@@ -2660,7 +3116,9 @@ mod stufftext_is_parsed_not_scanned {
             trace
                 .items
                 .iter()
-                .filter(|i| matches!(i, Item::Engine { id, .. } if *id == svc::SVC_DELTADESCRIPTION))
+                .filter(
+                    |i| matches!(i, Item::Engine { id, .. } if *id == svc::SVC_DELTADESCRIPTION)
+                )
                 .count(),
             7
         );

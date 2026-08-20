@@ -24,13 +24,26 @@ fn round_trip(request: &[u8]) -> Option<Vec<u8>> {
     sock.connect(SERVER).ok()?;
     sock.send(request).ok()?;
     let mut buf = vec![0u8; 4096];
-    let n = sock.recv(&mut buf).ok()?;
-    buf.truncate(n);
-    Some(buf)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        if let Ok(n) = sock.recv(&mut buf) {
+            let mut res = buf.clone();
+            res.truncate(n);
+            if let Some(payload) = cl::payload(&res) {
+                if !payload.is_empty() && payload[0] == cl::S2C_CHALLENGE {
+                    return Some(res);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn skip_or_panic(what: &str) {
-    if std::env::var("AIPLAYERS_REQUIRE_SERVER").is_ok() {
+    if std::env::var("REB_REQUIRE_SERVER").is_ok()
+        || std::env::var("REBOTS_REQUIRE_SERVER").is_ok()
+        || std::env::var("AIPLAYERS_REQUIRE_SERVER").is_ok()
+    {
         panic!("no HLDS server on {SERVER}: {what}");
     }
     eprintln!("SKIP: no HLDS server on {SERVER} ({what}) -- `cd testserver && docker compose up -d`");

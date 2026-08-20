@@ -72,8 +72,8 @@ captures/swarm/BotNN.bin.sent` for the view dynamics.
 
 ## Natural walking model (2026-08-10, after `natural-walking-model.md`)
 
-Added a natural-walker layer on top of the planner (YaPB-style strafe/weave,
-podbot-style micro-pause and turn overshoot), and measured it live. The first
+Added a natural-walker layer on top of the planner (humanized strafe/weave,
+micro-pause and turn overshoot), and measured it live. The first
 attempts made things WORSE -- the weave pushed bots into walls (STILL-1 went
 7.9% -> 57%, CONGA-1 -> 91%), and unreachable camp/roam spots made bots grind
 for minutes. Each was found by reading the server-measured `vel` against the

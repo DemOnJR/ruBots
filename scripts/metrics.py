@@ -51,9 +51,13 @@ BRAIN_RE = re.compile(
     r"brain: alive (\S+) frozen (\S+) fwd (-?\d+) side (-?\d+) yaw (-?\d+)"
     r" site (Some\(\[[^\]]*\]\)|None) wp (\d+) node (-?\d+) reroutes (\d+) stuck (\S+)"
 )
+# Optional `role <name>` inserted after the rung (Phase A1); tolerate trailing
+# plant diagnostics after to_goal.
 OBJ_RE = re.compile(
-    r"obj: rung (\S+)\s+bomb (\S+)\s+arming (\S+)\s+attack (\S+)\s+use (\S+)\s+to_goal (-?\d+)"
+    r"obj: rung (\S+)\s+(?:role \S+\s+)?bomb (\S+)\s+arming (\S+)\s+"
+    r"attack (\S+)\s+use (\S+)\s+to_goal (-?\d+(?:\.\d+)?)"
 )
+ROTATE_RE = re.compile(r"\| rotate (\d+) site (?:Some\((\d+)\)|None)")
 OBJECTIVE_RE = re.compile(r"objective: \[\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\]")
 
 
@@ -80,6 +84,7 @@ def parse_log(path, samples, objectives):
             # lines, so stash it and attach them when they come.
             cur = {
                 "team": team,
+                "bot": path.stem,
                 "t": int(m.group(1)),
                 "origin": (int(m.group(2)), int(m.group(3)), int(m.group(4))),
                 "vel": int(m.group(5)),
@@ -92,6 +97,8 @@ def parse_log(path, samples, objectives):
                 "reroutes": None,
                 "rung": None,
                 "to_goal": None,
+                "rotate_events": None,
+                "rotate_site": None,
                 "objective": None,
             }
             continue
@@ -111,6 +118,10 @@ def parse_log(path, samples, objectives):
         if o:
             cur["rung"] = o.group(1)
             cur["to_goal"] = float(o.group(6))
+            r = ROTATE_RE.search(line)
+            if r:
+                cur["rotate_events"] = int(r.group(1))
+                cur["rotate_site"] = int(r.group(2)) if r.group(2) is not None else None
             if cur["alive"] is not None:
                 samples.append(cur)
             cur = None
@@ -297,8 +308,30 @@ def main():
         prev = s
     view2 = view2 / max(1, total_pairs)
 
+    # --- G2 rotation diagnostics ---------------------------------------------
+    # The counter is cumulative per bot/round; count only positive edges so
+    # repeated 2-second samples do not inflate the event total.
+    rotation_events = 0
+    rotation_bots = set()
+    by_bot = defaultdict(list)
+    for s in samples:
+        if s["rotate_events"] is not None:
+            by_bot[s["bot"]].append(s)
+    for bot, bot_samples in by_bot.items():
+        previous = 0
+        for s in sorted(bot_samples, key=lambda sample: sample["t"]):
+            current = s["rotate_events"]
+            if current < previous:
+                previous = current
+                continue
+            if current > previous:
+                rotation_events += current - previous
+                rotation_bots.add(bot)
+            previous = current
+
     # --- output --------------------------------------------------------------
     print(f"logs {len(logs)}  live {n}")
+    print(f"G2-ROTATE\t{rotation_events}\t{len(rotation_bots)}")
     print(f"PILE-1\t{pile1:.3f}")
     print(f"PILE-2\t{pile2[0]:.1f}\t{pile2[1]}")
     print(f"PILE-3\t{pile3:.3f}")

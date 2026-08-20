@@ -1,10 +1,7 @@
-//! Navigation: waypoint graph, pathfinding, and (later) BSP line-of-sight.
+//! Navigation: waypoint graph, pathfinding, and BSP line-of-sight.
 //!
-//! Port of `internal/nav/`. The graph format is YaPB's `.graph`, identified
-//! from three constants in `LoadGraph` — see [`graph`].
-//!
-//! Still to port: `ulzUncompress` (the graph payload is ULZ-compressed) and
-//! `bsp.rs` (`Visible`, `TraceFraction`, `GroundHeight`).
+//! Handles waypoint graphs (`.graph`), collision hull navigation grids,
+//! A* route generation, and line-of-sight raytracing.
 
 pub mod bsp;
 pub mod entities;

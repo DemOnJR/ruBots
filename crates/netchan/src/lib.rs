@@ -138,6 +138,36 @@ pub fn classify(data: &[u8]) -> Datagram<'_> {
     }
 }
 
+/// Compress a fragment-stream payload the way the engine does for large
+/// client→server uploads: optional `BZ2\0` + bzip2 body.
+///
+/// If compression does not shrink the message, the original bytes are kept
+/// (same fallback as ReHLDS when `BZ2_bzBuffToBuffCompress` fails).
+pub fn compress_fragment_payload(payload: &[u8]) -> Vec<u8> {
+    // Tiny messages are not worth compressing; engine still accepts raw.
+    if payload.len() < 64 {
+        return payload.to_vec();
+    }
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression;
+    use std::io::Write;
+    let mut enc = BzEncoder::new(Vec::new(), Compression::best());
+    if enc.write_all(payload).is_err() {
+        return payload.to_vec();
+    }
+    let Ok(compressed) = enc.finish() else {
+        return payload.to_vec();
+    };
+    // Need room for the 4-byte magic; only use if smaller overall.
+    if compressed.len() + 4 >= payload.len() {
+        return payload.to_vec();
+    }
+    let mut out = Vec::with_capacity(4 + compressed.len());
+    out.extend_from_slice(&BZ2_MAGIC);
+    out.extend_from_slice(&compressed);
+    out
+}
+
 /// Decompress a payload if it carries the `BZ2\0` magic; otherwise return it
 /// unchanged.
 pub fn maybe_decompress(data: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -341,7 +371,10 @@ pub const FRAGMENT_PAYLOAD: usize = 128;
 
 impl NetChannel {
     pub fn new() -> Self {
-        Self { outgoing_sequence: 1, ..Default::default() }
+        Self {
+            outgoing_sequence: 1,
+            ..Default::default()
+        }
     }
 
     /// Hand a reliable payload to the channel.
@@ -363,7 +396,13 @@ impl NetChannel {
     /// Some client→server messages are not accepted as plain reliable
     /// messages: a real client sends `clc_resourcelist` and
     /// `clc_fileconsistency` as fragments, and the server ignores them
-    /// otherwise. (Manutza\*'s "# detect 7 … sent using fragment method".)
+    /// otherwise.
+    ///
+    /// Large payloads are **BZ2-compressed** first (`BZ2\0` + bzip2 stream),
+    /// matching ReHLDS `Netchan_CreateFragments_`. Without that, remote
+    /// servers have been observed to drop the client on
+    /// `clc_fileconsistency` with `Invalid length` / `badread` when the
+    /// reassembled stream is large and uncompressed.
     ///
     /// The payload is split into [`FRAGMENT_PAYLOAD`]-byte pieces and one goes
     /// out per acknowledged round trip, exactly as observed on the wire.
@@ -372,8 +411,13 @@ impl NetChannel {
         if payload.is_empty() {
             return;
         }
-        let total = payload.len().div_ceil(FRAGMENT_PAYLOAD) as u16;
-        self.frag_out = Some(FragOut { data: payload.to_vec(), next: 1, total });
+        let data = compress_fragment_payload(payload);
+        let total = data.len().div_ceil(FRAGMENT_PAYLOAD) as u16;
+        self.frag_out = Some(FragOut {
+            data,
+            next: 1,
+            total,
+        });
     }
 
     /// Abandon everything in flight, exactly as ReHLDS `Netchan_Clear` does
@@ -481,16 +525,25 @@ impl NetChannel {
         // each of the two streams a presence byte, and for a present stream a
         // `(index << 16) | total` id, a `u16` offset (always 0) and a `u16`
         // length. Only stream 0 is ever used by the client.
+        //
+        // **Critical:** the reliable payload must ONLY appear when
+        // `send_reliable` is true (ReHLDS `Netchan_Transmit`). Putting
+        // `reliable_buf` into idle packets without the reliable/fragment flags
+        // made the server parse a bare `clc_fileconsistency` header whose
+        // declared length far exceeded the short idle body → drop with
+        // `Invalid length` / `badread on opcode clc_fileconsistency`.
         let mut payload = Vec::new();
-        if let Some((index, total)) = frag {
-            let id = (u32::from(index) << 16) | u32::from(total);
-            payload.push(1u8);
-            payload.extend_from_slice(&id.to_le_bytes());
-            payload.extend_from_slice(&0u16.to_le_bytes());
-            payload.extend_from_slice(&(self.reliable_buf.len() as u16).to_le_bytes());
-            payload.push(0u8); // stream 1 absent
+        if send_reliable {
+            if let Some((index, total)) = frag {
+                let id = (u32::from(index) << 16) | u32::from(total);
+                payload.push(1u8);
+                payload.extend_from_slice(&id.to_le_bytes());
+                payload.extend_from_slice(&0u16.to_le_bytes());
+                payload.extend_from_slice(&(self.reliable_buf.len() as u16).to_le_bytes());
+                payload.push(0u8); // stream 1 absent
+            }
+            payload.extend_from_slice(&self.reliable_buf);
         }
-        payload.extend_from_slice(&self.reliable_buf);
         payload.extend_from_slice(unreliable);
 
         let seq = self.outgoing_sequence;
@@ -656,10 +709,13 @@ impl SplitReassembler {
         if header.count == 0 || header.index >= header.count {
             return None;
         }
-        let entry = self.pending.entry(header.sequence).or_insert_with(|| Pending {
-            count: header.count,
-            parts: HashMap::new(),
-        });
+        let entry = self
+            .pending
+            .entry(header.sequence)
+            .or_insert_with(|| Pending {
+                count: header.count,
+                parts: HashMap::new(),
+            });
 
         // A changed fragment count means a new message reused the sequence.
         if entry.count != header.count {
@@ -793,8 +849,28 @@ mod tests {
     #[test]
     fn out_of_range_fragment_index_is_ignored() {
         let mut r = SplitReassembler::new();
-        assert_eq!(r.feed(SplitHeader { sequence: 1, index: 5, count: 3 }, b"x"), None);
-        assert_eq!(r.feed(SplitHeader { sequence: 1, index: 0, count: 0 }, b"x"), None);
+        assert_eq!(
+            r.feed(
+                SplitHeader {
+                    sequence: 1,
+                    index: 5,
+                    count: 3
+                },
+                b"x"
+            ),
+            None
+        );
+        assert_eq!(
+            r.feed(
+                SplitHeader {
+                    sequence: 1,
+                    index: 0,
+                    count: 0
+                },
+                b"x"
+            ),
+            None
+        );
         assert_eq!(r.pending_count(), 0);
     }
 
@@ -814,7 +890,10 @@ mod tests {
     #[test]
     fn the_live_fragment_header_parses_exactly() {
         let f = Fragments::parse(&LIVE_SIGNON_BODY).expect("parses");
-        assert_eq!(f.len, 10, "header should be 10 bytes for one present stream");
+        assert_eq!(
+            f.len, 10,
+            "header should be 10 bytes for one present stream"
+        );
         let s0 = f.streams[0].expect("stream 0 present");
         assert_eq!(s0.id, 0x0001_0005);
         assert_eq!(s0.offset, 0);
@@ -835,9 +914,19 @@ mod tests {
     #[test]
     fn the_fragment_id_packs_index_and_total() {
         // The five ids observed on a live signon.
-        let ids = [0x0001_0005u32, 0x0002_0005, 0x0003_0005, 0x0004_0005, 0x0005_0005];
+        let ids = [
+            0x0001_0005u32,
+            0x0002_0005,
+            0x0003_0005,
+            0x0004_0005,
+            0x0005_0005,
+        ];
         for (n, id) in ids.iter().enumerate() {
-            let f = FragmentInfo { id: *id, offset: 0, size: 0 };
+            let f = FragmentInfo {
+                id: *id,
+                offset: 0,
+                size: 0,
+            };
             assert_eq!(f.index(), n as u16 + 1, "index is one-based");
             assert_eq!(f.total(), 5);
         }
@@ -847,7 +936,11 @@ mod tests {
     fn fragments_reassemble_by_index_not_offset() {
         // Every real fragment reported offset 0; only the index orders them.
         let mut buf = FragmentBuffer::new();
-        let mk = |i: u16| FragmentInfo { id: (u32::from(i) << 16) | 3, offset: 0, size: 0 };
+        let mk = |i: u16| FragmentInfo {
+            id: (u32::from(i) << 16) | 3,
+            offset: 0,
+            size: 0,
+        };
 
         assert_eq!(buf.push(mk(2), b"BBB"), None);
         assert_eq!(buf.push(mk(3), b"CCC"), None);
@@ -861,19 +954,63 @@ mod tests {
     fn out_of_range_fragment_indices_are_ignored() {
         let mut buf = FragmentBuffer::new();
         // index 0 is invalid (ids are one-based), as is index > total.
-        assert_eq!(buf.push(FragmentInfo { id: 0x0000_0003, offset: 0, size: 0 }, b"x"), None);
-        assert_eq!(buf.push(FragmentInfo { id: 0x0009_0003, offset: 0, size: 0 }, b"x"), None);
-        assert_eq!(buf.push(FragmentInfo { id: 0x0001_0000, offset: 0, size: 0 }, b"x"), None);
+        assert_eq!(
+            buf.push(
+                FragmentInfo {
+                    id: 0x0000_0003,
+                    offset: 0,
+                    size: 0
+                },
+                b"x"
+            ),
+            None
+        );
+        assert_eq!(
+            buf.push(
+                FragmentInfo {
+                    id: 0x0009_0003,
+                    offset: 0,
+                    size: 0
+                },
+                b"x"
+            ),
+            None
+        );
+        assert_eq!(
+            buf.push(
+                FragmentInfo {
+                    id: 0x0001_0000,
+                    offset: 0,
+                    size: 0
+                },
+                b"x"
+            ),
+            None
+        );
         assert_eq!(buf.received(), 0);
     }
 
     #[test]
     fn a_new_message_resets_a_partial_one() {
         let mut buf = FragmentBuffer::new();
-        buf.push(FragmentInfo { id: 0x0001_0004, offset: 0, size: 0 }, b"old");
+        buf.push(
+            FragmentInfo {
+                id: 0x0001_0004,
+                offset: 0,
+                size: 0,
+            },
+            b"old",
+        );
         assert_eq!(buf.received(), 1);
         // Different total -> different message.
-        let done = buf.push(FragmentInfo { id: 0x0001_0001, offset: 0, size: 0 }, b"new");
+        let done = buf.push(
+            FragmentInfo {
+                id: 0x0001_0001,
+                offset: 0,
+                size: 0,
+            },
+            b"new",
+        );
         assert_eq!(done.as_deref(), Some(&b"new"[..]));
     }
 
@@ -1039,13 +1176,21 @@ mod tests {
     fn a_fragmented_upload_matches_the_observed_wire_format() {
         // 12 fragments: eleven of 128 bytes then a 4-byte remainder, exactly
         // the shape of the real client's clc_fileconsistency upload.
-        let data: Vec<u8> = (0..1412u32).map(|i| (i % 251) as u8).collect();
+        // Use high-entropy bytes so optional BZ2 compression does not shrink
+        // the payload (munged consistency bodies look the same on the wire).
+        let data: Vec<u8> = (0..1412u32)
+            .map(|i| {
+                let x = i.wrapping_mul(0x9E37_79B9).wrapping_add(0xA5A5_A5A5);
+                (x ^ (x >> 13) ^ (x << 7)) as u8
+            })
+            .collect();
         let mut ch = NetChannel::new();
         ch.queue_fragmented(&data);
         assert!(ch.fragment_upload_active());
 
         let mut got = Vec::new();
-        for expect_index in 1..=12u16 {
+        let total = ch.fragment_progress().unwrap().1;
+        for expect_index in 1..=total {
             let pkt = ch.transmit(&[]);
             let (header, frags, payload) = decode_ours(&pkt);
 
@@ -1056,41 +1201,95 @@ mod tests {
             let info = frags.streams[0].expect("stream 0 present");
             assert!(frags.streams[1].is_none(), "stream 1 unused by the client");
             assert_eq!(info.index(), expect_index);
-            assert_eq!(info.total(), 12);
+            assert_eq!(info.total(), total);
             assert_eq!(info.offset, 0, "offset is always zero");
 
-            let expected_len = if expect_index == 12 { 4 } else { 128 };
-            assert_eq!(usize::from(info.size), expected_len);
+            let expected_len = usize::from(info.size);
+            assert!(expected_len > 0 && expected_len <= FRAGMENT_PAYLOAD);
+            if expect_index < total {
+                assert_eq!(expected_len, FRAGMENT_PAYLOAD);
+            }
             got.extend_from_slice(&payload[..expected_len]);
 
             // Acknowledge so the next fragment is promoted.
             let ack = peer_packet(u32::from(expect_index), 1, ch.outgoing_reliable != 0, &[1]);
             ch.read(&ack).expect("ack decodes");
         }
+        let got = maybe_decompress(got).expect("decompress");
         assert_eq!(got, data, "the upload reassembles to the original payload");
         assert!(!ch.fragment_upload_active(), "upload is finished");
     }
 
     #[test]
     fn a_fragment_waits_for_its_acknowledgement_before_the_next_one() {
-        let data = vec![0xABu8; 300];
+        // High entropy so BZ2 does not collapse this into a single fragment.
+        let data: Vec<u8> = (0..300u32)
+            .map(|i| (i.wrapping_mul(0x45D9_F3B) ^ 0xDEAD_BEEF) as u8)
+            .collect();
         let mut ch = NetChannel::new();
         ch.queue_fragmented(&data);
+        let total = ch.fragment_progress().unwrap().1;
+        assert!(
+            total >= 2,
+            "need multi-fragment upload for this test, got {total}"
+        );
 
         // Fragment 1 goes out once.
         let pkt = ch.transmit(&[]);
         let (_, frags, _) = decode_ours(&pkt);
         let info = frags.unwrap().streams[0].unwrap();
-        assert_eq!((info.index(), info.total()), (1, 3));
+        assert_eq!((info.index(), info.total()), (1, total));
 
         // Without an acknowledgement the channel does not advance, and does
-        // not blindly repeat either.
+        // not blindly repeat either. Idle packets must also NOT leak the
+        // in-flight reliable bytes as a bare clc stream.
         for _ in 0..3 {
             let pkt = ch.transmit(&[clc::NOP]);
             let seq = u32::from_le_bytes(pkt[0..4].try_into().unwrap());
             assert!(seq & FRAGMENT_FLAG == 0, "no blind fragment repeat");
+            assert!(seq & RELIABLE_FLAG == 0, "no reliable flag while waiting");
+            let (_, body) = {
+                let mut rx = NetChannel::new();
+                rx.incoming_sequence = 0;
+                rx.read(&pkt).expect("decodes")
+            };
+            // Idle body is just the nop we asked for (plus dword padding nops).
+            assert!(
+                body.iter().all(|&b| b == clc::NOP),
+                "in-flight reliable must not ride on idle packets (got {body:02x?})"
+            );
         }
-        assert_eq!(ch.fragment_progress(), Some((2, 3)), "still on fragment 2");
+        assert_eq!(
+            ch.fragment_progress(),
+            Some((2, total)),
+            "still on fragment 2"
+        );
+    }
+
+    #[test]
+    fn idle_packets_do_not_leak_in_flight_reliable_payload() {
+        // Regression: a pending clc_fileconsistency fragment was re-emitted
+        // on every idle pump without the fragment header, so the server saw
+        // opcode 7 with a length field that ran past the short packet.
+        let mut ch = NetChannel::new();
+        let payload = {
+            let mut m = vec![clc::FILECONSISTENCY];
+            m.extend_from_slice(&1491u16.to_le_bytes());
+            m.extend(std::iter::repeat(0xAAu8).take(1491));
+            m
+        };
+        ch.queue_fragmented(&payload);
+        let _ = ch.transmit(&[]); // promote fragment 1
+
+        let pkt = ch.transmit(&[clc::NOP]);
+        let seq = u32::from_le_bytes(pkt[0..4].try_into().unwrap());
+        assert_eq!(seq & RELIABLE_FLAG, 0);
+        assert_eq!(seq & FRAGMENT_FLAG, 0);
+        let mut rx = NetChannel::new();
+        rx.incoming_sequence = 0;
+        let (_, body) = rx.read(&pkt).expect("decodes");
+        assert_ne!(body.first().copied(), Some(clc::FILECONSISTENCY));
+        assert!(body.iter().all(|&b| b == clc::NOP), "got {body:02x?}");
     }
 
     #[test]
@@ -1191,7 +1390,10 @@ mod tests {
         // The peer echoes our reliable bit: the message got through.
         let ack = peer_packet(1, 1, in_flight_bit != 0, &[1]);
         ch.read(&ack).expect("decodes");
-        assert!(!ch.reliable_in_flight(), "ack must clear the in-flight buffer");
+        assert!(
+            !ch.reliable_in_flight(),
+            "ack must clear the in-flight buffer"
+        );
 
         // The next transmit promotes the queued `begin`.
         let _ = ch.transmit(&[]);

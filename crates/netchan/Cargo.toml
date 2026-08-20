@@ -7,3 +7,4 @@ rust-version.workspace = true
 [dependencies]
 proto = { path = "../proto" }
 bzip2-rs = "0.1"
+bzip2 = "0.4"

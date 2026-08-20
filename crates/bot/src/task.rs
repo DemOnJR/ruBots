@@ -158,10 +158,12 @@ impl Difficulty {
     /// cube means shot 3 is nearly free and shot 8 is hopeless. A worse bot
     /// holds the trigger longer, which is both realistic and self-punishing.
     pub fn burst_shots(self) -> i32 {
+        // Live feedback: sprays looked inhuman (long dump / odd cadence).
+        // Human-ish is 2–3 bullet taps with a release so accuracy recovers.
         match self {
-            Difficulty::Easy => 8,
-            Difficulty::Normal => 5,
-            Difficulty::Hard => 3,
+            Difficulty::Easy => 4,
+            Difficulty::Normal => 3,
+            Difficulty::Hard => 2,
             Difficulty::Unfair => 2,
         }
     }
@@ -233,8 +235,12 @@ mod tests {
         // A bot that turns faster must also aim better, react quicker and
         // burst tighter — otherwise "harder" is not a difficulty, it is a
         // different bot.
-        let ladder =
-            [Difficulty::Easy, Difficulty::Normal, Difficulty::Hard, Difficulty::Unfair];
+        let ladder = [
+            Difficulty::Easy,
+            Difficulty::Normal,
+            Difficulty::Hard,
+            Difficulty::Unfair,
+        ];
         for pair in ladder.windows(2) {
             let (lo, hi) = (pair[0], pair[1]);
             assert!(lo.max_turn() < hi.max_turn(), "{lo:?} -> {hi:?} turn");
@@ -242,14 +248,25 @@ mod tests {
                 lo.aim_error_degrees() > hi.aim_error_degrees(),
                 "{lo:?} -> {hi:?} aim error must shrink"
             );
-            assert!(lo.reaction_time() > hi.reaction_time(), "{lo:?} -> {hi:?} reaction");
-            assert!(lo.burst_shots() > hi.burst_shots(), "{lo:?} -> {hi:?} burst");
+            assert!(
+                lo.reaction_time() > hi.reaction_time(),
+                "{lo:?} -> {hi:?} reaction"
+            );
+            assert!(
+                lo.burst_shots() >= hi.burst_shots(),
+                "{lo:?} -> {hi:?} burst must not grow"
+            );
         }
     }
 
     #[test]
     fn every_difficulty_is_physically_plausible() {
-        for d in [Difficulty::Easy, Difficulty::Normal, Difficulty::Hard, Difficulty::Unfair] {
+        for d in [
+            Difficulty::Easy,
+            Difficulty::Normal,
+            Difficulty::Hard,
+            Difficulty::Unfair,
+        ] {
             assert!(d.max_turn() > 0.0 && d.max_turn() <= 180.0, "{d:?}");
             assert!(d.aim_error_degrees() >= 0.0, "{d:?}");
             assert!(d.reaction_time() >= 0.0 && d.reaction_time() < 2.0, "{d:?}");

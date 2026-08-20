@@ -1,7 +1,7 @@
 //! One A\* for every kind of navigation data.
 //!
 //! There are two sources of waypoints in this crate and there will be more: a
-//! YaPB `.graph` file if the server ships one ([`crate::graph`]), and a grid
+//! `.graph` file if the server ships one ([`crate::graph`]), and a grid
 //! generated from the map's own collision hulls when it does not
 //! ([`crate::navgrid`]). The router must not care which it got — a bot that
 //! paths differently depending on where the nodes came from is two bots to
@@ -127,11 +127,7 @@ pub fn find_path_avoiding<S: NavSource + ?Sized>(
 /// * `> 1.0` is greedy/weighted A*: follows the heuristic, commits early, and
 ///   returns a slightly worse but visibly different path.
 ///
-/// YaPB gets the same effect by giving each bot one of three (g,h) pairs chosen
-/// per round from personality and a morale coin-flip
-/// (`yapb/src/manager.cpp:1766-1790`, cost functions at
-/// `yapb/src/navigate.cpp:3493-3522`). Its `g` variants lean on a learned danger
-/// table we do not have, so this is the portable half.
+/// Distinct search styles provide human-like route variance.
 pub const H_DIJKSTRA: f32 = 0.0;
 pub const H_ASTAR: f32 = 1.0;
 pub const H_GREEDY: f32 = 1.6;
@@ -165,7 +161,10 @@ pub fn find_path_tuned<S: NavSource + ?Sized>(
     let h = |i: usize| dist(src.origin(i), goal_origin) * h_weight;
 
     g[start] = 0.0;
-    open.push(Candidate { cost: h(start), node: start });
+    open.push(Candidate {
+        cost: h(start),
+        node: start,
+    });
 
     while let Some(Candidate { node, .. }) = open.pop() {
         if node == goal {
@@ -193,7 +192,10 @@ pub fn find_path_tuned<S: NavSource + ?Sized>(
             if tentative < g[next] {
                 g[next] = tentative;
                 came[next] = node;
-                open.push(Candidate { cost: tentative + h(next), node: next });
+                open.push(Candidate {
+                    cost: tentative + h(next),
+                    node: next,
+                });
             }
         }
     }
@@ -207,6 +209,38 @@ pub fn nearest<S: NavSource + ?Sized>(src: &S, pos: Vec3) -> Option<usize> {
             .partial_cmp(&dist(src.origin(b), pos))
             .unwrap_or(std::cmp::Ordering::Equal)
     })
+}
+
+/// Soft |Δz| beyond which a candidate is heavily penalised (same-floor prefer).
+///
+/// Standing player height is 72; stacked dust2 floors (A≈144, tunnels≈0–48)
+/// are farther than this. Used by [`nearest_prefer_z`].
+pub const FLOOR_Z_SOFT: f32 = 40.0;
+
+/// Like [`nearest`], but strongly prefers a node on the **same floor** as `pos`.
+///
+/// Pure 3D nearest can snap a bot on A platform to a tunnel node under mid
+/// (XY closer through a wall column), which yields a path that A* believes
+/// and the body cannot walk — "stuck staring at a wall" on CT A→B rotates.
+///
+/// Score = 3D distance + large penalty when `|Δz| > FLOOR_Z_SOFT`.
+pub fn nearest_prefer_z<S: NavSource + ?Sized>(src: &S, pos: Vec3) -> Option<usize> {
+    (0..src.len()).min_by(|&a, &b| {
+        floor_snap_score(src.origin(a), pos)
+            .partial_cmp(&floor_snap_score(src.origin(b), pos))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn floor_snap_score(node: Vec3, pos: Vec3) -> f32 {
+    let d = dist(node, pos);
+    let dz = (node[2] - pos[2]).abs();
+    if dz <= FLOOR_Z_SOFT {
+        d
+    } else {
+        // Prefer any same-floor node within ~2 cells before a wrong-floor snap.
+        d + (dz - FLOOR_Z_SOFT) * 8.0 + 200.0
+    }
 }
 
 /// Every node carrying `flag`.
@@ -244,7 +278,7 @@ pub fn reachable_from<S: NavSource + ?Sized>(src: &S, roots: &[usize]) -> Vec<bo
 
 // ---------------------------------------------------------------- .graph
 
-/// A YaPB waypoint file, seen as a routing source.
+/// A binary `.graph` waypoint file, seen as a routing source.
 ///
 /// This is the adapter that makes [`crate::graph::Graph`] and
 /// [`crate::navgrid::NavGrid`] interchangeable to a caller.
@@ -310,7 +344,11 @@ mod tests {
     }
 
     fn node_at(number: i32, x: f32, y: f32, links: &[i16]) -> Node {
-        let mut n = Node { number, origin: [x, y, 0.0], ..Default::default() };
+        let mut n = Node {
+            number,
+            origin: [x, y, 0.0],
+            ..Default::default()
+        };
         for (slot, idx) in n.links.iter_mut().zip(links) {
             slot.index = *idx;
         }
@@ -399,11 +437,23 @@ mod tests {
     fn reachability_follows_edges_forwards_only() {
         //  0 -> 1 -> 2   ;   3 isolated   ;   4 -> 1 (but 1 does not reach 4)
         let t = toy(
-            &[(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (99.0, 99.0), (5.0, 5.0)],
+            &[
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (20.0, 0.0),
+                (99.0, 99.0),
+                (5.0, 5.0),
+            ],
             &[&[1], &[2], &[], &[], &[1]],
         );
-        assert_eq!(reachable_from(&t, &[0]), vec![true, true, true, false, false]);
-        assert_eq!(reachable_from(&t, &[4]), vec![false, true, true, false, true]);
+        assert_eq!(
+            reachable_from(&t, &[0]),
+            vec![true, true, true, false, false]
+        );
+        assert_eq!(
+            reachable_from(&t, &[4]),
+            vec![false, true, true, false, true]
+        );
         assert_eq!(reachable_from(&t, &[]), vec![false; 5]);
         // An out-of-range root is ignored rather than panicking.
         assert_eq!(reachable_from(&t, &[99]), vec![false; 5]);
@@ -426,10 +476,7 @@ mod tests {
             node_at(1, 50.0, 900.0, &[0, 2]),
             node_at(2, 100.0, 0.0, &[0, 1]),
         ]);
-        let split = Graph::new(vec![
-            node_at(0, 0.0, 0.0, &[]),
-            node_at(1, 100.0, 0.0, &[]),
-        ]);
+        let split = Graph::new(vec![node_at(0, 0.0, 0.0, &[]), node_at(1, 100.0, 0.0, &[])]);
 
         for g in [&line, &detour, &split] {
             for a in 0..g.len() + 2 {
@@ -554,8 +601,13 @@ mod tests {
                 5
             }
             fn origin(&self, i: usize) -> [f32; 3] {
-                [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [5.0, 20.0, 0.0],
-                 [15.0, 20.0, 0.0], [20.0, 0.0, 0.0]][i]
+                [
+                    [0.0, 0.0, 0.0],
+                    [10.0, 0.0, 0.0],
+                    [5.0, 20.0, 0.0],
+                    [15.0, 20.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                ][i]
             }
             fn neighbours(&self, i: usize, out: &mut Vec<usize>) {
                 out.extend_from_slice(match i {
@@ -576,7 +628,11 @@ mod tests {
         }
 
         let plain = find_path(&Diamond, 0, 4).expect("a path");
-        assert_eq!(plain, vec![0, 1, 4], "the short way when nothing is penalised");
+        assert_eq!(
+            plain,
+            vec![0, 1, 4],
+            "the short way when nothing is penalised"
+        );
 
         let avoided = find_path_avoiding(&Diamond, 0, 4, &|n| if n == 1 { 400.0 } else { 0.0 })
             .expect("a path");
@@ -585,7 +641,11 @@ mod tests {
         // With the detour also blocked there is no alternative, so the
         // penalised node must still be used rather than reporting failure.
         let forced = find_path_avoiding(&Diamond, 0, 4, &|n| {
-            if n == 2 || n == 3 { 10_000.0 } else { 0.0 }
+            if n == 2 || n == 3 {
+                10_000.0
+            } else {
+                0.0
+            }
         })
         .expect("a penalty must never make a reachable goal unreachable");
         assert_eq!(forced, vec![0, 1, 4]);

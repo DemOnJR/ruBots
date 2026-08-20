@@ -97,9 +97,18 @@ pub struct SpringGains {
 }
 
 /// Walking around: stiff enough to be purposeful, damped enough not to ring.
-pub const NAV_GAINS: SpringGains = SpringGains { k: 200.0, c: 25.0, a_max: 3000.0 };
-/// Fighting: faster, and deliberately underdamped so a hard flick overshoots.
-pub const COMBAT_GAINS: SpringGains = SpringGains { k: 300.0, c: 20.0, a_max: 3300.0 };
+pub const NAV_GAINS: SpringGains = SpringGains {
+    k: 180.0,
+    c: 28.0,
+    a_max: 2400.0,
+};
+/// Fighting: underdamped enough for a small flick overshoot, damped enough
+/// that live sprays no longer look like the crosshair is jumping.
+pub const COMBAT_GAINS: SpringGains = SpringGains {
+    k: 300.0,
+    c: 16.0,
+    a_max: 2800.0,
+};
 
 /// Longest tick the integrator will accept, in seconds.
 ///
@@ -140,8 +149,7 @@ impl ViewMotion {
         self.step_with_yaw_error(current, desired, gains, dt, None)
     }
 
-    /// One spring step with YaPB's back-swing guard
-    /// (`yapb/src/vision.cpp:172-195`) applied at the navigation rungs.
+    /// One spring step with a back-swing guard applied at navigation rungs.
     ///
     /// `travel_yaw` is the bearing of the point being walked to, in degrees.
     /// A head on a swivel passes behind itself on huge turns, wraps, and shows
@@ -152,10 +160,9 @@ impl ViewMotion {
     /// its short way) so the integrator swings round the front instead: on a
     /// nav rung the head leads the body, it does not trail it.
     ///
-    /// Condition and adjustment are YaPB's: with `c` and `t` the signed,
-    /// travel-relative yaws of current and desired, force the long way when
-    /// `c * t < 0` (they straddle the direction of travel) and
-    /// `|c - t| >= 180` (so the short arc is the one that goes behind).
+    /// With `c` and `t` the signed, travel-relative yaws of current and desired,
+    /// force the long way when `c * t < 0` (they straddle the direction of travel)
+    /// and `|c - t| >= 180` (so the short arc is the one that goes behind).
     pub fn step_guarded(
         &mut self,
         current: Angles,
@@ -191,9 +198,8 @@ impl ViewMotion {
     ) -> Angles {
         let dt = dt.clamp(1e-4, MAX_DT);
 
-        let ey = yaw_error.unwrap_or_else(|| {
-            norm_angle(f64::from(desired.yaw) - f64::from(current.yaw))
-        });
+        let ey = yaw_error
+            .unwrap_or_else(|| norm_angle(f64::from(desired.yaw) - f64::from(current.yaw)));
         let yaw = if ey.abs() < YAW_DEADBAND {
             // Close enough: stop, and kill the momentum so it cannot ring here.
             self.yaw_vel = 0.0;
@@ -205,8 +211,7 @@ impl ViewMotion {
         };
 
         let ep = norm_angle(f64::from(desired.pitch) - f64::from(current.pitch));
-        let ap =
-            (2.0 * gains.k * ep - gains.c * self.pitch_vel).clamp(-gains.a_max, gains.a_max);
+        let ap = (2.0 * gains.k * ep - gains.c * self.pitch_vel).clamp(-gains.a_max, gains.a_max);
         self.pitch_vel += dt * ap;
         let pitch = f64::from(current.pitch) + dt * self.pitch_vel;
 
@@ -227,8 +232,8 @@ pub fn turn_toward(current: Angles, desired: Angles, max_turn: f64) -> Angles {
     let pitch_step = (dpitch * TURN_FACTOR).clamp(-max, max);
 
     let yaw = norm_angle(f64::from(current.yaw) + yaw_step) as f32;
-    let pitch = (norm_angle(f64::from(current.pitch) + pitch_step) as f32)
-        .clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    let pitch =
+        (norm_angle(f64::from(current.pitch) + pitch_step) as f32).clamp(-PITCH_LIMIT, PITCH_LIMIT);
 
     Angles { pitch, yaw }
 }
@@ -274,7 +279,10 @@ pub fn decay_punch_step(punch: Angles, frametime: f32) -> Angles {
     let shrunk =
         (len - (PUNCH_DECAY_BASE + len * PUNCH_DECAY_RATE) * f64::from(frametime)).max(0.0);
     let k = shrunk / len;
-    Angles { pitch: (p * k) as f32, yaw: (y * k) as f32 }
+    Angles {
+        pitch: (p * k) as f32,
+        yaw: (y * k) as f32,
+    }
 }
 
 /// Run the decay forward over `frames` engine frames of `frametime` each.
@@ -344,14 +352,21 @@ mod tests {
         let after = turn_toward(before, ang(0.0, 179.0), DEFAULT_MAX_TURN);
         let moved = norm_angle(f64::from(after.yaw) - f64::from(before.yaw)).abs();
         assert!(moved <= DEFAULT_MAX_TURN + 1e-9, "moved {moved} > cap");
-        assert!(moved > 19.0, "should be saturated at the cap, moved {moved}");
+        assert!(
+            moved > 19.0,
+            "should be saturated at the cap, moved {moved}"
+        );
     }
 
     #[test]
     fn small_errors_use_the_045_factor_not_the_cap() {
         let after = turn_toward(ang(0.0, 0.0), ang(0.0, 10.0), DEFAULT_MAX_TURN);
         // 10 * 0.45 = 4.5
-        assert!((f64::from(after.yaw) - 4.5).abs() < 1e-6, "yaw {}", after.yaw);
+        assert!(
+            (f64::from(after.yaw) - 4.5).abs() < 1e-6,
+            "yaw {}",
+            after.yaw
+        );
     }
 
     #[test]
@@ -359,7 +374,10 @@ mod tests {
         // From 350 to 10 is +20, not -340.
         let after = turn_toward(ang(0.0, 170.0), ang(0.0, -170.0), DEFAULT_MAX_TURN);
         let moved = norm_angle(f64::from(after.yaw) - 170.0);
-        assert!(moved > 0.0, "should turn positively through 180, moved {moved}");
+        assert!(
+            moved > 0.0,
+            "should turn positively through 180, moved {moved}"
+        );
         assert!(moved <= DEFAULT_MAX_TURN + 1e-9);
     }
 
@@ -410,14 +428,27 @@ mod tests {
         // The whole point: once via pev->v_angle, once in UTIL_MakeVectors.
         let punch = ang(-2.0, 0.5);
         let out = compensate(ang(0.0, 90.0), punch);
-        assert!((out.pitch - 4.0).abs() < 1e-4, "pitch {} should be +4", out.pitch);
-        assert!((out.yaw - 89.0).abs() < 1e-4, "yaw {} should be 89", out.yaw);
+        assert!(
+            (out.pitch - 4.0).abs() < 1e-4,
+            "pitch {} should be +4",
+            out.pitch
+        );
+        assert!(
+            (out.yaw - 89.0).abs() < 1e-4,
+            "yaw {} should be 89",
+            out.yaw
+        );
         assert_eq!(PUNCH_APPLICATIONS, 2.0);
     }
 
     #[test]
     fn compensate_is_the_exact_inverse_of_what_the_server_does() {
-        for punch in [ang(0.0, 0.0), ang(-3.5, 1.25), ang(1.0, -4.0), ang(-8.0, 0.0)] {
+        for punch in [
+            ang(0.0, 0.0),
+            ang(-3.5, 1.25),
+            ang(1.0, -4.0),
+            ang(-8.0, 0.0),
+        ] {
             for desired in [ang(0.0, 0.0), ang(12.0, -170.0), ang(-30.0, 45.0)] {
                 let sent = compensate(desired, punch);
                 let landed = resolve_shot(sent, punch);
@@ -447,7 +478,11 @@ mod tests {
         // len -= (10.0 + len * 0.5) * frametime, on the vector length.
         // Pure pitch: len = 4.0, frametime 0.1 -> 4 - (10 + 2)*0.1 = 2.8.
         let after = decay_punch_step(ang(-4.0, 0.0), 0.1);
-        assert!((f64::from(after.pitch) + 2.8).abs() < 1e-4, "{}", after.pitch);
+        assert!(
+            (f64::from(after.pitch) + 2.8).abs() < 1e-4,
+            "{}",
+            after.pitch
+        );
 
         // Mixed axes: the length shrinks, the direction is preserved.
         let before = ang(-3.0, 4.0); // length 5
@@ -468,7 +503,10 @@ mod tests {
             p = decay_punch_step(p, 0.05);
             assert!(p.pitch.is_finite() && p.yaw.is_finite());
         }
-        assert!(p.pitch.abs() < 1e-6 && p.yaw.abs() < 1e-6, "should have settled: {p:?}");
+        assert!(
+            p.pitch.abs() < 1e-6 && p.yaw.abs() < 1e-6,
+            "should have settled: {p:?}"
+        );
         // And it stays there rather than flipping sign.
         let still = decay_punch_step(p, 0.05);
         assert_eq!(still, Angles::default());
@@ -497,7 +535,10 @@ mod tests {
 
         let naive_err = aim_error(resolve_shot(naive, real_at_fire), ang(0.0, 0.0));
         let pred_err = aim_error(resolve_shot(predicted, real_at_fire), ang(0.0, 0.0));
-        assert!(pred_err < naive_err, "prediction {pred_err} should beat naive {naive_err}");
+        assert!(
+            pred_err < naive_err,
+            "prediction {pred_err} should beat naive {naive_err}"
+        );
         assert!(pred_err < 1e-3);
     }
 
@@ -516,8 +557,14 @@ mod tests {
         // Returns (peak deg/s, overshoot deg, seconds to settle inside 1 deg).
         let swing = |gains: SpringGains| {
             let mut m = ViewMotion::default();
-            let mut cur = Angles { pitch: 0.0, yaw: 0.0 };
-            let target = Angles { pitch: 0.0, yaw: 90.0 };
+            let mut cur = Angles {
+                pitch: 0.0,
+                yaw: 0.0,
+            };
+            let target = Angles {
+                pitch: 0.0,
+                yaw: 90.0,
+            };
             let (mut peak, mut overshoot, mut settled) = (0.0f64, 0.0f64, None);
             for i in 0..120 {
                 cur = m.step(cur, target, gains, dt);
@@ -548,10 +595,11 @@ mod tests {
         // Navigation does not overshoot -- walking somewhere is not a flick.
         assert!(nav_over < 1.0, "nav overshot by {nav_over:.1} deg");
 
-        // Combat does, and by an amount you could see.
+        // Combat still overshoots a little (human flick), but we deliberately
+        // toned gains down so live play no longer looked like aim snap.
         assert!(
-            cbt_over > 5.0,
-            "combat overshoot only {cbt_over:.1} deg -- the flick is the point"
+            cbt_over > 2.0,
+            "combat overshoot only {cbt_over:.1} deg -- want a mild flick"
         );
 
         // Both arrive promptly. A view that takes a second to come round is not
@@ -564,8 +612,14 @@ mod tests {
     #[test]
     fn a_long_hitch_does_not_launch_the_view_across_the_map() {
         let mut m = ViewMotion::default();
-        let cur = Angles { pitch: 0.0, yaw: 0.0 };
-        let target = Angles { pitch: 0.0, yaw: 90.0 };
+        let cur = Angles {
+            pitch: 0.0,
+            yaw: 0.0,
+        };
+        let target = Angles {
+            pitch: 0.0,
+            yaw: 90.0,
+        };
         // Half a second of stall, handed in as one tick.
         let after = m.step(cur, target, NAV_GAINS, 0.5);
         let moved = f64::from(after.yaw).abs();
@@ -589,9 +643,15 @@ mod tests {
     #[test]
     fn yaw_snaps_inside_the_deadband_and_pitch_does_not() {
         let mut m = ViewMotion::default();
-        let mut cur = Angles { pitch: 0.0, yaw: 0.0 };
+        let mut cur = Angles {
+            pitch: 0.0,
+            yaw: 0.0,
+        };
         // Both errors are under YAW_DEADBAND.
-        let target = Angles { pitch: 0.4, yaw: 0.4 };
+        let target = Angles {
+            pitch: 0.4,
+            yaw: 0.4,
+        };
 
         let after = m.step(cur, target, NAV_GAINS, 1.0 / 30.0);
         assert_eq!(m.yaw_vel, 0.0, "yaw kept momentum inside the deadband");
@@ -609,32 +669,37 @@ mod tests {
         let mut moves = 0;
         let mut last = cur.pitch;
         for i in 0..60 {
-            let bob = Angles { pitch: 0.4 + ((i as f32) * 0.5).sin() * 0.8, yaw: 0.4 };
+            let bob = Angles {
+                pitch: 0.4 + ((i as f32) * 0.5).sin() * 0.8,
+                yaw: 0.4,
+            };
             cur = m.step(cur, bob, NAV_GAINS, 1.0 / 30.0);
             if (cur.pitch - last).abs() > 1e-4 {
                 moves += 1;
             }
             last = cur.pitch;
         }
-        assert!(moves > 50, "pitch went still under excitation after {moves} ticks");
+        assert!(
+            moves > 50,
+            "pitch went still under excitation after {moves} ticks"
+        );
     }
 
     /// Walking at 170 deg with the destination behind at -170: the short way
     /// round swings through the back of the head (through 180, away from the
     /// direction of travel). A human head leads the body, so the spring must
     /// take the long way through the front -- the direction of travel.
-    ///
-    /// The travel bearing is a hair off due forward. That is not a corner
-    /// case, it is the correct ones: with travel exactly 0 the pair sits
-    /// smack on the travel axis and YaPB's `fzero(forward)` skips the guard --
-    /// there is no straddle to protect -- and moved further round the circle
-    /// the two angles stop straddling the travel direction. The guard fires
-    /// in a narrow band of bearings where heading, eyes and target conspire.
     #[test]
     fn the_back_swing_guard_forces_the_long_way_through_the_front() {
         let travel = 0.5; // moving towards +x, a whisker off
-        let current = Angles { pitch: 0.0, yaw: 170.0 };
-        let desired = Angles { pitch: 0.0, yaw: -170.0 };
+        let current = Angles {
+            pitch: 0.0,
+            yaw: 170.0,
+        };
+        let desired = Angles {
+            pitch: 0.0,
+            yaw: -170.0,
+        };
         let dt = 1.0 / 30.0;
 
         let mut plain = ViewMotion::default();
@@ -669,8 +734,14 @@ mod tests {
     #[test]
     fn the_guard_is_inert_when_the_short_way_is_forward() {
         let travel = 90.0; // moving towards +y
-        let current = Angles { pitch: 0.0, yaw: 40.0 };
-        let desired = Angles { pitch: 0.0, yaw: 70.0 };
+        let current = Angles {
+            pitch: 0.0,
+            yaw: 40.0,
+        };
+        let desired = Angles {
+            pitch: 0.0,
+            yaw: 70.0,
+        };
         let dt = 1.0 / 30.0;
 
         let mut plain = ViewMotion::default();

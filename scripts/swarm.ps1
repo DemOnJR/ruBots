@@ -23,8 +23,8 @@ Get-ChildItem "$Out\bot*.log" -ErrorAction SilentlyContinue | Remove-Item -Force
 $procs = @()
 for ($i = 1; $i -le $N; $i++) {
     $team = if ($i % 2 -eq 1) { 1 } else { 2 }
-    $key = "AIPLAYERBOT{0:D4}" -f $i
-    $name = "Bot{0:D2}" -f $i
+    $key = "REBBOT{0:D4}" -f $i
+    $name = "reBot{0:D2}" -f $i
     # Staged exits so the fleet leaves spread out (see swarm.sh for the
     # ReAuthCheck 60-minute ban on 7 disconnects in 15 s).
     # Integer! `$Secs + 5*($i-1)/2` is a DOUBLE for odd i (907.5), and the
@@ -34,13 +34,21 @@ for ($i = 1; $i -le $N; $i++) {
     $outFile = Join-Path $Out "$name.bin"
     $logFile = Join-Path $Out "bot$i.log"
 
+    $env:REB_NAME = $name
     $env:AIPLAYERS_NAME = $name
+    $env:REB_KEY = $key
     $env:AIPLAYERS_KEY = $key
+    $env:REB_TEAM = [string]$team
     $env:AIPLAYERS_TEAM = [string]$team
     # Debug radar (plan debug-gui-radar.md): broadcast position to the GUI.
     # Set to 0 to disable; the GUI listens on 27016.
-    if (-not $env:AIPLAYERS_TELEMETRY_PORT) {
+    if (-not $env:REB_TELEMETRY_PORT) {
+        $env:REB_TELEMETRY_PORT = "27016"
         $env:AIPLAYERS_TELEMETRY_PORT = "27016"
+    }
+    if (-not $env:REB_TEAM_PORT) {
+        $env:REB_TEAM_PORT = "27017"
+        $env:AIPLAYERS_TEAM_PORT = "27017"
     }
     # Start-Process redirects stderr (the telemetry) to the log file at spawn,
     # so it streams while the bot runs. stdout (quiet) goes nowhere useful.

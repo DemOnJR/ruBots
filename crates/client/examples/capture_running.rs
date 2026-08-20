@@ -18,7 +18,9 @@ use std::io::Write;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use client::telemetry::{BotTelemetry, DEFAULT_PORT, PACKET_LEN};
+use client::telemetry::{
+    decode_site, site_code, BotTelemetry, TeamBus, TeamTelemetry, DEFAULT_PORT, PACKET_LEN,
+};
 use client::{Identity, Session, Transport};
 
 /// Broadcasts this bot's position to the debug radar (plan
@@ -35,9 +37,15 @@ struct TelemetrySender {
     last: Instant,
 }
 
+fn reb_env(key: &str) -> Result<String, env::VarError> {
+    env::var(format!("REB_{key}"))
+        .or_else(|_| env::var(format!("REBOTS_{key}")))
+        .or_else(|_| env::var(format!("AIPLAYERS_{key}")))
+}
+
 impl TelemetrySender {
     fn from_env() -> Option<Self> {
-        let port: u16 = env::var("AIPLAYERS_TELEMETRY_PORT")
+        let port: u16 = reb_env("TELEMETRY_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_PORT);
@@ -45,16 +53,23 @@ impl TelemetrySender {
         sock.set_nonblocking(true).ok()?;
         let dest = format!("127.0.0.1:{port}").parse().ok()?;
         let mut name = [0u8; 16];
-        let n = env::var("AIPLAYERS_NAME").unwrap_or_else(|_| "AIPlayer".into());
+        let n = reb_env("NAME").unwrap_or_else(|_| "reBot".into());
         name[..n.len().min(16)].copy_from_slice(&n.as_bytes()[..n.len().min(16)]);
         let mut map = [0u8; 32];
-        let m = env::var("AIPLAYERS_MAP").unwrap_or_else(|_| "de_dust2".into());
+        let m = reb_env("MAP").unwrap_or_else(|_| "de_dust2".into());
         map[..m.len().min(32)].copy_from_slice(&m.as_bytes()[..m.len().min(32)]);
-        let team: u8 = env::var("AIPLAYERS_TEAM")
+        let team: u8 = reb_env("TEAM")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
-        Some(Self { sock, dest, name, map, team, last: Instant::now() })
+        Some(Self {
+            sock,
+            dest,
+            name,
+            map,
+            team,
+            last: Instant::now(),
+        })
     }
 
     /// Send the current state if 0.5 s have elapsed since the last packet.
@@ -111,10 +126,7 @@ impl<T: Transport> Transport for Logged<T> {
 fn main() {
     let mut args = env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:27015".into());
-    let secs: u64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(15);
+    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(15);
     let out_path = args.next().unwrap_or_else(|| "running.bin".into());
 
     let inner = match client::UdpTransport::connect(addr.parse().expect("addr"), None) {
@@ -125,14 +137,17 @@ fn main() {
         }
     };
     let sent_path = format!("{out_path}.sent");
-    let mut t = Logged { inner, log: File::create(&sent_path).expect("sent log") };
+    let mut t = Logged {
+        inner,
+        log: File::create(&sent_path).expect("sent log"),
+    };
     eprintln!("logging our outgoing packets to {sent_path}");
 
     // Distinct name AND key per bot: Reunion's IDClientsLimit is 1, so two
     // bots sharing a CD key are one identity and the second is refused.
-    let name = env::var("AIPLAYERS_NAME").unwrap_or_else(|_| "AIPlayer".into());
+    let name = reb_env("NAME").unwrap_or_else(|_| "reBot".into());
 
-    let key = env::var("AIPLAYERS_KEY").unwrap_or_else(|_| "AIPLAYER0000000".into());
+    let key = reb_env("KEY").unwrap_or_else(|_| "REBBOT000000000".into());
 
     // Every bot used to be constructed with a literal seed and a literal
     // difficulty, so thirty processes computed the same function of (map, team)
@@ -143,16 +158,15 @@ fn main() {
     // the swarm gets a spread without having to pass anything extra -- and the
     // same bot keeps the same personality across runs, which makes a
     // reproduction reproducible.
-    let seed: usize = env::var("AIPLAYERS_SEED")
+    let seed: usize = reb_env("SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
-            key.bytes()
-                .fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
-                    (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3u64)
-                }) as usize
+            key.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3u64)
+            }) as usize
         });
-    let difficulty = match env::var("AIPLAYERS_DIFFICULTY").as_deref() {
+    let difficulty = match reb_env("DIFFICULTY").as_deref() {
         Ok("easy") => bot::Difficulty::Easy,
         Ok("normal") => bot::Difficulty::Normal,
         Ok("hard") => bot::Difficulty::Hard,
@@ -209,11 +223,16 @@ fn main() {
         let _ = session.pump_idle(&mut t);
     }
 
-    let spawncount: u32 = env::var("AIPLAYERS_SPAWNCOUNT")
+    let spawncount: u32 = reb_env("SPAWNCOUNT")
         .ok()
         .and_then(|v| v.parse().ok())
         .or_else(|| session.resource_message.as_ref().map(|r| r.spawncount))
-        .or_else(|| session.recorded.iter().find_map(|m| Session::spawncount_from(m)))
+        .or_else(|| {
+            session
+                .recorded
+                .iter()
+                .find_map(|m| Session::spawncount_from(m))
+        })
         .unwrap_or(1);
     match session.resource_message.as_ref() {
         Some(rm) => {
@@ -221,7 +240,11 @@ fn main() {
                 "  resource message: {} resources, spawncount {}, consistency {} ({} demands)",
                 rm.resources.len(),
                 rm.spawncount,
-                if rm.consistency.should_send { "REQUESTED" } else { "not requested" },
+                if rm.consistency.should_send {
+                    "REQUESTED"
+                } else {
+                    "not requested"
+                },
                 rm.consistency.indices.len(),
             );
             if rm.consistency.should_send {
@@ -256,7 +279,7 @@ fn main() {
     }
     session.start_decoding();
     // Give the bot a brain unless we are capturing raw protocol.
-    if env::var("AIPLAYERS_NO_BRAIN").is_err() {
+    if reb_env("NO_BRAIN").is_err() {
         session.brain = Some(bot::Controller::new(seed as u64, difficulty));
         eprintln!("  bot brain enabled");
     }
@@ -265,20 +288,40 @@ fn main() {
     match session.map.as_ref() {
         Some(m) => eprintln!(
             "  map {} loaded: {} nav nodes, {} bomb sites, {} rescue zones",
-            m.name, m.grid.len(), m.info.bomb_sites.len(), m.info.rescue_zones.len()
+            m.name,
+            m.grid.len(),
+            m.info.bomb_sites.len(),
+            m.info.rescue_zones.len()
         ),
         None => eprintln!("  no map loaded -- the bot will not path"),
     }
     // Debug radar telemetry (plan `debug-gui-radar.md`): broadcast position
-    // every 0.5 s when AIPLAYERS_TELEMETRY_PORT is set. The map name for the
+    // every 0.5 s when REB_TELEMETRY_PORT is set. The map name for the
     // packet comes from the loaded map so the GUI picks the right radar.
     let mut telemetry = TelemetrySender::from_env();
+    let mut team_bus = match TeamBus::from_env() {
+        Ok(bus) => bus,
+        Err(error) => {
+            eprintln!("  team bus disabled: {error}");
+            None
+        }
+    };
+    let bot_id = name
+        .strip_prefix("Bot")
+        .or_else(|| name.strip_prefix("reBot"))
+        .or_else(|| name.strip_prefix("REBBot"))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    session.set_team_bot_id(bot_id);
     if let (Some(t), Some(m)) = (telemetry.as_mut(), session.map.as_ref()) {
         let b = m.name.as_bytes();
         t.map[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
     }
     if telemetry.is_some() {
-        eprintln!("  telemetry broadcasting on AIPLAYERS_TELEMETRY_PORT");
+        eprintln!("  telemetry broadcasting on REB_TELEMETRY_PORT");
+    }
+    if team_bus.is_some() {
+        eprintln!("  G0 team bus enabled on REB_TEAM_PORT");
     }
     eprintln!("  entering game: spawn {spawncount} then sendents ...");
     match session.enter_game(&mut t, spawncount, Duration::from_secs(10)) {
@@ -287,7 +330,7 @@ fn main() {
         Err(e) => eprintln!("  enter_game error: {e}"),
     }
 
-    if env::var("AIPLAYERS_NO_JOIN").is_ok() {
+    if reb_env("NO_JOIN").is_ok() {
         eprintln!("  BISECT: fully connected, sending nothing but moves");
     } else {
         // Let the entry burst drain before adding the join burst on top of it.
@@ -298,7 +341,7 @@ fn main() {
         // (3.17 s); firing them back to back stacks two bursts and overflows.
         let settle = Instant::now()
             + Duration::from_millis(
-                env::var("AIPLAYERS_JOIN_DELAY_MS")
+                reb_env("JOIN_DELAY_MS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(2000),
@@ -322,7 +365,15 @@ fn main() {
                 eprintln!("  re-asserted name {:?}", session.name());
                 session.refresh_objective(seed);
                 if let Some(site) = session.site {
-                    eprintln!("  objective: [{:.0} {:.0} {:.0}]", site[0], site[1], site[2]);
+                    let role = session.role.map_or("none", |r| r.as_str());
+                    let plant = session
+                        .plant_spot
+                        .map(|p| format!("[{:.0} {:.0} {:.0}]", p[0], p[1], p[2]))
+                        .unwrap_or_else(|| "none".into());
+                    eprintln!(
+                        "  objective: [{:.0} {:.0} {:.0}]  role {role}  plant {plant}",
+                        site[0], site[1], site[2]
+                    );
                 }
             }
             Ok(false) => eprintln!("  !!! team was never accepted"),
@@ -359,7 +410,7 @@ fn main() {
                 // anti-idle check, which needs BOTH yaw and pitch to move by
                 // >= 0.1 degrees across a 5 s sample (CSPlayer.cpp:530-540).
                 yaw: (secs * 24.0) % 360.0,
-                },
+            },
             forwardmove: 250.0,
             ..Default::default()
         };
@@ -370,7 +421,10 @@ fn main() {
         if let Ok(mode) = env::var("AIPLAYERS_DRIVE") {
             let t0 = start.elapsed().as_secs_f32();
             let mut manual = bot::Intent::default();
-            manual.view = bot::Angles { pitch: 0.0, yaw: (t0 * 20.0) % 360.0 };
+            manual.view = bot::Angles {
+                pitch: 0.0,
+                yaw: (t0 * 20.0) % 360.0,
+            };
             match mode.as_str() {
                 "jump" => manual.jump = (t0 as u32) % 2 == 0,
                 "fwd" => manual.forwardmove = 250.0,
@@ -392,12 +446,17 @@ fn main() {
             if let Some(cd) = session.clientdata.as_ref() {
                 let o = cd.origin();
                 let base = *first_origin.get_or_insert(o);
-                max_travel = max_travel
-                    .max(((o[0] - base[0]).powi(2) + (o[1] - base[1]).powi(2)).sqrt());
+                max_travel =
+                    max_travel.max(((o[0] - base[0]).powi(2) + (o[1] - base[1]).powi(2)).sqrt());
                 if last_state.elapsed() >= Duration::from_millis(700) {
                     eprintln!(
                         "  DRIVE t+{:>4.0}s origin [{:>6.0} {:>6.0} {:>6.1}] on_ground {} hp {:.0}",
-                        t0, o[0], o[1], o[2], cd.on_ground(), cd.health()
+                        t0,
+                        o[0],
+                        o[1],
+                        o[2],
+                        cd.on_ground(),
+                        cd.health()
                     );
                     last_state = Instant::now();
                 }
@@ -464,16 +523,17 @@ fn main() {
                         dec.reroutes, dec.stuck,
                     );
                     eprintln!(
-                        "      obj: rung {:<10} bomb {} arming {} attack {} use {} to_goal {:.0}                          | planted {} at {:?}",
-                        dec.rung, dec.carrying_bomb, dec.arming, dec.attack, dec.use_action,
+                        "      obj: rung {:<10} role {:<8} bomb {} arming {} attack {} use {} to_goal {:.0} | planted {} at {:?} | rotate {} site {:?}",
+                        dec.rung, dec.role, dec.carrying_bomb, dec.arming, dec.attack, dec.use_action,
                         dec.to_goal,
                         dec.bomb_planted,
                         dec.bomb_known_at.map(|b| [b[0] as i32, b[1] as i32]),
+                        dec.rotate_events,
+                        dec.rotate_site,
                     );
                     eprintln!(
                         "      hostage: escort {:<9} seen {} led {} to_hostage {:.0} edges {}",
-                        dec.escort, dec.hostages, dec.hostages_led, dec.to_hostage,
-                        dec.use_edges,
+                        dec.escort, dec.hostages, dec.hostages_led, dec.to_hostage, dec.use_edges,
                     );
                     // Debug radar: broadcast every 0.5 s.
                     if let Some(t) = telemetry.as_mut() {
@@ -485,7 +545,10 @@ fn main() {
                 // self-defeating: forcing a flush with `log off` ROTATES the
                 // file, so a plant recorded before the poll lands in a file the
                 // next poll no longer looks at.
-                if session.decoder.as_ref().is_some_and(|d| d.game.bomb_planted)
+                if session
+                    .decoder
+                    .as_ref()
+                    .is_some_and(|d| d.game.bomb_planted)
                     && !announced_plant
                 {
                     announced_plant = true;
@@ -542,8 +605,13 @@ fn main() {
                     for p in players.iter().take(4) {
                         eprintln!(
                             "        player #{} {:?} at [{:.0} {:.0} {:.0}] yaw {:.0}{}",
-                            p.entity, p.team, p.origin[0], p.origin[1], p.origin[2],
-                            p.angles[1], if p.ducking { " (ducking)" } else { "" },
+                            p.entity,
+                            p.team,
+                            p.origin[0],
+                            p.origin[1],
+                            p.origin[2],
+                            p.angles[1],
+                            if p.ducking { " (ducking)" } else { "" },
                         );
                     }
                 }
@@ -554,6 +622,54 @@ fn main() {
                 }
                 last_state = Instant::now();
             }
+        }
+        if let Some(bus) = team_bus.as_ref() {
+            let mut wire_reports = Vec::new();
+            bus.poll(&mut wire_reports);
+            let reports: Vec<bot::TeamReport> = wire_reports
+                .into_iter()
+                .map(|report| bot::TeamReport {
+                    bot_id: report.bot_id,
+                    team: match report.team {
+                        1 => bot::Team::Terrorist,
+                        2 => bot::Team::CounterTerrorist,
+                        _ => bot::Team::Unassigned,
+                    },
+                    alive: report.alive,
+                    origin: report.origin,
+                    assigned_site: decode_site(report.assigned_site),
+                    contact_site: decode_site(report.contact_site),
+                    contact_at: (report.contact_at >= 0.0).then_some(report.contact_at),
+                    bomb_carrier: report.bomb_carrier,
+                    bomb_planted: report.bomb_planted,
+                    bomb_origin: report.bomb_origin,
+                    observed_at: report.observed_at,
+                    role: report.role,
+                    rung: report.rung,
+                })
+                .collect();
+            session.ingest_team_reports(&reports);
+        }
+        if let (Some(bus), Some(report)) = (team_bus.as_mut(), session.latest_team_report) {
+            bus.publish(TeamTelemetry {
+                bot_id: report.bot_id,
+                team: match report.team {
+                    bot::Team::Terrorist => 1,
+                    bot::Team::CounterTerrorist => 2,
+                    _ => 0,
+                },
+                alive: report.alive,
+                origin: report.origin,
+                assigned_site: site_code(report.assigned_site),
+                contact_site: site_code(report.contact_site),
+                contact_at: report.contact_at.unwrap_or(-1.0),
+                bomb_carrier: report.bomb_carrier,
+                bomb_planted: report.bomb_planted,
+                bomb_origin: report.bomb_origin,
+                observed_at: report.observed_at,
+                role: report.role,
+                rung: report.rung,
+            });
         }
         match step {
             Ok(msgs) => {
@@ -614,10 +730,19 @@ fn main() {
         for it in &w.items {
             if let client::Item::User { name, payload, .. } = it {
                 *totals.entry(name.clone()).or_default() += 1;
-                if matches!(name.as_str(), "TeamInfo" | "TextMsg" | "StatusIcon" | "CurWeapon" | "Money") {
+                if matches!(
+                    name.as_str(),
+                    "TeamInfo" | "TextMsg" | "StatusIcon" | "CurWeapon" | "Money"
+                ) {
                     let txt: String = payload
                         .iter()
-                        .map(|&c| if (32..127).contains(&c) { c as char } else { '.' })
+                        .map(|&c| {
+                            if (32..127).contains(&c) {
+                                c as char
+                            } else {
+                                '.'
+                            }
+                        })
                         .collect();
                     eprintln!("     {name}: {txt}");
                 }
@@ -660,13 +785,22 @@ fn main() {
             let end = (pos + 160).min(msg.len());
             let txt: String = msg[start..end]
                 .iter()
-                .map(|&c| if (32..127).contains(&c) { c as char } else { '.' })
+                .map(|&c| {
+                    if (32..127).contains(&c) {
+                        c as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect();
             eprintln!("  SERVER-SIDE USERINFO: {txt}");
             break;
         }
     }
-    eprintln!("recorded {} messages; stufftext candidates:", session.recorded.len());
+    eprintln!(
+        "recorded {} messages; stufftext candidates:",
+        session.recorded.len()
+    );
     for t in stuff.iter().take(30) {
         eprintln!("   STUFFTEXT {t:?}");
     }
@@ -680,11 +814,11 @@ fn main() {
                 "  SERVER-SIDE STATE: origin [{:.0} {:.0} {:.0}] health {:.0} maxspeed {:.0} alive {}",
                 o[0], o[1], o[2], cd.health(), cd.maxspeed(), cd.alive()
             );
-            eprintln!(
-                "  MOVEMENT: travelled {max_travel:.0} units, peak speed {max_speed:.0} u/s"
-            );
+            eprintln!("  MOVEMENT: travelled {max_travel:.0} units, peak speed {max_speed:.0} u/s");
             if max_travel < 32.0 {
-                eprintln!("  !!! the bot did not move -- commands are being discarded or it is dead");
+                eprintln!(
+                    "  !!! the bot did not move -- commands are being discarded or it is dead"
+                );
             }
         }
         None => eprintln!("  !!! no svc_clientdata decoded -- not receiving datagrams"),

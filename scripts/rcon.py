@@ -28,7 +28,7 @@ import socket
 import sys
 
 ADDR = ("127.0.0.1", 27015)
-PASSWORD = "aiplayers_local"
+PASSWORD = "rebots_local"
 TIMEOUT = 3.0
 
 

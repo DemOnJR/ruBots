@@ -8,21 +8,24 @@
 //! (`internal/client/client.go:30`): `disconnected`, `challenging`,
 //! `connecting`, `connected`, `running`.
 
-pub mod navigate;
-pub mod map;
-pub mod view;
-pub mod console;
-pub mod usermsg;
-pub mod world;
 pub mod clock;
+pub mod console;
 pub mod content;
 pub mod control;
+pub mod map;
 pub mod messages;
+pub mod navigate;
+pub mod role;
 pub mod session;
 pub mod signon;
 pub mod stream;
 pub mod svc;
 pub mod telemetry;
+pub mod usermsg;
+pub mod view;
+pub mod world;
+
+pub use role::{BotRole, ObjectivePick};
 
 pub use control::{intent_to_usercmd, MoveSender};
 pub use messages::{Reader, ServerInfo};
@@ -187,13 +190,11 @@ pub struct Identity {
 impl Default for Identity {
     fn default() -> Self {
         Self {
-            name: "AIPlayer".into(),
+            name: "reBot".into(),
             key: auth::DEFAULT_KEY.to_vec(),
             // A real client negotiates a high rate; a low one makes the
             // server's `Netchan_CanPacket` rate limiter (cleartime) stall it
             // for long stretches while reliable data keeps queueing behind.
-            // Manutza* records mimicking cl_updaterate 60-80 for the same
-            // reason.
             // These directly govern how fast the server can DRAIN its reliable
             // buffer to us: it flushes at most one reliable message per update
             // interval (`next_messageinterval = 1.0 / cl_updaterate`,
@@ -654,7 +655,11 @@ mod tests {
 
     #[test]
     fn userinfo_carries_the_configured_name_and_rate() {
-        let id = Identity { name: "Bravo".into(), rate: 30_000, ..Default::default() };
+        let id = Identity {
+            name: "Bravo".into(),
+            rate: 30_000,
+            ..Default::default()
+        };
         let u = id.userinfo();
         assert!(u.contains("\\name\\Bravo"), "{u}");
         assert!(u.contains("\\rate\\30000"), "{u}");
@@ -693,12 +698,15 @@ mod tests {
                     assert!(!u.contains(&format!("\\name\\{other}")), "{u}");
                 }
             }
-            assert!(seen.insert(id.wire_name().to_string()), "duplicate name {name}");
+            assert!(
+                seen.insert(id.wire_name().to_string()),
+                "duplicate name {name}"
+            );
         }
         assert_eq!(seen.len(), names.len());
         // And the default is only ever used when nobody asked for a name --
-        // "(1)AIPlayer" in a server log means a bot fell back to it.
-        assert_eq!(Identity::default().name, "AIPlayer");
+        // "(1)reBot" in a server log means a bot fell back to it.
+        assert_eq!(Identity::default().name, "reBot");
     }
 
     /// `MAX_NAME` is 31 usable bytes (`rehlds/engine/server.h:35`), and the
@@ -706,14 +714,25 @@ mod tests {
     /// on the server and come back deduplicated as `(1)…`.
     #[test]
     fn names_are_clamped_to_the_engines_max_name() {
-        let id = Identity { name: "N".repeat(64), ..Default::default() };
+        let id = Identity {
+            name: "N".repeat(64),
+            ..Default::default()
+        };
         assert_eq!(id.wire_name().len(), MAX_NAME);
-        assert!(id.userinfo().contains(&format!("\\name\\{}", "N".repeat(MAX_NAME))));
+        assert!(id
+            .userinfo()
+            .contains(&format!("\\name\\{}", "N".repeat(MAX_NAME))));
         // A short name is untouched.
-        let short = Identity { name: "Bot01".into(), ..Default::default() };
+        let short = Identity {
+            name: "Bot01".into(),
+            ..Default::default()
+        };
         assert_eq!(short.wire_name(), "Bot01");
         // Multi-byte names are cut on a character boundary, never mid-codepoint.
-        let wide = Identity { name: "ä".repeat(20), ..Default::default() };
+        let wide = Identity {
+            name: "ä".repeat(20),
+            ..Default::default()
+        };
         assert!(wide.wire_name().len() <= MAX_NAME);
         assert!(std::str::from_utf8(wide.wire_name().as_bytes()).is_ok());
     }
@@ -724,15 +743,26 @@ mod tests {
     /// unquoted name containing a space would be silently ignored.
     #[test]
     fn setinfo_name_command_matches_the_engine_wire_form() {
-        let id = Identity { name: "Bot01".into(), ..Default::default() };
+        let id = Identity {
+            name: "Bot01".into(),
+            ..Default::default()
+        };
         assert_eq!(id.setinfo_name_command(), "setinfo \"name\" \"Bot01\"");
-        let spaced = Identity { name: "Bot 01".into(), ..Default::default() };
+        let spaced = Identity {
+            name: "Bot 01".into(),
+            ..Default::default()
+        };
         assert_eq!(spaced.setinfo_name_command(), "setinfo \"name\" \"Bot 01\"");
         // It re-asserts the clamped name, so it agrees with the connect
         // userinfo rather than fighting it.
-        let long = Identity { name: "N".repeat(64), ..Default::default() };
+        let long = Identity {
+            name: "N".repeat(64),
+            ..Default::default()
+        };
         assert!(long.setinfo_name_command().contains(&"N".repeat(MAX_NAME)));
-        assert!(!long.setinfo_name_command().contains(&"N".repeat(MAX_NAME + 1)));
+        assert!(!long
+            .setinfo_name_command()
+            .contains(&"N".repeat(MAX_NAME + 1)));
     }
 
     /// `dropclient` is the one disconnect verb the engine accepts from a

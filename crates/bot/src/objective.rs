@@ -79,6 +79,8 @@ pub enum Objective {
     MoveToDefuse,
     /// Standing on the bomb, defusing.
     Defusing,
+    /// Phase G4: T post-plant — hold an entry angle near the bomb (not Idle hunt).
+    DefendPlant,
 }
 
 /// Objective progress across ticks.
@@ -93,7 +95,11 @@ pub struct ObjectiveState {
 
 impl Default for ObjectiveState {
     fn default() -> Self {
-        Self { objective: Objective::Idle, target: None, elapsed: 0.0 }
+        Self {
+            objective: Objective::Idle,
+            target: None,
+            elapsed: 0.0,
+        }
     }
 }
 
@@ -126,6 +132,36 @@ pub fn defuse_time(has_kit: bool) -> f32 {
     }
 }
 
+/// Phase G4: T post-plant hold offset from the bomb model.
+///
+/// Real teams do not stack on the C4. Four entry-denial lanes around the plant
+/// (plus one closer "close" for defuse denial) give different bots different
+/// doors/angles. Salt is stable for a still body (rounded origin) so the hold
+/// does not jitter every tick.
+pub fn t_post_plant_hold(bomb: Vec3, me: &crate::world::SelfState) -> Vec3 {
+    // Quantise origin so the lane does not flip while walking a few units.
+    let qx = (me.origin[0] / 64.0).floor() as i32;
+    let qy = (me.origin[1] / 64.0).floor() as i32;
+    let salt = (qx.wrapping_mul(0x45d9_f3b) ^ qy.wrapping_mul(0x27d4_eb2d)) as u32;
+    let lane = salt % 5;
+    // Bearings: N / E / S / W / NE — covers typical dual entrances on dust2 sites.
+    let angle = match lane {
+        0 => 0.0f32,
+        1 => std::f32::consts::FRAC_PI_2,
+        2 => std::f32::consts::PI,
+        3 => -std::f32::consts::FRAC_PI_2,
+        _ => std::f32::consts::FRAC_PI_4,
+    };
+    // Lane 4 (close) sits ~180u on the bomb for defuse denial; others 320–480u.
+    let r = if lane == 4 {
+        180.0
+    } else {
+        320.0 + (salt % 5) as f32 * 32.0
+    };
+    let (s, c) = angle.sin_cos();
+    [bomb[0] + r * c, bomb[1] + r * s, bomb[2]]
+}
+
 impl ObjectiveState {
     /// Advance the objective by one tick.
     ///
@@ -151,14 +187,32 @@ impl ObjectiveState {
             return Some(ObjectiveEvent::BombPlantedSuccessfully);
         }
 
-        // Defusing takes precedence: a planted bomb is the whole game.
+        // Defusing / post-plant defence: a planted bomb is the whole game.
         if world.bomb.planted {
+            // Phase G4 — terrorists do NOT go Idle and wander. They hold
+            // seed-stable offsets around the bomb (entry denial), so CT cannot
+            // walk onto site free. One lane sits closer for defuse denial.
+            if world.me.team == Team::Terrorist {
+                let bomb = world.bomb.origin.or(site);
+                if let Some(bomb) = bomb {
+                    let hold = t_post_plant_hold(bomb, &world.me);
+                    self.objective = Objective::DefendPlant;
+                    self.target = Some(hold);
+                    self.elapsed += dt;
+                    return None;
+                }
+                self.objective = Objective::Idle;
+                self.target = None;
+                return None;
+            }
             if world.me.team != Team::CounterTerrorist {
                 self.objective = Objective::Idle;
                 self.target = None;
                 return None;
             }
-            let Some(bomb) = world.bomb.origin else {
+            // CT retake: prefer decoded plant origin; fall back to map site so
+            // bots who never saw the plant entity still path to the right half.
+            let Some(bomb) = world.bomb.origin.or(site) else {
                 self.objective = Objective::Idle;
                 return None;
             };
@@ -272,8 +326,15 @@ mod tests {
 
     fn terrorist_with_bomb(at: Vec3) -> WorldView {
         WorldView {
-            me: SelfState { origin: at, team: Team::Terrorist, ..Default::default() },
-            bomb: BombState { carried_by_me: true, ..Default::default() },
+            me: SelfState {
+                origin: at,
+                team: Team::Terrorist,
+                ..Default::default()
+            },
+            bomb: BombState {
+                carried_by_me: true,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -286,7 +347,11 @@ mod tests {
                 has_defuse_kit: kit,
                 ..Default::default()
             },
-            bomb: BombState { planted: true, origin: Some(SITE), ..Default::default() },
+            bomb: BombState {
+                planted: true,
+                origin: Some(SITE),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -382,19 +447,49 @@ mod tests {
         let mut w = ct_near_planted_bomb([1000.0, 1000.0, 0.0], false);
         w.me.team = Team::Terrorist;
         assert_eq!(s.tick(&w, None, 0.1), None);
-        assert_eq!(s.objective, Objective::Idle);
+        // G4: T post-plant defends, never defuses.
+        assert_eq!(s.objective, Objective::DefendPlant);
+        assert!(s.target.is_some());
+        let hold = s.target.unwrap();
+        let d = distance2d(SITE, hold);
+        assert!(
+            d >= 150.0 && d <= 550.0,
+            "hold should be offset from bomb, got d={d}"
+        );
     }
 
     #[test]
     fn a_planted_bomb_outranks_planting() {
         // Even holding the bomb, if it is somehow already planted the carrier
-        // stops trying to plant.
+        // stops trying to plant and switches to post-plant defence (G4).
         let mut s = ObjectiveState::default();
         let mut w = terrorist_with_bomb([1000.0, 1000.0, 0.0]);
         w.bomb.planted = true;
         w.bomb.origin = Some(SITE);
         assert_eq!(s.tick(&w, Some(SITE), 0.1), None);
-        assert_eq!(s.objective, Objective::Idle);
+        assert_eq!(s.objective, Objective::DefendPlant);
+        assert!(s.target.is_some());
+    }
+
+    #[test]
+    fn t_post_plant_holds_fan_out() {
+        let bomb = SITE;
+        let mut cells = std::collections::HashSet::new();
+        for i in 0..12 {
+            let mut me = crate::world::SelfState::default();
+            me.team = Team::Terrorist;
+            // Spread "identities" via quantised origin buckets.
+            me.origin = [i as f32 * 200.0, (i % 3) as f32 * 200.0, 0.0];
+            let h = t_post_plant_hold(bomb, &me);
+            cells.insert(((h[0] / 80.0).floor() as i32, (h[1] / 80.0).floor() as i32));
+            let d = distance2d(bomb, h);
+            assert!((150.0..550.0).contains(&d), "lane dist {d}");
+        }
+        assert!(
+            cells.len() >= 3,
+            "12 T identities should use several hold cells, got {}",
+            cells.len()
+        );
     }
 
     #[test]
@@ -427,7 +522,10 @@ mod tests {
 
     #[test]
     fn event_strings_match_the_recovered_literals() {
-        assert_eq!(ObjectiveEvent::PlantingTheBomb.as_str(), "planting the bomb");
+        assert_eq!(
+            ObjectiveEvent::PlantingTheBomb.as_str(),
+            "planting the bomb"
+        );
         assert_eq!(
             ObjectiveEvent::PlantSpotNotValid.as_str(),
             "plant spot not valid - moving on"
@@ -436,7 +534,10 @@ mod tests {
             ObjectiveEvent::BombPlantedSuccessfully.as_str(),
             "bomb planted successfully"
         );
-        assert_eq!(ObjectiveEvent::DefusingTheBomb.as_str(), "defusing the bomb");
+        assert_eq!(
+            ObjectiveEvent::DefusingTheBomb.as_str(),
+            "defusing the bomb"
+        );
     }
 
     /// A dropped bomb is not somebody else's problem.

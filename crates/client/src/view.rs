@@ -91,6 +91,35 @@ impl Sight for nav::bsp::Bsp {
     }
 }
 
+/// Worldspawn **plus** brush entities (`func_wall`, breakables, …).
+///
+/// Raw [`nav::bsp::Bsp`] only answers world hulls. Dust2 site geometry and
+/// many crates live as separate models — without them bots "see" (and shoot)
+/// through solid cover.
+pub struct BrushSight<'a> {
+    pub bsp: &'a nav::bsp::Bsp,
+    pub brushes: &'a [nav::entities::SolidBrush],
+}
+
+impl Sight for BrushSight<'_> {
+    fn visible(&self, from: [f32; 3], to: [f32; 3]) -> bool {
+        use nav::bsp::Hull;
+        if !self.bsp.visible(from, to) {
+            return false;
+        }
+        for b in self.brushes {
+            if b.model == 0 || b.model >= self.bsp.models.len() {
+                continue;
+            }
+            let t = self.bsp.hull_trace_model(b.model, Hull::Point, from, to);
+            if t.start_solid || t.fraction < 1.0 - 1e-4 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Half-width of a player's bounding box: `VEC_HULL_MIN/MAX` is
 /// `(-16,-16,-36)..(16,16,36)` and `VEC_DUCK_HULL_MIN/MAX` is
 /// `(-16,-16,-18)..(16,16,18)` (`regamedll/dlls/player.h`), so the footprint is
@@ -138,15 +167,17 @@ fn blocks_line(blocker: [f32; 3], ducking: bool, from: [f32; 3], to: [f32; 3]) -
     let half = [
         half_w,
         half_w,
-        if ducking { DUCK_HALF_HEIGHT } else { PLAYER_HALF_HEIGHT },
+        if ducking {
+            DUCK_HALF_HEIGHT
+        } else {
+            PLAYER_HALF_HEIGHT
+        },
     ];
 
     // An endpoint inside the box means this "blocker" IS one of the two
     // parties, so it cannot be in the way of itself. Without this the shooter
     // is always inside its own box and can never fire at anything.
-    let contains = |p: [f32; 3]| {
-        (0..3).all(|a| (p[a] - blocker[a]).abs() <= half[a])
-    };
+    let contains = |p: [f32; 3]| (0..3).all(|a| (p[a] - blocker[a]).abs() <= half[a]);
     if contains(from) || contains(to) {
         return false;
     }
@@ -276,7 +307,10 @@ pub fn project(
         punchangle: cd
             .map(|c| {
                 let p = c.punchangle();
-                Angles { pitch: p[0], yaw: p[1] }
+                Angles {
+                    pitch: p[0],
+                    yaw: p[1],
+                }
             })
             .unwrap_or_default(),
         weapon: weapon_state(d),
@@ -292,10 +326,7 @@ pub fn project(
     // allowed to veto shots, or one unknown slot silently disarms the bot.
     let friendly_bodies: Vec<(u16, [f32; 3], bool)> = if my_team.is_playing() {
         seen.iter()
-            .filter(|p| {
-                p.team == my_team
-                    && !g.player(p.entity as u8).is_some_and(|i| i.dead)
-            })
+            .filter(|p| p.team == my_team && !g.player(p.entity as u8).is_some_and(|i| i.dead))
             .map(|p| (p.entity, p.origin, p.ducking))
             .collect()
     } else {
@@ -310,9 +341,9 @@ pub fn project(
             // (from the BSP) and our own team (from the entity frame, because
             // players are not in the BSP at all).
             let world_clear = sight.is_some_and(|s| s.visible(eye, target_eye));
-            let friendly_clear = !friendly_bodies.iter().any(|&(e, o, duck)| {
-                e != p.entity && blocks_line(o, duck, eye, target_eye)
-            });
+            let friendly_clear = !friendly_bodies
+                .iter()
+                .any(|&(e, o, duck)| e != p.entity && blocks_line(o, duck, eye, target_eye));
             PlayerView {
                 entity: p.entity,
                 origin: p.origin,
@@ -416,10 +447,8 @@ mod tests {
         d.clientdata = Some(cd.clone());
         assert!(!alive(&d), "health 0 is a corpse");
 
-        cd.fields.insert(
-            "health".into(),
-            proto::delta::Value::Float(100.0),
-        );
+        cd.fields
+            .insert("health".into(), proto::delta::Value::Float(100.0));
         d.clientdata = Some(cd);
         assert!(alive(&d), "full health with no deadflag is alive");
     }
@@ -448,13 +477,24 @@ mod tests {
         // A line 30 units above the blocker's origin.
         let from = [0.0, 0.0, 30.0];
         let to = [400.0, 0.0, 30.0];
-        assert!(blocks_line([200.0, 0.0, 0.0], false, from, to), "standing is 36 tall");
-        assert!(!blocks_line([200.0, 0.0, 0.0], true, from, to), "ducked is 18 tall");
+        assert!(
+            blocks_line([200.0, 0.0, 0.0], false, from, to),
+            "standing is 36 tall"
+        );
+        assert!(
+            !blocks_line([200.0, 0.0, 0.0], true, from, to),
+            "ducked is 18 tall"
+        );
     }
 
     #[test]
     fn a_degenerate_segment_blocks_nothing() {
-        assert!(!blocks_line([0.0, 0.0, 0.0], false, [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]));
+        assert!(!blocks_line(
+            [0.0, 0.0, 0.0],
+            false,
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0]
+        ));
     }
 
     /// The point of the gate: an enemy behind a teammate is not a shot.
@@ -478,7 +518,8 @@ mod tests {
         d.game.apply("TeamInfo", &team_info(2, "TERRORIST"));
         d.game.apply("TeamInfo", &team_info(3, "CT"));
         let mut cd = crate::world::ClientData::default();
-        cd.fields.insert("health".into(), proto::delta::Value::Float(100.0));
+        cd.fields
+            .insert("health".into(), proto::delta::Value::Float(100.0));
         d.clientdata = Some(cd);
         d.entities = vec![
             player_entity(2, [200.0, 0.0, 0.0]),
@@ -491,7 +532,11 @@ mod tests {
             !enemy.visible,
             "the map is clear but a living teammate is standing in the line"
         );
-        assert_eq!(w.visible_enemies().count(), 0, "so there is nothing to shoot");
+        assert_eq!(
+            w.visible_enemies().count(),
+            0,
+            "so there is nothing to shoot"
+        );
 
         // Step the teammate aside and the shot is back on.
         d.entities[0] = player_entity(2, [200.0, 80.0, 0.0]);
@@ -525,7 +570,8 @@ mod tests {
         d.game.apply("TeamInfo", &team_info(2, "CT"));
         d.game.apply("TeamInfo", &team_info(3, "CT"));
         let mut cd = crate::world::ClientData::default();
-        cd.fields.insert("health".into(), proto::delta::Value::Float(100.0));
+        cd.fields
+            .insert("health".into(), proto::delta::Value::Float(100.0));
         d.clientdata = Some(cd);
         d.entities = vec![
             player_entity(2, [200.0, 0.0, 0.0]),
@@ -614,7 +660,10 @@ mod tests {
             }
         }
         assert!(checked > 10_000, "only checked {checked} lines");
-        assert!(blocking > 100, "only {blocking} of {checked} lines actually blocked");
+        assert!(
+            blocking > 100,
+            "only {blocking} of {checked} lines actually blocked"
+        );
     }
 
     /// Neither endpoint may block itself, or a bot can never shoot at all.
@@ -622,8 +671,14 @@ mod tests {
     fn the_shooter_and_the_target_do_not_block_their_own_line() {
         let from = [0.0, 0.0, 0.0];
         let to = [500.0, 0.0, 0.0];
-        assert!(!blocks_line(from, false, from, to), "the shooter blocked itself");
-        assert!(!blocks_line(to, false, from, to), "the target blocked itself");
+        assert!(
+            !blocks_line(from, false, from, to),
+            "the shooter blocked itself"
+        );
+        assert!(
+            !blocks_line(to, false, from, to),
+            "the target blocked itself"
+        );
     }
 
     #[test]

@@ -1,7 +1,4 @@
-//! ULZ decompression — the codec YaPB graph payloads are stored with.
-//!
-//! Port of `ulzUncompress` (`0x1406F7DA0`). The token layout was read
-//! directly out of the disassembly:
+//! ULZ decompression — codec for compressed waypoint graph payloads.
 //!
 //! | instruction | meaning |
 //! |---|---|
