@@ -145,3 +145,83 @@ amplitude).
   loudness right now; the sound index is captured but not yet mapped to the
   precache list, which is what would let a bot treat a reload differently from
   a shot.
+
+---
+
+# Part two: they were never camping at all
+
+Reported after the shake was fixed: *"when they camp they are looking at a wall,
+not from where the players can come"*, and *"each time it goes mid and tries to
+go to A ... it is doing loops"*.
+
+Both turned out to be the same bug, and it is not a looking bug.
+
+## What the sight lines were
+
+`nav::watch` originally returned **the farthest walkable node with a clear line
+of sight in each direction**. On the de_dust2 sites that is a fan of four
+directions all round the room, most of which no attacker ever uses:
+
+```text
+site centre, old selection:  -99 deg 900u   147 deg 649u   -155 deg 606u   -57 deg 249u
+same spot, now:             -110 deg 306u   -72 deg 557u
+```
+
+The two it gives now are the tunnel mouth and the door. The rule changed from
+"what can I see" to **"where does an attacker coming from their spawn first come
+into view"**: route from the enemy spawn to the spot, walk that route back out,
+and keep the far end of the unbroken run of nodes still visible from here. Force
+a different route (charge the nodes already used) and repeat. `cargo run -p
+client --example watch_points` prints both selections side by side for any map.
+
+Two details that cost a measurement each:
+
+* The point where a route *enters* a site is usually **not visible** from inside
+  it, so watching that is watching the wall in front of it.
+* Taking the farthest visible node on the route rather than the end of the
+  unbroken visible run picks a spot past a wall where the attacker flickers in
+  and out — measured, that put a watch point 121 degrees off the route.
+
+## Why it looked like a wall
+
+The bots were **never holding a position at all**. Measured across six bots and
+ten minutes: not one sample ever reached the holding branch.
+
+The camp task walks to a defend point the caller picks 300–1700 units away.
+Walking there took the bot outside the *objective's* arrival radius, so
+`arrived` went false, the camp task stopped being ticked, the route pulled it
+back to the objective, it arrived, and it set off again — the loop that was
+reported as "it goes mid, then tries to go to A, in circles". The straight-line
+walk also had no route behind it, so anything in the way was a wall to grind
+into. What looked like camping was a bot mid-reposition, aiming at a floor point
+several hundred units away with geometry in between.
+
+Four changes, each with its own measurement:
+
+| change | before | after |
+| --- | --- | --- |
+| The camp spot is the destination while a task exists (and is published as `nav_goal`, so the caller **routes** there) | `to_spot` median 613 u, never arrives | median **186 u**, arrived in **40%** of samples |
+| Give-up budget scaled to the walk, not a flat 6 s | expired on every task | tasks survive to the hold |
+| Sight lines refreshed every tick, not snapshotted at task creation | a third of camp samples had none | **0%** have none |
+| Sound threshold 0.12 → 0.38 plus a 2.2 s glance cooldown | **every** holding sample had the head on a sound | glancing on 15% of holding samples |
+
+Result, with all four in: a holding bot is within 20° of a real entrance in
+**47%** of samples (median 28°), and the rest are mostly mid-swing between two
+angles — a player crossing from one angle to the other is also "off both".
+Walking bots read 60° off, which is correct: they look where they are going.
+
+## One thing tried and reverted
+
+Watching the entrances *while walking* to the spot. It reads well and it broke
+the walking: the movement code stops the body when the head is more than
+`TURN_STOP_ANGLE` off the direction of travel, so a crosshair parked on a
+doorway 90 degrees away froze the bot in place. The revert is commented at the
+call site so it is not tried again.
+
+## Still open
+
+- The hold is short (`camp_hold()` is 5–12 s scaled by fear) and the bot then
+  hunts. Whether a defender should hold longer is a design question, not a bug.
+- `sight_lines` (the old "what can I see" selection) is kept as the fallback for
+  spots with no route to work from. It is the wrong answer, just better than no
+  answer.

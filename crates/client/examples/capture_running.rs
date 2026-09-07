@@ -595,8 +595,32 @@ fn main() {
                             .as_ref()
                             .map(|x| (x.look_reversals, x.look_dwell))
                             .unwrap_or((0.0, 0.0));
+                        let (lines, off, held, holding, to_spot, give_up, glancing) = session
+                            .last_decision
+                            .as_ref()
+                            .map(|x| {
+                                (
+                                    x.watch_lines,
+                                    x.watch_off,
+                                    x.camp_watch,
+                                    x.camp_holding,
+                                    x.camp_to_spot,
+                                    x.camp_give_up,
+                                    x.glancing,
+                                )
+                            })
+                            .unwrap_or((0, -1.0, 0, false, -1.0, -1.0, false));
+                        let aim = if off < 0.0 {
+                            "no sight lines".to_string()
+                        } else {
+                            format!(
+                                "{lines} lines (brain has {held}{}), aim {off:.0} deg off nearest                                  | camp to_spot {to_spot:.0} give_up {give_up:.1}s{}",
+                                if glancing { " GLANCING" } else { "" },
+                                if holding { ", HOLDING" } else { ", walking" }
+                            )
+                        };
                         eprintln!(
-                            "      look: reversals/s {rev:.2} dwell {dwell:.1}s |                              heard {} loudest {loudest:.2}",
+                            "      look: reversals/s {rev:.2} dwell {dwell:.1}s | heard {} loudest {loudest:.2} | {aim}",
                             heard.len()
                         );
                     }

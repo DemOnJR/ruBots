@@ -99,6 +99,10 @@ pub struct Fleet {
     pub bots: HashMap<String, BotState>,
     /// Map name, silhouette and projection, loaded from the first packet.
     pub map: Option<(String, RadarBackground, Projection)>,
+    /// The loaded map itself, kept so the shell can answer questions the
+    /// telemetry packet does not carry -- what a bot at this spot ought to be
+    /// watching, for one. Roughly the size of the .bsp, once.
+    pub map_data: Option<client::map::Map>,
     /// A map the loader has already failed on, so it is not retried per packet.
     map_failed: Option<String>,
     pub packets: u64,
@@ -114,6 +118,7 @@ impl Fleet {
         Self {
             bots: HashMap::new(),
             map: None,
+            map_data: None,
             map_failed: None,
             packets: 0,
             team_packets: 0,
@@ -265,6 +270,7 @@ impl Fleet {
                 let bg = RadarBackground::from_grid(&map.grid);
                 let proj = Projection::from_grid(&map.grid);
                 self.map = Some((name.to_string(), bg, proj));
+                self.map_data = Some(map);
             }
             None => self.map_failed = Some(name.to_string()),
         }

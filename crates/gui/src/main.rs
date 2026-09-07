@@ -128,7 +128,15 @@ pub struct RadarState {
     pub show_ladders: bool,
     pub show_falls: bool,
     pub show_goals: bool,
+    /// Draw what the selected bot ought to be watching, from the map.
+    pub show_watch: bool,
     pub stuck_only: bool,
+    /// Cached sight lines: which bot, where it was, and what came back.
+    ///
+    /// The answer costs four route searches and a trace per node, so it is
+    /// computed once per selection and reused until the bot has moved a
+    /// meaningful distance.
+    pub watch_cache: Option<(String, [f32; 3], Vec<[f32; 3]>)>,
     /// Seconds behind live; 0 = live.
     pub replay: f32,
     pub playing: bool,
@@ -153,7 +161,9 @@ impl Default for RadarState {
             show_ladders: true,
             show_falls: true,
             show_goals: true,
+            show_watch: true,
             stuck_only: false,
+            watch_cache: None,
             replay: 0.0,
             playing: false,
             last_step: Instant::now(),
@@ -695,6 +705,23 @@ impl App {
         for (i, key) in keys.iter().enumerate() {
             if ctx.input(|input| input.key_pressed(*key)) {
                 self.view = View::ALL[i];
+            }
+        }
+        // Tab cycles the selection. Clicking a 7-pixel square on a radar is
+        // fine with a mouse and impossible from a script, and inspecting one
+        // bot after another is the most common thing to want here.
+        if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            let names = self.fleet.names();
+            if !names.is_empty() {
+                let next = match &self.selected {
+                    Some(cur) => names
+                        .iter()
+                        .position(|n| n == cur)
+                        .map(|i| (i + 1) % names.len())
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                self.selected = Some(names[next].clone());
             }
         }
     }
