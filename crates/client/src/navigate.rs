@@ -176,6 +176,11 @@ pub struct PathFollower {
     worn: std::collections::HashMap<usize, u32>,
     /// Origin of the last replan start — opening-angle bias is measured from here.
     open_from: Option<[f32; 3]>,
+    /// Set when the current route cannot be continued from where the body is:
+    /// the waypoint is on another floor, or the obstacle in front of it is
+    /// taller than a player can jump. Either way the next tick replans from
+    /// here instead of steering at a point it cannot reach.
+    force_replan: bool,
 }
 
 /// What to add to the steering while blocked.
@@ -201,6 +206,23 @@ fn dist2d(a: [f32; 3], b: [f32; 3]) -> f32 {
     let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
     (dx * dx + dy * dy).sqrt()
 }
+
+/// Vertical slack allowed when calling a waypoint reached.
+///
+/// Arrival was judged in two dimensions only, which is the whole of the
+/// multi-level problem: on de_dust2 a bot in the tunnel under A is within a
+/// wide node's radius of the platform node 108 units above it, so it counted
+/// that node reached, advanced the path, and then steered at the *next*
+/// platform waypoint from underneath — walking into the wall it could not see
+/// past. Planning already refuses to snap across floors
+/// (`nav::route::nearest_prefer_z`); this is the same rule at arrival.
+///
+/// The bound is what a legitimate in-progress hop can be worth: one jump
+/// (`MAX_JUMP` 44) plus one step (`STEP_SIZE` 18). A ladder hop is 32, a
+/// jump-up is at most 44, and a fall's target node is below — the bot only
+/// reaches it after landing. Two stacked floors are always further apart than
+/// this: a standing player is 72 tall.
+pub const ARRIVE_Z: f32 = nav::navgrid::MAX_JUMP + nav::navgrid::STEP_SIZE;
 
 /// How close to a waypoint counts as having reached it.
 ///
@@ -271,6 +293,7 @@ impl PathFollower {
             reroll_timer: 0.3,
             worn: std::collections::HashMap::new(),
             open_from: None,
+            force_replan: false,
             origin_stuck_timer: 0.0,
             origin_stuck_at: None,
             origin_stuck_warns: 0,
@@ -474,6 +497,20 @@ impl PathFollower {
         grid.move_between(from, to)
     }
 
+    /// Tell the follower that what is in front of it cannot be climbed.
+    ///
+    /// The session measures the obstacle with the engine's own hulls
+    /// ([`nav::ahead`]) before it presses jump. When the answer is "no height
+    /// gets you over this", repeating the jump is the loop this exists to
+    /// break: charge the waypoint that led here and route round it instead.
+    pub fn blocked_ahead(&mut self) {
+        if let Some(&node) = self.path.get(self.at) {
+            *self.blocked.entry(node).or_insert(0) += 2;
+        }
+        self.force_replan = true;
+        self.unstick_for = 0.0;
+    }
+
     /// Steering to add while blocked, if anything.
     ///
     /// Escalates rather than repeating one trick: strafe first, then strafe
@@ -543,6 +580,23 @@ impl PathFollower {
         }
 
         let mut target = self.current_target(grid, from, goal);
+
+        // Standing under (or over) the waypoint: the route was planned from a
+        // node on another floor, so nothing on it is walkable from here. Plan
+        // again from where the body actually is, charging the waypoint that
+        // cannot be reached from this level so A* looks for the stairs.
+        if self.force_replan {
+            self.force_replan = false;
+            if let Some(&node) = self.path.get(self.at) {
+                *self.blocked.entry(node).or_insert(0) += 2;
+            }
+            self.reroutes += 1;
+            self.replan(grid, from, goal);
+            self.no_progress_for = 0.0;
+            self.unstick_for = 0.0;
+            target = self.current_target(grid, from, goal);
+        }
+
         self.watch(target, from);
 
         match target {
@@ -654,6 +708,14 @@ impl PathFollower {
             // Measured against the point actually being steered at, not the
             // node centre.
             if dist2d(from, point) <= arrive_radius(grid, node) {
+                // ... but only if we are on its floor. Being underneath a
+                // waypoint is not being at it, and advancing past one from the
+                // wrong level is what leaves a bot grinding into the geometry
+                // below a platform with a valid-looking route.
+                if (from[2] - point[2]).abs() > ARRIVE_Z {
+                    self.force_replan = true;
+                    return Some(point);
+                }
                 self.at += 1;
                 self.steer = None;
                 // Plan W6: a node advance is a new hop, so the brain's
@@ -663,7 +725,7 @@ impl PathFollower {
                 return Some(point);
             }
         }
-        if dist2d(from, goal) > ARRIVE_RADIUS {
+        if dist2d(from, goal) > ARRIVE_RADIUS || (from[2] - goal[2]).abs() > ARRIVE_Z {
             Some(goal)
         } else {
             None
@@ -1017,6 +1079,59 @@ mod tests {
         assert!(signs.len() == 2, "weave never changed direction: {signs:?}");
         // The micro-pause dice fired at least once in 200 ticks (2% chance).
         assert!(pauses >= 0, "pause counter is a lower bound only");
+    }
+
+    /// Arrival is judged on the bot's floor, not only on the map's x/y.
+    ///
+    /// The failure this pins: standing in the tunnel under A, the platform
+    /// node overhead is well inside a wide node's arrival radius in two
+    /// dimensions. Before the z gate the follower counted it reached and
+    /// advanced, so the bot then steered at the *next* platform waypoint from
+    /// underneath and ground into the wall with a route it believed in.
+    #[test]
+    fn a_waypoint_on_another_floor_is_not_reached_by_standing_under_it() {
+        let Some(map) = dust2() else {
+            eprintln!("SKIP: de_dust2.bsp not present");
+            return;
+        };
+        // Find a genuinely stacked pair: two nodes within a node's radius in
+        // x/y and more than two floors apart in z.
+        let grid = &map.grid;
+        let mut stacked = None;
+        'outer: for a in 0..grid.nodes.len() {
+            let oa = grid.origin(a);
+            for b in (a + 1)..grid.nodes.len() {
+                let ob = grid.origin(b);
+                if dist2d(oa, ob) <= 24.0 && (oa[2] - ob[2]).abs() > 100.0 {
+                    stacked = Some(if oa[2] < ob[2] { (a, b) } else { (b, a) });
+                    break 'outer;
+                }
+            }
+        }
+        let Some((low, high)) = stacked else {
+            eprintln!("SKIP: no stacked columns in this lattice");
+            return;
+        };
+        let (low_o, high_o) = (grid.origin(low), grid.origin(high));
+
+        let mut f = PathFollower::new();
+        f.path = vec![high];
+        f.at = 0;
+        f.goal = Some(high_o);
+        let target = f.current_target(grid, low_o, high_o);
+
+        assert_eq!(f.at, 0, "advanced past a waypoint on another floor");
+        assert!(f.force_replan, "the wrong-floor flag should be raised");
+        assert!(target.is_some(), "still steering at something");
+
+        // Standing on the node's own floor, the same waypoint is reached.
+        let mut g = PathFollower::new();
+        g.path = vec![high];
+        g.at = 0;
+        g.goal = Some(high_o);
+        g.current_target(grid, high_o, high_o);
+        assert_eq!(g.at, 1, "a waypoint underfoot is reached");
+        assert!(!g.force_replan);
     }
 
     #[test]

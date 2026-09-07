@@ -171,6 +171,18 @@ pub struct Session {
     /// The loaded map: collision, entities and the navigation graph.
     pub map: Option<crate::map::Map>,
     follower: crate::navigate::PathFollower,
+    /// How many times a jump was refused because nothing could clear what was
+    /// in front. A bot with a climbing count is being routed into geometry it
+    /// cannot pass, which is a graph problem and not a steering one.
+    pub refused_jumps: u32,
+    /// Rate limit for the diagnostic line that reports those refusals.
+    last_refusal_log: Option<Instant>,
+    /// Last obstacle probe: where it was taken, when, and what it said.
+    ///
+    /// The sweep is a few dozen hull traces, so it is cached rather than run
+    /// every tick while a bot is scraping: the geometry in front of a body
+    /// that has not moved does not change.
+    ahead_probe: Option<([f32; 3], f32, Instant, nav::ahead::Ahead)>,
     /// Where we were last frame, and when. `clientdata_t` does NOT carry
     /// velocity -- the server omits it because a predicting client computes
     /// its own -- so real speed has to be measured from successive origins.
@@ -300,6 +312,9 @@ impl Session {
             rotate_events: 0,
             rotate_cooldown: 0.0,
             map: None,
+            refused_jumps: 0,
+            last_refusal_log: None,
+            ahead_probe: None,
             follower: crate::navigate::PathFollower::new(), // re-seeded by set_seed
             last_origin: None,
             last_speed: 0.0,
@@ -1636,7 +1651,40 @@ impl Session {
                 if u.yaw_bias.abs() > 0.0 {
                     intent.forwardmove = 0.0;
                 }
-                intent.jump |= u.jump;
+                // Know what is being jumped at. The unstick's jump used to
+                // be a timer with no idea what was in front of it, so a bot
+                // pressed against a 96-unit wall hopped at it until the round
+                // ended -- measured on de_dust2: ~50 s inside a 150-unit box
+                // with the reroute counter past 30. Measure the lip with the
+                // engine's own hulls instead: jump only at a height a player
+                // can reach, duck when the height needs it, and when nothing
+                // clears it say so, so the route goes round.
+                if u.jump {
+                    match self.obstacle_ahead(world.me.origin, intent.view.yaw) {
+                        Some(a) if a.wants_jump() => {
+                            intent.jump = true;
+                            intent.duck |= a.wants_duck();
+                        }
+                        Some(a) if a.impassable() => {
+                            self.refused_jumps += 1;
+                            let due = self
+                                .last_refusal_log
+                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                            if due {
+                                self.last_refusal_log = Some(Instant::now());
+                                eprintln!(
+                                    "      ahead: {a:?} at yaw {:.0} - nothing clears it, routing round instead of jumping (refused {})",
+                                    intent.view.yaw, self.refused_jumps
+                                );
+                            }
+                            self.follower.blocked_ahead();
+                        }
+                        Some(_) => {}
+                        // No map loaded: nothing to ask, so keep the old
+                        // behaviour rather than never jumping at all.
+                        None => intent.jump = true,
+                    }
+                }
                 intent.view.yaw =
                     bot::math::norm_angle(f64::from(intent.view.yaw + u.yaw_bias)) as f32;
             }
@@ -1792,6 +1840,38 @@ impl Session {
     /// client with prediction on computes its own velocity, so the server
     /// saves the bits. Trusting the absent field means reading zero, which
     /// makes a bot sprinting across the map look permanently stuck.
+    /// What is in front of the bot, measured against the engine's own hulls.
+    ///
+    /// `None` when no map is loaded, which is the honest answer rather than a
+    /// guess: without collision there is nothing to measure, and the caller
+    /// falls back to the old behaviour instead of refusing to jump at all.
+    ///
+    /// Re-probed when the bot has moved half a hull width, turned, or a
+    /// quarter of a second has passed; a body wedged in one place gets the
+    /// same answer every tick and does not need the traces repeated.
+    fn obstacle_ahead(&mut self, origin: [f32; 3], yaw: f32) -> Option<nav::ahead::Ahead> {
+        const RE_PROBE_AFTER: Duration = Duration::from_millis(250);
+        const RE_PROBE_DIST: f32 = 16.0;
+        const RE_PROBE_YAW: f32 = 20.0;
+
+        if let Some((at, was_yaw, when, verdict)) = self.ahead_probe {
+            let moved = {
+                let (dx, dy, dz) = (origin[0] - at[0], origin[1] - at[1], origin[2] - at[2]);
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            };
+            let turned = bot::math::norm_angle(f64::from(yaw - was_yaw)).abs() as f32;
+            if moved < RE_PROBE_DIST && turned < RE_PROBE_YAW && when.elapsed() < RE_PROBE_AFTER {
+                return Some(verdict);
+            }
+        }
+
+        let map = self.map.as_ref()?;
+        let world = nav::navgrid::World::new(&map.bsp, &map.info);
+        let verdict = nav::ahead::ahead(&world, origin, yaw, nav::ahead::PROBE_REACH);
+        self.ahead_probe = Some((origin, yaw, Instant::now(), verdict));
+        Some(verdict)
+    }
+
     fn measured_speed(&mut self, origin: [f32; 3], now: Instant) -> f32 {
         let speed = match self.last_origin {
             Some((prev, at)) => {

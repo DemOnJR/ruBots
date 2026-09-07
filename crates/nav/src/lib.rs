@@ -3,6 +3,7 @@
 //! Handles waypoint graphs (`.graph`), collision hull navigation grids,
 //! A* route generation, and line-of-sight raytracing.
 
+pub mod ahead;
 pub mod bsp;
 pub mod entities;
 pub mod graph;
