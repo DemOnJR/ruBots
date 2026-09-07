@@ -151,6 +151,30 @@ pub struct Decision {
     pub to_goal: f32,
     /// Which rung of the brain's ladder decided this tick.
     pub rung: &'static str,
+    /// How many sight lines the map offers for where the bot is standing.
+    pub watch_lines: u8,
+    /// How many the brain is actually holding on its camp task.
+    ///
+    /// Kept separate from `watch_lines` on purpose: the two disagreeing is
+    /// exactly the failure where the map knows the ways in and the bot is
+    /// still sweeping an arbitrary arc, and one number cannot show that.
+    pub camp_watch: u8,
+    /// Whether the camp task is holding rather than walking to its spot.
+    pub camp_holding: bool,
+    /// True while a sound has the crosshair, so `watch_off` is measuring
+    /// against the wrong thing on purpose and should be read separately.
+    pub glancing: bool,
+    /// Distance still to walk to the camp spot, and the seconds left before
+    /// the task gives up trying to get there. A bot that never holds is
+    /// either never arriving or never giving up, and these say which.
+    pub camp_to_spot: f32,
+    pub camp_give_up: f32,
+    /// Smallest angle, in degrees, between the sent view and any of them.
+    ///
+    /// The end-to-end check on the look model: a holding bot should be a few
+    /// degrees off one of the ways in, not ninety off all of them. `-1` means
+    /// there was nothing to compare against.
+    pub watch_off: f32,
     /// Yaw direction changes per second in the view actually sent.
     pub look_reversals: f32,
     /// Longest run, in seconds, with the sent yaw parked.
@@ -1823,6 +1847,34 @@ impl Session {
             })
             .unwrap_or(f32::NAN);
         self.view_stats.note(intent.view.yaw, dt);
+        // How far the crosshair is from the nearest way in. Measured against
+        // the same points the brain was handed, so the number answers "did the
+        // look model use them" and not "were they any good".
+        let (watch_lines, watch_off) = {
+            let here = world.me.origin;
+            // Measure against the points the BRAIN is using, falling back to
+            // the map's answer when it has none. Comparing against a freshly
+            // computed set instead was measuring the diagnostic, not the bot:
+            // the two are computed from different origins and disagreed by
+            // tens of degrees while the bot was aiming perfectly correctly.
+            let brain_watch = self
+                .brain
+                .as_ref()
+                .and_then(|b| b.post_arrival.as_ref())
+                .map(|t| t.watch);
+            let lines = brain_watch.unwrap_or_else(|| self.watch_points());
+            let mut best = -1.0f32;
+            let mut count = 0u8;
+            for p in lines.iter().flatten() {
+                count += 1;
+                let want = (p[1] - here[1]).atan2(p[0] - here[0]).to_degrees();
+                let off = bot::math::norm_angle(f64::from(want - intent.view.yaw)).abs() as f32;
+                if best < 0.0 || off < best {
+                    best = off;
+                }
+            }
+            (count, best)
+        };
         self.last_decision = Some(Decision {
             alive: world.me.alive,
             in_game: world.me.freeze_period,
@@ -1842,6 +1894,35 @@ impl Session {
             arming: self.brain.as_ref().is_some_and(|b| b.plant.is_arming()),
             to_goal,
             rung: self.brain.as_ref().map_or("none", |b| b.rung),
+            watch_lines,
+            watch_off,
+            camp_watch: self
+                .brain
+                .as_ref()
+                .and_then(|b| b.post_arrival.as_ref())
+                .map_or(0, |t| t.watch.iter().flatten().count() as u8),
+            camp_holding: self
+                .brain
+                .as_ref()
+                .and_then(|b| b.post_arrival.as_ref())
+                .is_some_and(|t| !t.moving),
+            glancing: self
+                .brain
+                .as_ref()
+                .is_some_and(|b| b.glancing_at_a_sound()),
+            camp_to_spot: self
+                .brain
+                .as_ref()
+                .and_then(|b| b.post_arrival.as_ref())
+                .map_or(-1.0, |t| {
+                    let (dx, dy) = (t.spot[0] - world.me.origin[0], t.spot[1] - world.me.origin[1]);
+                    (dx * dx + dy * dy).sqrt()
+                }),
+            camp_give_up: self
+                .brain
+                .as_ref()
+                .and_then(|b| b.post_arrival.as_ref())
+                .map_or(-1.0, |t| t.give_up_after),
             look_reversals: self.view_stats.reversals_per_sec(),
             look_dwell: self.view_stats.longest_dwell(),
             escort: self
@@ -1967,10 +2048,25 @@ impl Session {
             return empty;
         };
         let world = nav::navgrid::World::new(&map.bsp, &map.info);
+        // Whose spawns matter depends on which side we are on: a defender
+        // watches the ways in from the OTHER team's half. Getting this
+        // backwards would have a bot watch its own reinforcements arrive.
+        let enemy_spawns: &[[f32; 3]] = match self
+            .decoder
+            .as_ref()
+            .map(|d| d.game.my_team())
+        {
+            Some(crate::usermsg::Team::CounterTerrorist) => &map.info.t_spawns,
+            Some(crate::usermsg::Team::Terrorist) => &map.info.ct_spawns,
+            // Not on a team yet: the T spawns are the useful default, since
+            // that is who attacks a bomb site.
+            _ => &map.info.t_spawns,
+        };
         let found = nav::watch::watch_points(
             &map.grid,
             &world,
             spot,
+            enemy_spawns,
             nav::watch::DEFAULT_RADIUS,
             bot::controller::MAX_WATCH,
         );

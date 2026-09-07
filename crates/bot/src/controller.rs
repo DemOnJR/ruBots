@@ -212,6 +212,14 @@ fn lerp_vec(a: Vec3, b: Vec3, t: f32) -> Vec3 {
 ///
 /// An `Option<Vec3>` still converts into this as a goal with no waypoint, which
 /// is the right reading for a caller that has no navigation layer.
+/// How far a bot will walk to take up a suggested defending position.
+///
+/// Beyond this it holds where it arrived instead. The defend point is chosen
+/// from the nav grid around the objective and can be most of a site away; the
+/// walk to it is a straight line, not a route, so a distant one is a walk into
+/// the nearest wall rather than a reposition.
+pub const MAX_REPOSITION: f32 = 650.0;
+
 /// The closest a look target may be before its bearing stops meaning anything.
 ///
 /// `aim_angles(origin, target)` is a bearing, and the bearing to a point you
@@ -358,6 +366,16 @@ pub struct CampTask {
 
 impl CampTask {
     /// How long a hold lasts for this bot, scaled by its fear.
+    /// Seconds allowed per unit of walk, plus a fixed grace.
+    ///
+    /// `WALK_SPEED` is the pace this task moves at; the factor is slack for
+    /// the fact that the walk is a straight line at a spot the route did not
+    /// plan, so it will not be the shortest path.
+    fn budget(from: Vec3, spot: Vec3) -> f32 {
+        let d = distance2d(from, spot);
+        (2.0 + d / WALK_SPEED * 2.5).clamp(2.0, 20.0)
+    }
+
     pub fn new(spot: Vec3, sweep_a: Vec3, sweep_b: Vec3, hold: f32) -> Self {
         Self {
             spot,
@@ -368,7 +386,14 @@ impl CampTask {
             watch: [None; MAX_WATCH],
             held: None,
             moving: true,
-            give_up_after: 6.0,
+            // Sized to the walk, not a constant. Six seconds flat meant a
+            // defend point 400 units away was already hopeless and one 1700
+            // units away was farce -- measured live, `to_spot` ran 426 to 1737
+            // with a 2 s budget left, so the task ALWAYS expired and the bot
+            // never held a position at all. It spent its time walking at a
+            // spot it could not reach, staring at it through whatever wall was
+            // in between, which is what "they camp looking at a wall" was.
+            give_up_after: 0.0,
         }
     }
 }
@@ -731,6 +756,11 @@ impl Controller {
         };
     }
 
+    /// True while a sound has the crosshair rather than the sweep.
+    pub fn glancing_at_a_sound(&self) -> bool {
+        self.look.distracted()
+    }
+
     /// How long this bot holds a camp/defend spot, scaled by fear.
     fn camp_hold(&mut self) -> f32 {
         let base = self.rng.range(5.0, 12.0) as f32;
@@ -778,6 +808,15 @@ impl Controller {
             // Walk to the defend spot, looking at it. Slow and careful: this
             // is a post-arrival reposition, not a route hop, so WALK_SPEED.
             task.give_up_after -= dt;
+            // Look where you are going, not at the ways in.
+            //
+            // Watching the entrances during the walk was tried and reverted:
+            // the branch below stops the body when the head is more than
+            // TURN_STOP_ANGLE off the direction of travel, so a crosshair
+            // parked on a doorway ninety degrees away froze the bot on the
+            // spot -- it then never arrived, never held, and stood there with
+            // its head turned. The entrances are watched once the hold starts,
+            // which is where a defender watches them from anyway.
             let look_angles = aim_angles(world.me.origin, task.spot);
             self.aim_at_guarded(look_angles, NAV_GAINS, dt, f64::from(look_angles.yaw));
             self.rung = "camp";
@@ -1378,7 +1417,35 @@ impl Controller {
         // map objective. Hunt goals must win the arrival test too, or a bot
         // that set nav_goal after camping still measures "arrived" at the
         // old site and never leaves (live: endless `roam` at to_goal ~0).
-        if let Some(t) = self.objective.target.or(self.nav_goal).or(nav.goal) {
+        // While a camp task exists, IT is the destination -- not the objective.
+        //
+        // This is the loop that was reported as "each time it goes mid and
+        // tries to go to A, in circles". The bot arrived at the site, started
+        // a camp task with a defend point a few hundred units away, and walked
+        // at it; walking there took it outside the objective's arrival radius,
+        // so `arrived` went false, the camp task stopped being ticked, the
+        // route pulled it back to the site, it arrived, and it set off again.
+        // Measured across ten minutes and six bots, not one of them ever
+        // reached the holding branch.
+        //
+        // Publishing the spot as `nav_goal` while still walking makes the
+        // caller ROUTE there (it outranks the objective for the router, see
+        // `session.rs`), so the walk goes round walls instead of into them --
+        // the other half of "ruBot01 is stuck on that wall".
+        let camp_spot = self.post_arrival.as_ref().map(|c| c.spot);
+        if let Some(spot) = self
+            .post_arrival
+            .as_ref()
+            .filter(|c| c.moving)
+            .map(|c| c.spot)
+        {
+            self.nav_goal = Some(spot);
+        }
+        if let Some(t) = camp_spot
+            .or(self.objective.target)
+            .or(self.nav_goal)
+            .or(nav.goal)
+        {
             // A bomb site is a room, not a point. Once the route is exhausted
             // (no waypoint left, steering straight at the goal) the goal point
             // may sit inside a brush the bot cannot stand in -- so being
@@ -1441,27 +1508,40 @@ impl Controller {
                         let look = world.bomb.origin.unwrap_or(t);
                         let hold = self.camp_hold() * 1.5;
                         let mut camp = CampTask::new(t, look, t, hold);
+                        camp.give_up_after = CampTask::budget(world.me.origin, t);
                         camp.watch = nav.watch_points;
                         self.post_arrival = Some(camp);
-                    } else if let Some(defend) = nav.defend_point {
-                        // If this exact spot already failed us (unreachable),
-                        // do not grind toward it again -- roam instead.
-                        if self
-                            .failed_defend
-                            .map_or(true, |f| distance2d(f, defend) > 40.0)
-                        {
-                            // Sweep between the defend spot and a point slightly
-                            // back toward the goal, so the view moves during the
-                            // hold.
-                            let back = lerp_vec(defend, t, 0.3);
-                            let hold = self.camp_hold();
-                            let mut camp = CampTask::new(defend, defend, back, hold);
-                            camp.watch = nav.watch_points;
-                            self.post_arrival = Some(camp);
-                        }
+                    } else if let Some(defend) = nav.defend_point.filter(|d| {
+                        // Not one that has already defeated us, and not one so
+                        // far off that the walk is the whole hold: the walk is
+                        // a straight line, not a route, so distance is the
+                        // honest limit on it. Measured live before this filter,
+                        // `to_spot` ran 426 to 1737 units against a flat six
+                        // second budget, so the task always expired.
+                        distance2d(world.me.origin, *d) <= MAX_REPOSITION
+                            && self
+                                .failed_defend
+                                .map_or(true, |f| distance2d(f, *d) > 40.0)
+                    }) {
+                        let back = lerp_vec(defend, t, 0.3);
+                        let hold = self.camp_hold();
+                        let mut camp = CampTask::new(defend, defend, back, hold);
+                        camp.give_up_after = CampTask::budget(world.me.origin, defend);
+                        camp.watch = nav.watch_points;
+                        self.post_arrival = Some(camp);
                     }
                 }
                 if let Some(mut task) = self.post_arrival.take() {
+                    // Refresh the sight lines from the caller every tick rather
+                    // than keeping the snapshot taken when the task started.
+                    // A task created on the tick the bot arrived can predate
+                    // the defend point being known, and then it holds an empty
+                    // list for its whole life -- measured live: a third of camp
+                    // samples had the map offering two ways in and the brain
+                    // holding none, so those bots swept the arbitrary arc.
+                    if nav.watch_points.iter().any(Option::is_some) {
+                        task.watch = nav.watch_points;
+                    }
                     let mut intent = self.camp_tick(&mut task, world, dt);
                     if task.give_up_after <= 0.0 && task.moving {
                         // The spot was unreachable: remember it so the next
@@ -1481,6 +1561,7 @@ impl Controller {
                         let look = world.bomb.origin.unwrap_or(t);
                         let hold = self.camp_hold() * 1.5;
                         let mut camp = CampTask::new(t, look, t, hold);
+                        camp.give_up_after = CampTask::budget(world.me.origin, t);
                         camp.watch = nav.watch_points;
                         self.post_arrival = Some(camp);
                     } else {

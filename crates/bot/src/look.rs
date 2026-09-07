@@ -56,7 +56,20 @@ pub const INTEREST_MIN: f32 = 1.1;
 pub const INTEREST_MAX: f32 = 2.6;
 
 /// Below this urgency a sound is not worth turning for — distant, or stale.
-pub const HEAR_THRESHOLD: f32 = 0.12;
+///
+/// It was 0.12, which on a live server is "anything at all": measured over a
+/// ten-minute run, **every single sample of a bot holding a position had a
+/// sound above the old threshold**, so the head was permanently on the last
+/// noise and never on the angles the bot was supposed to be watching. A player
+/// glances at nearby gunfire; they do not abandon their crosshair for every
+/// shot on the map.
+pub const HEAR_THRESHOLD: f32 = 0.38;
+
+/// Least time between two sound glances.
+///
+/// Without it a firefight is a continuous stream of sounds each just louder
+/// than the last, and the head never returns to the sweep at all.
+pub const GLANCE_COOLDOWN: f32 = 2.2;
 
 /// A sound the bot has decided to look at.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,6 +93,8 @@ pub struct Scan {
     /// Seconds left on this dwell.
     dwell_left: f32,
     interest: Option<Interest>,
+    /// Seconds until another sound may take the head.
+    cooldown: f32,
     rng: Rng,
 }
 
@@ -95,6 +110,7 @@ impl Scan {
             at: 0,
             dwell_left: 0.0,
             interest: None,
+            cooldown: 0.0,
             rng: Rng::new(seed ^ 0x5CA1_AB1E),
         }
     }
@@ -105,14 +121,21 @@ impl Scan {
     /// rather than resetting, so re-supplying the same points mid-hold does
     /// not snap the head back to the first one.
     pub fn watch(&mut self, points: &[Vec3]) {
-        let changed = self.watch != points;
+        // Only a change in HOW MANY points restarts the look. The caller
+        // refreshes this every tick, and the points drift by a unit or two as
+        // the defend point is re-picked; treating that as new would zero the
+        // dwell on every tick, so the head would advance to the next target
+        // every frame and never settle on any of them. Measured live, that
+        // left a bot a median 45 degrees off the nearest of its own sight
+        // lines -- permanently in transit between two of them.
+        let resize = self.watch.len() != points.len();
         self.watch = points.to_vec();
         if self.watch.is_empty() {
             self.at = 0;
             return;
         }
-        if changed {
-            self.at %= self.watch.len();
+        self.at %= self.watch.len();
+        if resize {
             self.dwell_left = 0.0;
         }
     }
@@ -131,7 +154,7 @@ impl Scan {
     /// `urgency` is [`crate::world::Heard::urgency`]: loudness already
     /// discounted by age.
     pub fn hear(&mut self, point: Vec3, urgency: f32) {
-        if urgency < HEAR_THRESHOLD {
+        if urgency < HEAR_THRESHOLD || self.cooldown > 0.0 {
             return;
         }
         // Do not re-trigger on the same noise, but do let a louder one take
@@ -155,6 +178,7 @@ impl Scan {
     /// caller should keep whatever it was looking at rather than snap
     /// somewhere arbitrary.
     pub fn advance(&mut self, dt: f32) -> Option<Vec3> {
+        self.cooldown = (self.cooldown - dt).max(0.0);
         if let Some(interest) = self.interest.as_mut() {
             if interest.delay > 0.0 {
                 interest.delay -= dt;
@@ -166,6 +190,7 @@ impl Scan {
             let point = interest.point;
             if expired {
                 self.interest = None;
+                self.cooldown = GLANCE_COOLDOWN;
                 // Resume the sweep on a fresh dwell rather than the remains of
                 // the one interrupted.
                 self.dwell_left = 0.0;
@@ -307,13 +332,47 @@ mod tests {
         s.hear(B, HEAR_THRESHOLD * 0.5);
         assert!(s.interest.is_none(), "turned toward something inaudible");
 
-        s.hear(B, 0.3);
+        s.hear(B, 0.5);
         let first = s.interest.expect("accepted the audible one").point;
         assert_eq!(first, B);
-        s.hear(C, 0.2);
+        s.hear(C, 0.45);
         assert_eq!(s.interest.expect("kept").point, B, "a quieter sound won");
-        s.hear(C, 0.8);
+        s.hear(C, 0.9);
         assert_eq!(s.interest.expect("kept").point, C, "a louder sound lost");
+    }
+
+    /// A firefight is a stream of sounds, each about as loud as the last. If
+    /// every one of them could take the head, the crosshair would never come
+    /// back to the angles being watched -- measured live with the old
+    /// threshold, EVERY sample of a holding bot had a sound above it, so the
+    /// sweep never ran at all.
+    #[test]
+    fn a_stream_of_gunfire_does_not_own_the_head_forever() {
+        let mut s = Scan::from_seed(21);
+        s.watch(&[A, B]);
+        let shot: Vec3 = [0.0, -900.0, 64.0];
+
+        let mut on_sound = 0;
+        let mut on_sweep = 0;
+        for tick in 0..400 {
+            // A loud shot every quarter second, forever.
+            if tick % 12 == 0 {
+                s.hear(shot, 0.9);
+            }
+            match s.advance(0.05) {
+                Some(p) if p == shot => on_sound += 1,
+                Some(_) => on_sweep += 1,
+                None => {}
+            }
+        }
+        assert!(
+            on_sweep > 0,
+            "the sweep never ran: {on_sound} ticks on the sound, {on_sweep} on watch points"
+        );
+        assert!(
+            on_sweep * 2 > on_sound,
+            "under constant fire the head was on sounds {on_sound} ticks and on              its angles only {on_sweep}"
+        );
     }
 
     #[test]

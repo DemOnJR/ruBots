@@ -274,6 +274,63 @@ fn canvas(app: &mut App, ui: &mut egui::Ui) {
         app.selected = click_target.map(|(_, name)| name);
     }
 
+    // --- what the selected bot should be watching ------------------------
+    // Drawn from the map, not from telemetry: the packet does not carry it,
+    // and the shell has the same nav grid the bot does. Seeing the sight lines
+    // next to the heading tick is the whole point -- it answers "is it looking
+    // at the way in, or at a wall" without reading a log.
+    if app.radar.show_watch {
+        if let (Some(name), Some(map)) = (app.selected.clone(), app.fleet.map_data.as_ref()) {
+            if let Some(bot) = app.fleet.bots.get(&name) {
+                let here = bot.t.origin;
+                let stale = app
+                    .radar
+                    .watch_cache
+                    .as_ref()
+                    .is_none_or(|(who, at, _)| {
+                        who != &name
+                            || {
+                                let (dx, dy) = (here[0] - at[0], here[1] - at[1]);
+                                (dx * dx + dy * dy).sqrt() > 64.0
+                            }
+                    });
+                if stale {
+                    let world = nav::navgrid::World::new(&map.bsp, &map.info);
+                    // A CT watches the T spawns and the other way round.
+                    let spawns: &[[f32; 3]] = if bot.t.team == 2 {
+                        &map.info.t_spawns
+                    } else {
+                        &map.info.ct_spawns
+                    };
+                    let points = nav::watch::watch_points(
+                        &map.grid,
+                        &world,
+                        here,
+                        spawns,
+                        nav::watch::DEFAULT_RADIUS,
+                        4,
+                    );
+                    app.radar.watch_cache = Some((name.clone(), here, points));
+                }
+                if let Some((_, _, points)) = app.radar.watch_cache.as_ref() {
+                    let from = project(app, rect, scale, world_center, here[0], here[1]);
+                    for p in points {
+                        let to = project(app, rect, scale, world_center, p[0], p[1]);
+                        painter.line_segment(
+                            [from, to],
+                            Stroke::new(1.0, theme::ACCENT_TEXT.gamma_multiply(0.45)),
+                        );
+                        painter.rect_stroke(
+                            egui::Rect::from_center_size(to, egui::vec2(7.0, 7.0)),
+                            Rounding::ZERO,
+                            Stroke::new(1.0, theme::ACCENT_TEXT),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // --- overlay ---------------------------------------------------------
     let head = format!(
         "{map_name}  ·  {} nodes  ·  {} hops  ·  z {:.0}..{:.0}",
@@ -420,6 +477,8 @@ fn inspector(app: &mut App, ui: &mut egui::Ui) {
                 widgets::toggle(ui, &mut app.radar.show_ladders, "ladders");
                 widgets::toggle(ui, &mut app.radar.show_falls, "falls");
                 widgets::toggle(ui, &mut app.radar.show_goals, "bomb sites");
+                widgets::rule(ui);
+                widgets::toggle(ui, &mut app.radar.show_watch, "sight lines (selected)");
             });
 
             ui.add_space(10.0);
