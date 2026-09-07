@@ -315,6 +315,56 @@ fn block_bytes(r: &proto::bitbuf::BitReader<'_>) -> usize {
 /// This is the piece that turns a connected socket into a player: the entity
 /// block is the only place enemy positions exist, and `svc_clientdata` is the
 /// only authoritative account of our own.
+/// A sound the server told us about, and therefore one this player can hear.
+///
+/// The engine only sends `svc_sound` to clients in the sound's PAS
+/// (`SV_BuildSoundMsg`), so receiving one *is* the audibility test — there is
+/// no need to model walls. What is left is how loud it was where we are
+/// standing, which is the client's own falloff:
+/// `dist_mult = attenuation / SND_CLIP_DISTANCE` and the sound is inaudible
+/// once `distance * dist_mult >= 1` (`cl_dll` / `snd_dma.c` share the rule).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoundEvent {
+    pub origin: [f32; 3],
+    /// 0..1. Absent on the wire means full volume.
+    pub volume: f32,
+    /// Falloff rate; absent on the wire means `ATTN_NORM`-ish 1.0.
+    pub attenuation: f32,
+    /// Which entity made it — our own index is how we ignore our footsteps.
+    pub entity: u16,
+    /// Index into the sound precache.
+    pub sound: u16,
+    /// `svc_time` when it arrived, so age is measurable.
+    pub at: f32,
+}
+
+impl SoundEvent {
+    /// How loud this was at `listener`, 0 (inaudible) to 1 (right here).
+    pub fn loudness_at(&self, listener: [f32; 3]) -> f32 {
+        let d = {
+            let (dx, dy, dz) = (
+                self.origin[0] - listener[0],
+                self.origin[1] - listener[1],
+                self.origin[2] - listener[2],
+            );
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        };
+        let mult = self.attenuation.max(0.0) / SND_CLIP_DISTANCE;
+        (self.volume * (1.0 - d * mult)).clamp(0.0, 1.0)
+    }
+}
+
+/// `SND_CLIP_DISTANCE`, the range at which `ATTN_NORM` falls to nothing.
+pub const SND_CLIP_DISTANCE: f32 = 1000.0;
+
+/// How long a heard sound stays interesting. A footstep two seconds old is a
+/// place someone *was*, which is still worth a look; ten seconds old is noise.
+pub const SOUND_MEMORY: f32 = 3.0;
+
+/// Cap on remembered sounds, so a grenade going off in a crowd cannot grow the
+/// list without bound between frames.
+const MAX_SOUNDS: usize = 32;
+
 pub struct Decoder {
     pub registry: proto::delta::DeltaRegistry,
     pub maxclients: u8,
@@ -330,6 +380,8 @@ pub struct Decoder {
     pub game: crate::usermsg::GameState,
     pub user_table: crate::stream::UserMsgTable,
     pub stats: DecodeStats,
+    /// Sounds heard in the last [`SOUND_MEMORY`] seconds, oldest first.
+    pub sounds: Vec<SoundEvent>,
 }
 
 /// Why a datagram did or did not decode. Kept because "the bot cannot see
@@ -400,6 +452,7 @@ impl Decoder {
             game,
             user_table,
             stats: DecodeStats::default(),
+            sounds: Vec::new(),
         }
     }
 
@@ -652,7 +705,7 @@ impl Decoder {
 
     /// Step over one bit-packed engine message starting at `at`, returning the
     /// offset just past it.
-    fn skip_bit_packed(&self, msg: &[u8], at: usize) -> Option<usize> {
+    fn skip_bit_packed(&mut self, msg: &[u8], at: usize) -> Option<usize> {
         let id = *msg.get(at)?;
         let body = at + 1;
         let mut r = proto::bitbuf::BitReader::new(msg.get(body..)?);
@@ -698,19 +751,54 @@ impl Decoder {
             // properly rather than abandoning the datagram: gunfire is a
             // genuine perception cue we will want later.
             svc::SVC_SOUND => {
+                const SND_VOLUME: u32 = 0x01;
+                const SND_ATTENUATION: u32 = 0x02;
+                const SND_LARGE_INDEX: u32 = 0x04;
+                const SND_PITCH: u32 = 0x08;
+                const SND_STOP: u32 = 0x20;
+                const SND_SPAWNING: u32 = 0x100;
+
                 let mask = r.read_bits(9);
-                if mask & 0x01 != 0 {
-                    r.skip(8); // volume
-                }
-                if mask & 0x02 != 0 {
-                    r.skip(8); // attenuation
-                }
-                r.skip(3); // channel
-                r.skip(11); // entity index
-                r.skip(if mask & 0x04 != 0 { 16 } else { 8 }); // sound number
-                read_bit_vec3_coord(&mut r);
-                if mask & 0x08 != 0 {
+                // Absent means the default the server did not bother to send:
+                // full volume, normal falloff (`SV_StartSound` only sets the
+                // flag when the value differs).
+                let volume = if mask & SND_VOLUME != 0 {
+                    r.read_bits(8) as f32 / 255.0
+                } else {
+                    1.0
+                };
+                let attenuation = if mask & SND_ATTENUATION != 0 {
+                    r.read_bits(8) as f32 / 64.0
+                } else {
+                    1.0
+                };
+                let _channel = r.read_bits(3);
+                let entity = r.read_bits(11) as u16;
+                let sound = if mask & SND_LARGE_INDEX != 0 {
+                    r.read_bits(16)
+                } else {
+                    r.read_bits(8)
+                } as u16;
+                let origin = read_bit_vec3_coord(&mut r);
+                if mask & SND_PITCH != 0 {
                     r.skip(8); // pitch
+                }
+                // A stop is the absence of a sound, and a spawning sound is
+                // level ambience placed at load: neither is something moving.
+                if !r.overflowed() && mask & (SND_STOP | SND_SPAWNING) == 0 {
+                    let at = self.time;
+                    self.sounds.retain(|s| at - s.at < SOUND_MEMORY);
+                    if self.sounds.len() >= MAX_SOUNDS {
+                        self.sounds.remove(0);
+                    }
+                    self.sounds.push(SoundEvent {
+                        origin,
+                        volume,
+                        attenuation,
+                        entity,
+                        sound,
+                        at,
+                    });
                 }
             }
             _ => return None,

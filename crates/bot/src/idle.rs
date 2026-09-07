@@ -90,8 +90,13 @@ impl Ramp {
 
 /// A slow drift on both axes that keeps `CheckActivityInGame` satisfied.
 ///
-/// The amplitudes are around a degree — invisible in play, but a hundred times
-/// the threshold, so rounding on the wire cannot eat it. The periods are
+/// The amplitudes are a third of a degree — three times the threshold with
+/// room for wire rounding, and small enough that the drift cannot be seen.
+/// They used to be around a degree, which was visible as a slow crawl with a
+/// snap at every wrap, and that crawl was half of why a camping bot's
+/// crosshair looked wrong. The look model ([`crate::look`]) supplies the
+/// motion a person actually has; this only has to satisfy the predicate. The
+/// periods are
 /// deliberately different and not multiples of 5, so the two axes do not
 /// wrap together and the motion does not look mechanical.
 ///
@@ -107,8 +112,8 @@ pub struct AntiIdle {
 impl Default for AntiIdle {
     fn default() -> Self {
         Self {
-            yaw: Ramp { amplitude: 1.0, period: 12.0 },
-            pitch: Ramp { amplitude: 0.6, period: 9.0 },
+            yaw: Ramp { amplitude: 0.34, period: 12.0 },
+            pitch: Ramp { amplitude: 0.30, period: 9.0 },
             phase: 0.0,
         }
     }
@@ -132,12 +137,14 @@ impl AntiIdle {
             *h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((*h >> 33) as f64 / (1u64 << 31) as f64) as f32
         };
-        // Windows that satisfy `guarantees(): yaw amp >= 0.9, period <= 16 ->
-        // plain delta >= 0.28, wrapped >= 0.62; pitch amp >= 0.6, period <= 13
-        // -> plain >= 0.23, wrapped >= 0.37. All well above the 0.1 threshold.
+        // Windows that satisfy `guarantees()`: with amplitude >= 0.30 and
+        // period <= 13, the plain 5 s advance is >= 0.115 and the advance
+        // across a wrap is >= 0.185 -- both above the 0.1 threshold, with the
+        // margin coming from the period ceiling rather than from a big
+        // amplitude, which is what keeps the drift invisible.
         Self {
-            yaw: Ramp { amplitude: 0.9 + next(&mut h) * 0.5, period: 8.0 + next(&mut h) * 8.0 },
-            pitch: Ramp { amplitude: 0.6 + next(&mut h) * 0.4, period: 7.0 + next(&mut h) * 6.0 },
+            yaw: Ramp { amplitude: 0.30 + next(&mut h) * 0.10, period: 8.0 + next(&mut h) * 5.0 },
+            pitch: Ramp { amplitude: 0.30 + next(&mut h) * 0.08, period: 7.0 + next(&mut h) * 5.0 },
             phase: next(&mut h) * 8.0,
         }
     }

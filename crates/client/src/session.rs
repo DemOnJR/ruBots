@@ -29,6 +29,96 @@ use crate::{Client, Disconnect, Identity, State, Transport};
 
 /// A snapshot of one `think()`, so a stalled bot can be attributed to the
 /// layer that stalled it rather than guessed at.
+/// A rolling measurement of how the view we actually send moves.
+///
+/// "The crosshair looks wrong" is not a measurement, and a `.sent` capture
+/// cannot say which rung was running when it was recorded. The meter lives
+/// here, where both the sent angle and the rung are known. Two numbers:
+///
+/// * **reversals per second** - direction changes in yaw. A person scanning
+///   reverses about once a second; five or six a second is a tremor.
+/// * **longest dwell** - the longest run with the yaw effectively parked. A
+///   defender holds one angle for seconds at a time.
+#[derive(Debug, Default, Clone)]
+pub struct ViewStats {
+    /// `(time, yaw)` over the last [`ViewStats::WINDOW`] seconds.
+    samples: std::collections::VecDeque<(f32, f32)>,
+    now: f32,
+}
+
+impl ViewStats {
+    /// How much history the numbers describe.
+    pub const WINDOW: f32 = 5.0;
+    /// Yaw movement below this is the view standing still.
+    const PARKED: f32 = 0.15;
+
+    pub fn note(&mut self, yaw: f32, dt: f32) {
+        self.now += dt.clamp(0.0, 0.25);
+        self.samples.push_back((self.now, yaw));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| self.now - t > Self::WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    fn span(&self) -> f32 {
+        match (self.samples.front(), self.samples.back()) {
+            (Some((a, _)), Some((b, _))) => (b - a).max(0.001),
+            _ => 0.001,
+        }
+    }
+
+    /// Yaw direction changes per second over the window.
+    pub fn reversals_per_sec(&self) -> f32 {
+        let mut sign = 0i32;
+        let mut reversals = 0u32;
+        let mut prev: Option<f32> = None;
+        for (_, yaw) in &self.samples {
+            if let Some(p) = prev {
+                let d = bot::math::norm_angle(f64::from(yaw - p)) as f32;
+                let s = if d > 0.02 {
+                    1
+                } else if d < -0.02 {
+                    -1
+                } else {
+                    0
+                };
+                if s != 0 {
+                    if sign != 0 && s != sign {
+                        reversals += 1;
+                    }
+                    sign = s;
+                }
+            }
+            prev = Some(*yaw);
+        }
+        reversals as f32 / self.span()
+    }
+
+    /// Longest stretch, in seconds, with the yaw parked.
+    pub fn longest_dwell(&self) -> f32 {
+        let mut run = 0.0f32;
+        let mut best = 0.0f32;
+        let mut prev: Option<(f32, f32)> = None;
+        for &(t, yaw) in &self.samples {
+            if let Some((pt, pyaw)) = prev {
+                let d = bot::math::norm_angle(f64::from(yaw - pyaw)).abs() as f32;
+                if d < Self::PARKED {
+                    run += t - pt;
+                    best = best.max(run);
+                } else {
+                    run = 0.0;
+                }
+            }
+            prev = Some((t, yaw));
+        }
+        best
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Decision {
     pub alive: bool,
@@ -61,6 +151,10 @@ pub struct Decision {
     pub to_goal: f32,
     /// Which rung of the brain's ladder decided this tick.
     pub rung: &'static str,
+    /// Yaw direction changes per second in the view actually sent.
+    pub look_reversals: f32,
+    /// Longest run, in seconds, with the sent yaw parked.
+    pub look_dwell: f32,
     /// Escort phase, as a word. None of the escort's state is on the wire in a
     /// form the bot can read back -- `HostagePos` is a 1 Hz radar blip and
     /// nothing at all says who a hostage is following -- so a hostage round is
@@ -177,6 +271,10 @@ pub struct Session {
     pub refused_jumps: u32,
     /// Rate limit for the diagnostic line that reports those refusals.
     last_refusal_log: Option<Instant>,
+    /// Sight lines, cached against the defend point they were computed from.
+    watch_cache: Option<([f32; 3], [Option<[f32; 3]>; bot::controller::MAX_WATCH])>,
+    /// How the sent view has been moving, for the look diagnostics.
+    view_stats: ViewStats,
     /// Last obstacle probe: where it was taken, when, and what it said.
     ///
     /// The sweep is a few dozen hull traces, so it is cached rather than run
@@ -313,6 +411,8 @@ impl Session {
             rotate_cooldown: 0.0,
             map: None,
             refused_jumps: 0,
+            watch_cache: None,
+            view_stats: ViewStats::default(),
             last_refusal_log: None,
             ahead_probe: None,
             follower: crate::navigate::PathFollower::new(), // re-seeded by set_seed
@@ -1573,6 +1673,10 @@ impl Session {
             new_waypoint: self.follower.took_advanced(),
             // Plan W5: where to defend after arrival, if the route has one.
             defend_point: self.follower.defend_point(),
+            // The sight lines into that defend point. Computed here because
+            // this is the only layer holding both the nav lattice and the
+            // collision hulls: the brain gets an answer, not a map.
+            watch_points: self.watch_points(),
             weave,
             speed_scale,
         };
@@ -1718,6 +1822,7 @@ impl Session {
                 (dx * dx + dy * dy).sqrt()
             })
             .unwrap_or(f32::NAN);
+        self.view_stats.note(intent.view.yaw, dt);
         self.last_decision = Some(Decision {
             alive: world.me.alive,
             in_game: world.me.freeze_period,
@@ -1737,6 +1842,8 @@ impl Session {
             arming: self.brain.as_ref().is_some_and(|b| b.plant.is_arming()),
             to_goal,
             rung: self.brain.as_ref().map_or("none", |b| b.rung),
+            look_reversals: self.view_stats.reversals_per_sec(),
+            look_dwell: self.view_stats.longest_dwell(),
             escort: self
                 .brain
                 .as_ref()
@@ -1840,6 +1947,41 @@ impl Session {
     /// client with prediction on computes its own velocity, so the server
     /// saves the bits. Trusting the absent field means reading zero, which
     /// makes a bot sprinting across the map look permanently stuck.
+    /// Where a bot holding the current defend point should watch.
+    ///
+    /// `nav::watch::watch_points` is a lattice sweep plus a visibility trace
+    /// per direction: far too much to do every tick, and pointless, because
+    /// the answer only changes when the defend point does. Cached against it.
+    fn watch_points(&mut self) -> [Option<[f32; 3]>; bot::controller::MAX_WATCH] {
+        let empty = [None; bot::controller::MAX_WATCH];
+        let Some(spot) = self.follower.defend_point() else {
+            return empty;
+        };
+        if let Some((at, cached)) = self.watch_cache {
+            let (dx, dy, dz) = (spot[0] - at[0], spot[1] - at[1], spot[2] - at[2]);
+            if (dx * dx + dy * dy + dz * dz).sqrt() < 32.0 {
+                return cached;
+            }
+        }
+        let Some(map) = self.map.as_ref() else {
+            return empty;
+        };
+        let world = nav::navgrid::World::new(&map.bsp, &map.info);
+        let found = nav::watch::watch_points(
+            &map.grid,
+            &world,
+            spot,
+            nav::watch::DEFAULT_RADIUS,
+            bot::controller::MAX_WATCH,
+        );
+        let mut out = empty;
+        for (slot, point) in out.iter_mut().zip(found) {
+            *slot = Some(point);
+        }
+        self.watch_cache = Some((spot, out));
+        out
+    }
+
     /// What is in front of the bot, measured against the engine's own hulls.
     ///
     /// `None` when no map is loaded, which is the honest answer rather than a
