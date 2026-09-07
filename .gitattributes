@@ -12,3 +12,12 @@
 # which strips the CR as well so a tree checked out before this file existed
 # still builds a working image.
 *.sh text eol=lf
+# Everything else: let git decide what is text and store it with LF.
+#
+# Without this, whether a file lands in the repo with CRLF depends on the
+# `core.autocrlf` of whoever committed it, and the tree drifts one file at a
+# time -- which is how eight of them ended up with CRLF blobs. `auto` means
+# git sniffs each file and leaves anything with a NUL byte alone, so the
+# binaries under testserver/rehlds are untouched (verified: renormalising with
+# this rule in place rewrites the same eight text files and nothing else).
+* text=auto
