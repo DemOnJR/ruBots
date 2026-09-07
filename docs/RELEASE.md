@@ -24,7 +24,7 @@ docker compose up -d
 The radar draws its map from the map's own `.bsp`, and a bot checks file
 consistency against the game's resources, so point both at a `cstrike` folder:
 
-* **In the app**: SETTINGS (key 8) → set `root` to a checkout that has
+* **In the app**: SETTINGS (key 7) → set `root` to a checkout that has
   `testserver/cstrike`, or edit `rubots-gui.conf` next to the exe.
 * **On the command line**: `RUB_MAPS_DIR` and `RUB_CSTRIKE_DIR`.
 
@@ -37,18 +37,10 @@ Without them everything still runs — the radar simply says "no map loaded".
 2. DEPLOY (key 4): set how many bots and press LAUNCH. They are started a few
    seconds apart on purpose — a mass connect from one IP trips ReAuthCheck and
    gets the address banned for an hour.
-3. RADAR (key 2): the swarm on the map. **Tab** cycles the selected bot and
-   draws the sight lines it is watching.
+3. RADAR (key 2): the swarm on the map, with a replay scrubber over the last
+   two minutes. **Tab** cycles the selected bot and draws the sight lines it
+   is watching.
 4. CONSOLE (key 6): every bot's output in one stream.
-
-## Recording and watching a session back
-
-Set `RUB_DEMO=1` when a bot runs and it writes a real GoldSrc `.dem` next to
-its capture. REPLAY (key 7) lists them, plays them back over the map with a
-scrubber and speed control, and the same file will open in the retail client.
-
-A demo is **one bot's view**: the engine only tells a client about entities in
-its PVS, so it shows what that bot could see, not the whole match.
 
 ## Environment variables
 
@@ -62,7 +54,6 @@ Every one takes the `RUB_` prefix (`REB_` and `AIPLAYERS_` still work).
 | `RUB_MAP` | map name | `de_dust2` |
 | `RUB_MAPS_DIR` | where the `.bsp` files are | `testserver/cstrike/maps` |
 | `RUB_CSTRIKE_DIR` | game resources, for consistency checks | `testserver/cstrike` |
-| `RUB_DEMO` | `1` records a `.dem`; a path records there | off |
 | `RUB_TELEMETRY_PORT` | radar telemetry | `27016` |
 | `RUB_TEAM_PORT` | team bus | `27017` |
 | `RUB_DIFFICULTY` | `easy` / `normal` / `hard` / `unfair` | from the seed |
@@ -73,7 +64,6 @@ Running one bot by hand:
 set RUB_NAME=ruBot01
 set RUB_KEY=RUBBOT0001
 set RUB_TEAM=2
-set RUB_DEMO=1
 rubots-bot.exe 127.0.0.1:27015 300 captures\ruBot01.bin
 ```
 
