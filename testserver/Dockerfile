@@ -90,7 +90,13 @@ COPY --chown=steam:steam cfg/ /home/steam/hlds/cstrike/
 RUN mkdir -p /home/steam/hlds/cstrike/logs
 
 COPY --chown=steam:steam entrypoint.sh /home/steam/entrypoint.sh
-RUN chmod +x /home/steam/entrypoint.sh
+# Strip CR as well as setting the bit. A Windows clone with the default
+# `core.autocrlf=true` checks this file out as CRLF, and the build context is
+# the working tree, so the shebang arrives as `#!/bin/sh\r` -- which the
+# kernel reports as "no such file or directory", naming a file that is right
+# there. `.gitattributes` pins the endings for fresh clones; this line covers
+# the trees that were cloned before it existed.
+RUN sed -i 's/\r$//' /home/steam/entrypoint.sh && chmod +x /home/steam/entrypoint.sh
 ENTRYPOINT ["/home/steam/entrypoint.sh"]
 
 WORKDIR /home/steam/hlds
