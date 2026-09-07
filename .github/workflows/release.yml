@@ -1,0 +1,66 @@
+name: release
+
+# Cutting a release is `git tag v0.2.0 && git push --tags`. Everything below
+# is so nobody has to remember which binaries go in the zip or build them on
+# the machine that happens to be free.
+on:
+  push:
+    tags:
+      - "v*"
+  # So the packaging can be exercised without minting a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The map-dependent tests skip loudly when the game files are absent,
+      # which they are here: testserver/cstrike is gitignored. The rest still
+      # covers the protocol, the nav grid, the demo format and the look model.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: |
+          cargo build --release -p gui
+          cargo build --release -p client --example capture_running
+
+      # Two binaries, because one is useless without the other: the control
+      # centre launches bots, and the bot is what connects to a server.
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if (-not $version) { $version = "dev" }
+          $stage = "rubots-$version-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/gui.exe                     "$stage/rubots-control.exe"
+          Copy-Item target/release/examples/capture_running.exe "$stage/rubots-bot.exe"
+          Copy-Item README.md                                   "$stage/README.md"
+          Copy-Item LICENSE                                     "$stage/LICENSE"
+          Copy-Item docs/RELEASE.md                             "$stage/HOW-TO-RUN.md"
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip" -Force
+          Get-ChildItem "$stage.zip" | Format-List
+
+      - name: Upload the build as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubots-windows-x64
+          path: rubots-*-windows-x64.zip
+
+      - name: Attach it to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rubots-*-windows-x64.zip
+          generate_release_notes: true
