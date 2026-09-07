@@ -10,11 +10,13 @@
 
 pub mod clock;
 pub mod console;
+pub mod demo;
 pub mod content;
 pub mod control;
 pub mod map;
 pub mod messages;
 pub mod navigate;
+pub mod replay;
 pub mod role;
 pub mod session;
 pub mod signon;
