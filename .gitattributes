@@ -1,0 +1,14 @@
+# Shell scripts must reach a Linux container with LF endings.
+#
+# `core.autocrlf=true` is the Windows default, so a plain clone on Windows
+# rewrites every checked-out .sh to CRLF. Git's index is unaffected -- the
+# blobs stay LF -- but Docker builds from the *working tree*, so the CRLF copy
+# is what gets baked into the image, and `#!/bin/sh\r` is not a program:
+#
+#     exec /home/steam/entrypoint.sh: no such file or directory
+#
+# which names a file that is plainly there, with the wrong reason. That cost
+# this project a broken test server once already; see testserver/Dockerfile,
+# which strips the CR as well so a tree checked out before this file existed
+# still builds a working image.
+*.sh text eol=lf
