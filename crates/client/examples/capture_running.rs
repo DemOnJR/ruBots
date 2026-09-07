@@ -187,28 +187,6 @@ fn main() {
         ..Default::default()
     });
     session.record_all = true;
-    // Record the session as a real .dem when asked. `RUB_DEMO=1` puts it next
-    // to the capture; `RUB_DEMO=<path>` puts it where you say. Started before
-    // the signon on purpose -- the loading lump has to carry that burst or the
-    // demo cannot decode itself.
-    match rub_env("DEMO").ok().filter(|v| v != "0" && !v.is_empty()) {
-        Some(v) => {
-            let path = if v == "1" || v.eq_ignore_ascii_case("true") {
-                let mut p = std::path::PathBuf::from(&out_path);
-                p.set_extension("dem");
-                p
-            } else {
-                std::path::PathBuf::from(v)
-            };
-            let map_name = rub_env("MAP").unwrap_or_else(|_| "de_dust2".into());
-            match session.record_demo(&path, &map_name, "cstrike") {
-                Ok(()) => eprintln!("  recording demo to {}", path.display()),
-                Err(e) => eprintln!("  demo recording failed: {e}"),
-            }
-        }
-        None => {}
-    }
-
     match session.connect_and_signon(&mut t, Duration::from_secs(15)) {
         Ok(signon) => eprintln!(
             "signon reached: {} delta tables, map {}",

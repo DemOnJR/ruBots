@@ -295,14 +295,6 @@ pub struct Session {
     pub refused_jumps: u32,
     /// Rate limit for the diagnostic line that reports those refusals.
     last_refusal_log: Option<Instant>,
-    /// Records everything the server sends us as a playable `.dem`.
-    ///
-    /// The bot is a real client, so its message stream IS a demo once it has a
-    /// header and a directory round it -- which means a session can be watched
-    /// back in the actual game rather than on a radar.
-    demo: Option<crate::demo::DemoWriter>,
-    /// When recording started, for demo timestamps.
-    demo_started: Option<Instant>,
     /// Sight lines, cached against the defend point they were computed from.
     watch_cache: Option<([f32; 3], [Option<[f32; 3]>; bot::controller::MAX_WATCH])>,
     /// How the sent view has been moving, for the look diagnostics.
@@ -444,8 +436,6 @@ impl Session {
             map: None,
             refused_jumps: 0,
             watch_cache: None,
-            demo: None,
-            demo_started: None,
             view_stats: ViewStats::default(),
             last_refusal_log: None,
             ahead_probe: None,
@@ -479,26 +469,6 @@ impl Session {
     /// hunting for it later meant scanning recorded bytes for the raw value 43
     /// — which is ASCII `'+'` and false-matches on payload data constantly.
     fn note_message(&mut self, msg: &[u8]) {
-        // Record before anything else looks at it: what goes in the demo
-        // should be exactly what arrived, not what survived parsing.
-        if let Some(demo) = self.demo.as_mut() {
-            if let Some(since) = self.demo_started {
-                demo.set_time(since.elapsed().as_secs_f32());
-            }
-            // The signon burst belongs in the loading lump; everything after
-            // it is playback. `phase` is the same signal the session uses to
-            // decide it can start sending moves.
-            let result = if self.phase == Phase::Running {
-                demo.write_message(msg)
-            } else {
-                demo.write_signon(msg)
-            };
-            if result.is_err() {
-                // A demo that cannot be written is not worth losing the bot
-                // over: drop the recorder and carry on playing.
-                self.demo = None;
-            }
-        }
         if self.resource_message.is_none() {
             if let Some(rm) = proto::resources::parse_resource_message(msg) {
                 self.resource_message = Some(rm);
@@ -2058,35 +2028,6 @@ impl Session {
     /// client with prediction on computes its own velocity, so the server
     /// saves the bits. Trusting the absent field means reading zero, which
     /// makes a bot sprinting across the map look permanently stuck.
-    /// Start recording this session to `path` as a GoldSrc `.dem`.
-    ///
-    /// Call it before the signon: the loading lump has to carry the server's
-    /// signon burst or the demo has no map, no models and no delta tables to
-    /// decode itself with.
-    pub fn record_demo(
-        &mut self,
-        path: impl AsRef<std::path::Path>,
-        map: &str,
-        game_dir: &str,
-    ) -> std::io::Result<()> {
-        let writer = crate::demo::DemoWriter::create(path, map, game_dir)?;
-        self.demo = Some(writer);
-        self.demo_started = Some(Instant::now());
-        Ok(())
-    }
-
-    /// Close the demo, writing its directory. Also happens on drop.
-    pub fn finish_demo(&mut self) {
-        if let Some(demo) = self.demo.as_mut() {
-            let _ = demo.finish();
-        }
-    }
-
-    /// How many playback frames the demo holds, if one is being recorded.
-    pub fn demo_frames(&self) -> Option<i32> {
-        self.demo.as_ref().map(|d| d.frames())
-    }
-
     /// Where a bot holding the current defend point should watch.
     ///
     /// `nav::watch::watch_points` is a lattice sweep plus a visibility trace
