@@ -378,6 +378,22 @@ pub fn project(
         })
         .collect();
 
+    // Sounds, minus our own. The engine already decided we can hear these
+    // (they only go to clients in the sound's PAS), so all that is left is the
+    // falloff at our ears and how stale each one is.
+    let my_entity = d.my_entity();
+    let sounds = d
+        .sounds
+        .iter()
+        .filter(|s| s.entity != my_entity)
+        .map(|s| bot::world::Heard {
+            origin: s.origin,
+            loudness: s.loudness_at(my_origin),
+            age: (d.time - s.at).max(0.0),
+        })
+        .filter(|h| h.loudness > 0.0)
+        .collect();
+
     let mut world = WorldView {
         me,
         players,
@@ -387,6 +403,7 @@ pub fn project(
         round_time: f32::from(g.round_time.max(0)),
         frametime: 0.0,
         latency,
+        sounds,
     };
     world.bomb.planted = g.bomb_planted;
     world.bomb.origin = g.bomb_position;

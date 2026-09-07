@@ -10,6 +10,7 @@ pub mod graph;
 pub mod navgrid;
 pub mod route;
 pub mod ulz;
+pub mod watch;
 
 pub use bsp::{Bsp, BspError, Hull, Trace};
 pub use entities::{Aabb, Entity, EntityError, MapInfo, Scenario};

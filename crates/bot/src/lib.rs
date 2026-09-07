@@ -33,6 +33,7 @@ pub mod economy;
 pub mod fire;
 pub mod idle;
 pub mod intent;
+pub mod look;
 pub mod math;
 pub mod objective;
 pub mod rng;

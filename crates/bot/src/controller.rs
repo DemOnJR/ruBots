@@ -212,6 +212,38 @@ fn lerp_vec(a: Vec3, b: Vec3, t: f32) -> Vec3 {
 ///
 /// An `Option<Vec3>` still converts into this as a goal with no waypoint, which
 /// is the right reading for a caller that has no navigation layer.
+/// The closest a look target may be before its bearing stops meaning anything.
+///
+/// `aim_angles(origin, target)` is a bearing, and the bearing to a point you
+/// are standing on is undefined: with the sub-unit jitter the server reports
+/// for a body at rest, it swings to a different answer every frame. The camp
+/// hold swept between the defend point and a point 30% back toward the goal,
+/// and at the start of every hold the first of those **is where the bot is
+/// standing** -- which is what made a camping bot's crosshair shake. Measured
+/// live: 18.5 yaw reversals per second on `camp`, against 0.4-2.7 on every
+/// other rung.
+pub const MIN_LOOK_RANGE: f32 = 96.0;
+
+/// How far the desired look angle must move before a holding bot re-aims.
+///
+/// The origin the server reports for a body that is standing still is never
+/// the same twice -- sub-unit jitter, every frame. Recomputing
+/// `aim_angles(origin, target)` from it produces a desired angle that wobbles
+/// by hundredths of a degree, and the aim spring faithfully chases every
+/// wobble: measured, +-0.5 units of origin jitter alone took a hold from 0.00
+/// to 6.57 yaw reversals per second, and live camping bots were reversing 18.5
+/// times a second while every other rung sat between 0.4 and 2.7.
+///
+/// A person does not correct their aim for a centimetre of body sway. Below
+/// this the held angle simply does not move.
+pub const HOLD_DEADZONE: f32 = 0.75;
+
+/// How many sight lines a holding bot will watch.
+///
+/// Four is what a person can keep in their head; past that the sweep takes so
+/// long that each angle is unguarded most of the time.
+pub const MAX_WATCH: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Nav {
     /// The objective itself: the bomb site, the rescue zone.
@@ -234,6 +266,17 @@ pub struct Nav {
     /// objective (deterministically per bot + round, so no IPC is needed).
     /// `None` means the caller has no defend point; the bot roams instead.
     pub defend_point: Option<Vec3>,
+    /// Where an enemy can come from, seen from the defend point.
+    ///
+    /// The caller owns the nav grid and the collision hulls, so it is the only
+    /// thing that can answer "which approaches into this spot can I see from
+    /// it" (`nav::watch::watch_points`). Empty means the caller does not know,
+    /// and the bot falls back to sweeping between the two points it was given
+    /// rather than inventing sight lines.
+    ///
+    /// A fixed array rather than a `Vec` because [`Nav`] is `Copy` and passed
+    /// by value every tick: the hot path does not allocate.
+    pub watch_points: [Option<Vec3>; MAX_WATCH],
     /// Natural-walker inputs from the caller (plan natural-walking-model.md).
     ///
     /// The caller's follower computes these each tick: `weave` is a small
@@ -253,6 +296,7 @@ impl Nav {
             look: None,
             new_waypoint: false,
             defend_point: None,
+            watch_points: [None; MAX_WATCH],
             weave: 0.0,
             speed_scale: 1.0,
         }
@@ -277,6 +321,7 @@ impl From<Option<Vec3>> for Nav {
             look: None,
             new_waypoint: false,
             defend_point: None,
+            watch_points: [None; MAX_WATCH],
             weave: 0.0,
             speed_scale: 1.0,
         }
@@ -295,6 +340,11 @@ pub struct CampTask {
     /// The two world points the view sweeps between.
     pub sweep_a: Vec3,
     pub sweep_b: Vec3,
+    /// Sight lines into this spot, from the caller's nav grid. Empty means the
+    /// caller had none and the two-point sweep is used instead.
+    pub watch: [Option<Vec3>; MAX_WATCH],
+    /// The angle actually being held, kept so body sway does not re-aim it.
+    held: Option<Angles>,
     /// Whether we have actually reached the spot yet (walking there first).
     pub moving: bool,
     /// How long we have been trying to reach the spot without arriving.
@@ -315,6 +365,8 @@ impl CampTask {
             hold_total: hold,
             sweep_a,
             sweep_b,
+            watch: [None; MAX_WATCH],
+            held: None,
             moving: true,
             give_up_after: 6.0,
         }
@@ -351,6 +403,8 @@ pub struct Controller {
     pub escort: HostageEscort,
     pub fire: FireControl,
     pub idle: AntiIdle,
+    /// Where the crosshair goes while holding a position (plan: look model).
+    pub look: crate::look::Scan,
     /// The target being tracked, and for how long it has been visible.
     tracking: Option<(u16, f32)>,
     /// Last combat target origin for constant-velocity aim lead (Phase C).
@@ -444,6 +498,7 @@ impl Controller {
             escort: HostageEscort::default(),
             fire: FireControl::new(difficulty.fire_params()),
             idle: AntiIdle::from_seed(seed),
+            look: crate::look::Scan::from_seed(seed),
             tracking: None,
             enemy_prev: None,
             aim_offset: (Angles::default(), f32::INFINITY),
@@ -761,16 +816,66 @@ impl Controller {
         // grinding toward geometry we cannot stand on.
         task.moving = false;
 
-        // Holding: sweep the view between the two points at head height.
-        let phase = 1.0 - (task.hold_left / task.hold_total).max(0.0);
-        let sweep = nav_look_point(world.me.origin, lerp_vec(task.sweep_a, task.sweep_b, phase));
-        let look_angles = aim_angles(world.me.origin, sweep);
-        self.aim_at_guarded(
-            look_angles,
-            NAV_GAINS,
-            dt,
-            f64::from(aim_angles(world.me.origin, task.spot).yaw),
-        );
+        // Holding: watch the ways in, the way a person does -- park the
+        // crosshair on one for a beat, then move to the next, and turn toward
+        // anything loud. The old behaviour lerped the look point across the
+        // whole hold, so the crosshair crept without ever stopping; measured
+        // from the wire it reversed direction seven times a second and never
+        // held an angle for longer than 0.6 s.
+        let watch: Vec<Vec3> = task.watch.iter().flatten().copied().collect();
+        let sweep = if watch.is_empty() {
+            // No sight lines from the caller (no grid, or a spot that sees
+            // nothing): fall back to the two-point sweep rather than freeze.
+            let phase = 1.0 - (task.hold_left / task.hold_total).max(0.0);
+            nav_look_point(world.me.origin, lerp_vec(task.sweep_a, task.sweep_b, phase))
+        } else {
+            self.look.watch(&watch);
+            match self.look.advance(dt) {
+                Some(p) => p,
+                None => nav_look_point(world.me.origin, task.sweep_a),
+            }
+        };
+        // Hold the angle rather than recomputing it from a body that is never
+        // quite still: see `HOLD_DEADZONE`. The angle only moves when the look
+        // model moves it, which is the whole point of having one.
+        //
+        // A target too close to have a bearing (see `MIN_LOOK_RANGE`) is not
+        // aimed at at all: keep whatever angle is already held, and only fall
+        // back to computing one when there is nothing held yet.
+        let too_close = distance2d(world.me.origin, sweep) < MIN_LOOK_RANGE;
+        let want = if too_close {
+            // Latch it once. Deriving the angle from `self.view` every tick
+            // would be a feedback loop -- the spring chasing a target computed
+            // from where the spring already is -- which measured *worse* than
+            // the bug it was meant to fix (11.7 reversals/s against 6.6).
+            *task.held.get_or_insert(Angles {
+                pitch: 0.0,
+                yaw: self.view.yaw,
+            })
+        } else {
+            aim_angles(world.me.origin, sweep)
+        };
+        let look_angles = match task.held {
+            Some(held)
+                if norm_angle(f64::from(want.yaw - held.yaw)).abs() < f64::from(HOLD_DEADZONE)
+                    && (want.pitch - held.pitch).abs() < HOLD_DEADZONE =>
+            {
+                held
+            }
+            _ => {
+                task.held = Some(want);
+                want
+            }
+        };
+        // Plain spring, not the guarded one. The back-swing guard exists so a
+        // walking bot's head does not swing through the back of its own skull,
+        // and it decides that from the bearing of the point being walked to --
+        // but a bot that is holding is not walking anywhere, so that bearing is
+        // the direction to a spot it is standing on: undefined, and a different
+        // answer every frame. Feeding the guard a random bearing flips the sign
+        // of the error it corrects, which kicks the spring back and forth. That
+        // was the rest of the shake.
+        self.aim_at(look_angles, NAV_GAINS, dt);
         task.hold_left -= dt;
 
         self.rung = "camp";
@@ -840,6 +945,15 @@ impl Controller {
     pub fn think(&mut self, world: &WorldView, nav: impl Into<Nav>, dt: f32) -> Intent {
         let nav = nav.into();
         self.idle.advance(dt);
+
+        // Hearing. The engine only sends a sound to clients in its PAS, so
+        // anything in here is something this player could genuinely hear; the
+        // look model decides whether it is worth turning for. Fed every tick,
+        // including while walking, so the head is already pointed the right
+        // way if the noise turns into a target.
+        if let Some(heard) = world.loudest_sound() {
+            self.look.hear(heard.origin, heard.urgency());
+        }
         // Re-decided every tick, by whichever rung answers. Anything else
         // leaves a rung's destination in place after the ladder has moved on --
         // a bot that escorted a hostage last round and is defusing this one
@@ -1290,13 +1404,23 @@ impl Controller {
                 nav.look.unwrap_or(steer)
             };
             let look_eye = nav_look_point(world.me.origin, look);
-            let look_angles = aim_angles(world.me.origin, look_eye);
-            self.aim_at_guarded(
-                look_angles,
-                NAV_GAINS,
-                dt,
-                f64::from(aim_angles(world.me.origin, steer).yaw),
-            );
+            // Do not aim at a point you are standing on. On arrival `look` is
+            // the objective itself, which by then is under the bot's feet, and
+            // the bearing to a point half a unit away is whatever the frame's
+            // sub-unit origin jitter says it is -- a different answer every
+            // tick. Measured: this single call was swinging a holding bot's
+            // view by a median of 2.2 degrees per tick, up to 18, which is the
+            // shake. When the target is that close the head simply does not
+            // move, and the camp behaviour below supplies the real angle.
+            if distance2d(world.me.origin, look_eye) >= MIN_LOOK_RANGE {
+                let look_angles = aim_angles(world.me.origin, look_eye);
+                self.aim_at_guarded(
+                    look_angles,
+                    NAV_GAINS,
+                    dt,
+                    f64::from(aim_angles(world.me.origin, steer).yaw),
+                );
+            }
 
             // Plan W6: roll the per-hop slowdown dice on a node advance.
             if nav.new_waypoint {
@@ -1316,7 +1440,9 @@ impl Controller {
                     if post_plant {
                         let look = world.bomb.origin.unwrap_or(t);
                         let hold = self.camp_hold() * 1.5;
-                        self.post_arrival = Some(CampTask::new(t, look, t, hold));
+                        let mut camp = CampTask::new(t, look, t, hold);
+                        camp.watch = nav.watch_points;
+                        self.post_arrival = Some(camp);
                     } else if let Some(defend) = nav.defend_point {
                         // If this exact spot already failed us (unreachable),
                         // do not grind toward it again -- roam instead.
@@ -1329,7 +1455,9 @@ impl Controller {
                             // hold.
                             let back = lerp_vec(defend, t, 0.3);
                             let hold = self.camp_hold();
-                            self.post_arrival = Some(CampTask::new(defend, defend, back, hold));
+                            let mut camp = CampTask::new(defend, defend, back, hold);
+                            camp.watch = nav.watch_points;
+                            self.post_arrival = Some(camp);
                         }
                     }
                 }
@@ -1352,7 +1480,9 @@ impl Controller {
                         // Re-hold: do not abandon the planted bomb.
                         let look = world.bomb.origin.unwrap_or(t);
                         let hold = self.camp_hold() * 1.5;
-                        self.post_arrival = Some(CampTask::new(t, look, t, hold));
+                        let mut camp = CampTask::new(t, look, t, hold);
+                        camp.watch = nav.watch_points;
+                        self.post_arrival = Some(camp);
                     } else {
                         // Hold finished: leave the site and re-engage the map.
                         self.pick_hunt_goal(world);
@@ -1751,6 +1881,7 @@ mod tests {
             look: None,
             new_waypoint: false,
             defend_point: None,
+            watch_points: [None; MAX_WATCH],
             weave: 0.0,
             speed_scale: 1.0,
         };
@@ -1775,6 +1906,106 @@ mod tests {
         assert_eq!(Nav::nowhere().steer(), None);
     }
 
+    /// A bot holding a position does not shake its crosshair.
+    ///
+    /// Measured live before this test existed: every other rung reversed the
+    /// sent yaw 0.4-2.7 times a second, and `camp` reversed it **18.5 times a
+    /// second** with a longest dwell of 0.13 s. That is the tremor this pins.
+    ///
+    /// Driven at command rate (about 47 Hz) because reversal counting is
+    /// sample-rate sensitive: at 10 Hz a per-tick tremor is invisible.
+    #[test]
+    fn a_holding_bot_does_not_shake_its_crosshair() {
+        let spot = [1000.0, 0.0, 0.0];
+        // Both cases: with sight lines to watch, and without (the fallback).
+        // The bug lived in the path they share, so both have to be pinned.
+        for watch_points in [
+            [
+                Some([1800.0, 300.0, 17.0]),
+                Some([600.0, 900.0, 17.0]),
+                Some([200.0, -700.0, 17.0]),
+                None,
+            ],
+            [None; MAX_WATCH],
+        ] {
+            let mut c = Controller::new(7, Difficulty::Normal);
+            let mut w = WorldView {
+                me: me_at(spot, Team::CounterTerrorist),
+                ..Default::default()
+            };
+            let nav = Nav {
+                goal: Some(spot),
+                waypoint: Some(spot),
+                look: None,
+                new_waypoint: false,
+                defend_point: Some(spot),
+                watch_points,
+                weave: 0.0,
+                speed_scale: 1.0,
+            };
+
+            // Live conditions, both of which the bug needed to show itself:
+            // the origin the server reports for a standing body is never the
+            // same twice, and the client thinks on packet arrival, not on a
+            // fixed clock. With a static origin and a fixed dt this test
+            // passes against the broken code.
+            let mut rng = crate::rng::Rng::new(99);
+            let mut yaws = Vec::new();
+            let mut seconds = 0.0f32;
+            for _ in 0..(47 * 6) {
+                let dt = rng.range(0.008, 0.050) as f32;
+                w.me.origin = [
+                    spot[0] + rng.range(-0.5, 0.5) as f32,
+                    spot[1] + rng.range(-0.5, 0.5) as f32,
+                    spot[2],
+                ];
+                let intent = c.think(&w, nav, dt);
+                if c.rung == "camp" {
+                    yaws.push(intent.view.yaw);
+                    seconds += dt;
+                }
+            }
+            assert!(yaws.len() > 100, "never settled into a hold: {}", yaws.len());
+
+            let mut sign = 0i32;
+            let mut reversals = 0u32;
+            let step = seconds / yaws.len() as f32;
+            let mut parked = 0.0f32;
+            let mut longest = 0.0f32;
+            for w in yaws.windows(2) {
+                let d = norm_angle(f64::from(w[1] - w[0])) as f32;
+                if d.abs() < 0.15 {
+                    parked += step;
+                    longest = longest.max(parked);
+                } else {
+                    parked = 0.0;
+                }
+                let s = if d > 0.02 {
+                    1
+                } else if d < -0.02 {
+                    -1
+                } else {
+                    0
+                };
+                if s != 0 {
+                    if sign != 0 && s != sign {
+                        reversals += 1;
+                    }
+                    sign = s;
+                }
+            }
+            let rate = reversals as f32 / seconds.max(0.001);
+            assert!(
+                rate <= 3.0,
+                "crosshair reversed {rate:.1} times a second while holding;                  a person scanning does about one"
+            );
+            assert!(
+                longest >= 0.5,
+                "never held an angle for half a second (longest {longest:.2}s)"
+            );
+        }
+    }
+
     /// Plan W5: once arrived with a defend point, the bot does not stand still.
     ///
     /// The old `arrived` rung returned `(0.0, 0.0)` and sat there -- 27.2% of
@@ -1796,6 +2027,7 @@ mod tests {
             look: None,
             new_waypoint: false,
             defend_point: Some(defend),
+            watch_points: [None; MAX_WATCH],
             weave: 0.0,
             speed_scale: 1.0,
         };
@@ -1859,6 +2091,7 @@ mod tests {
             look: None,
             new_waypoint: false,
             defend_point: None,
+            watch_points: [None; MAX_WATCH],
             weave: 0.0,
             speed_scale: 1.0,
         };
@@ -1924,6 +2157,7 @@ mod tests {
             look: None,
             new_waypoint: false,
             defend_point: None,
+            watch_points: [None; MAX_WATCH],
             weave: 0.0,
             speed_scale: 1.0,
         };

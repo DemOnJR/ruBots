@@ -235,6 +235,33 @@ impl SelfState {
     }
 }
 
+/// Something the bot heard: a gunshot, a footstep, a door.
+///
+/// The engine only sends a sound to clients inside its PAS, so anything that
+/// reaches us is something this player could genuinely hear — the audibility
+/// question is already answered by the time it gets here. What remains is how
+/// loud it was at our ears and how long ago, which is what decides whether it
+/// is worth turning to look at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Heard {
+    pub origin: Vec3,
+    /// 0 (inaudible) to 1 (right on top of us).
+    pub loudness: f32,
+    /// Seconds since it happened.
+    pub age: f32,
+}
+
+impl Heard {
+    /// Loudness discounted by how stale it is. Zero once it stops mattering.
+    pub fn urgency(&self) -> f32 {
+        const FADE: f32 = 3.0;
+        if self.age >= FADE {
+            return 0.0;
+        }
+        self.loudness * (1.0 - self.age / FADE)
+    }
+}
+
 /// Everything the AI is allowed to look at.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorldView {
@@ -255,6 +282,9 @@ pub struct WorldView {
     pub frametime: f32,
     /// Round-trip latency in seconds — how stale everything in here is.
     pub latency: f32,
+    /// Sounds heard recently, oldest first. Our own noises are already
+    /// filtered out: a bot must not turn to look at its own footsteps.
+    pub sounds: Vec<Heard>,
 }
 
 impl WorldView {
@@ -272,6 +302,18 @@ impl WorldView {
         self.players
             .iter()
             .filter(move |p| p.alive && p.team.is_enemy_of(my_team))
+    }
+
+    /// The sound most worth turning toward, if any.
+    ///
+    /// Loudness decays with age rather than being cut off: a shot half a
+    /// second ago outranks a footstep now, and a two-second-old footstep is
+    /// still a place worth checking, just not urgently.
+    pub fn loudest_sound(&self) -> Option<&Heard> {
+        self.sounds
+            .iter()
+            .max_by(|a, b| a.urgency().total_cmp(&b.urgency()))
+            .filter(|h| h.urgency() > 0.0)
     }
 
     /// Living, un-rescued hostages.

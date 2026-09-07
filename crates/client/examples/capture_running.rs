@@ -575,6 +575,48 @@ fn main() {
                     if let Some(e) = d.stats.last_entity_error {
                         eprintln!("      entity decode: {e}");
                     }
+                    // Hearing and looking, on one line, because the two are
+                    // the same behaviour seen from either end: what the bot
+                    // can hear, and what its crosshair does about it. A
+                    // permanently empty `heard` means the bot is deaf;
+                    // `reversals` above about 2 while holding means something
+                    // is driving the view every tick again.
+                    {
+                        let mine = d.my_entity();
+                        let listener = cd.origin();
+                        let heard: Vec<_> =
+                            d.sounds.iter().filter(|s| s.entity != mine).collect();
+                        let loudest = heard
+                            .iter()
+                            .map(|s| s.loudness_at(listener))
+                            .fold(0.0f32, f32::max);
+                        let (rev, dwell) = session
+                            .last_decision
+                            .as_ref()
+                            .map(|x| (x.look_reversals, x.look_dwell))
+                            .unwrap_or((0.0, 0.0));
+                        eprintln!(
+                            "      look: reversals/s {rev:.2} dwell {dwell:.1}s |                              heard {} loudest {loudest:.2}",
+                            heard.len()
+                        );
+                    }
+                    // Hearing. `heard` counts sounds still inside the memory
+                    // window; the loudest is what the look model would turn
+                    // toward. A permanently empty line here means the bot is
+                    // deaf and the camp sweep is running blind.
+                    {
+                        let mine = d.my_entity();
+                        let heard: Vec<_> =
+                            d.sounds.iter().filter(|s| s.entity != mine).collect();
+                        let loudest = heard
+                            .iter()
+                            .map(|s| s.loudness_at(cd.origin()))
+                            .fold(0.0f32, f32::max);
+                        eprintln!(
+                            "      heard: {} sounds (mine filtered) loudest {loudest:.2}",
+                            heard.len()
+                        );
+                    }
                     // Who we think is on which side, for every slot the server
                     // has spoken about -- the whole roster, not the four
                     // players that happen to be in the PVS. A friendly-fire
