@@ -71,17 +71,19 @@ pub enum View {
     Deploy,
     Server,
     Console,
+    Replay,
     Settings,
 }
 
 impl View {
-    pub const ALL: [View; 7] = [
+    pub const ALL: [View; 8] = [
         View::Dashboard,
         View::Radar,
         View::Fleet,
         View::Deploy,
         View::Server,
         View::Console,
+        View::Replay,
         View::Settings,
     ];
 
@@ -93,6 +95,7 @@ impl View {
             Self::Deploy => "deploy",
             Self::Server => "server",
             Self::Console => "console",
+            Self::Replay => "replay",
             Self::Settings => "settings",
         }
     }
@@ -106,6 +109,7 @@ impl View {
             Self::Deploy => "launch and stop bots, staggered to survive ReAuthCheck",
             Self::Server => "the docker test server and its own A2S player count",
             Self::Console => "every child process's output in one stream",
+            Self::Replay => "watch a recorded session back, from its .dem",
             Self::Settings => "ports, paths and swarm defaults",
         }
     }
@@ -224,6 +228,7 @@ pub struct App {
     pub selected: Option<String>,
     pub radar: RadarState,
     pub console: ConsoleState,
+    pub replay: crate::views::replay::ReplayState,
     pub fleet_sort: FleetSort,
     pub server: ServerState,
     pub started: Instant,
@@ -260,6 +265,7 @@ impl App {
             selected: None,
             radar: RadarState::default(),
             console: ConsoleState::default(),
+            replay: Default::default(),
             fleet_sort: FleetSort::Name,
             server: ServerState {
                 info: Default::default(),
@@ -701,6 +707,7 @@ impl App {
             egui::Key::Num5,
             egui::Key::Num6,
             egui::Key::Num7,
+            egui::Key::Num8,
         ];
         for (i, key) in keys.iter().enumerate() {
             if ctx.input(|input| input.key_pressed(*key)) {
@@ -816,6 +823,7 @@ impl eframe::App for App {
                     View::Deploy => views::deploy::ui(self, ui),
                     View::Server => views::server::ui(self, ui),
                     View::Console => views::console::ui(self, ui),
+                    View::Replay => views::replay::ui(self, ui),
                     View::Settings => views::settings::ui(self, ui),
                 }
             });
@@ -866,7 +874,7 @@ mod tests {
 
     #[test]
     fn every_view_has_a_shortcut_and_a_blurb() {
-        assert_eq!(View::ALL.len(), 7, "the rail shows 1-7");
+        assert_eq!(View::ALL.len(), 8, "the rail shows 1-8");
         for v in View::ALL {
             assert!(!v.name().is_empty());
             assert!(!v.blurb().is_empty());

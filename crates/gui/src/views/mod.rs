@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod deploy;
 pub mod fleet;
 pub mod radar;
+pub mod replay;
 pub mod server;
 pub mod settings;
 
