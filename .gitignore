@@ -23,3 +23,7 @@ __pycache__/
 # tracked, because which build the bots were tested against is part of the result.
 /testserver/bundle/
 /testserver/rehlds.old/
+
+# Local run artefacts from the control GUI
+gui_run.log
+rubots-gui.conf
